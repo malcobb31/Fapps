@@ -1,0 +1,172 @@
+package ip_parser_v1;
+
+import java.io.*;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+
+public class ip_parser_methods {
+
+    public static class TableSummary {
+        public String name;
+        public LocalDateTime start;
+        public LocalDateTime end;
+        public int totalFiles = 0;        // files discovered for this table
+        public int filesSuccess = 0;      // files successfully imported
+        public int filesFailed = 0;
+        public String status = "Success";
+
+        public long getDurationSeconds() {
+            if (start != null && end != null) {
+                return Duration.between(start, end).getSeconds();
+            }
+            return 0;
+        }
+    }
+
+    public static class ProcessSummary {
+        public String processName;
+        public LocalDateTime start;
+        public LocalDateTime end;
+        public boolean success = true;
+        public int totalFilesDiscovered = 0;
+        public int totalFilesProcessed = 0;
+        public Map<String, TableSummary> tables = new LinkedHashMap<>();
+    }
+
+    public void parseFile(String logFilePath, String tableName, String dbUrl, String dbUser, String dbPass, String serverIp) throws IOException {
+        ProcessSummary summary = parseLogFile(logFilePath);
+
+        // print summary
+        System.out.println("Process: " + summary.processName);
+        System.out.println("Process start: " + summary.start);
+        System.out.println("Process end  : " + summary.end);
+        System.out.println("Process status: " + (summary.success ? "Success" : "Fail"));
+        System.out.println("Total files discovered: " + summary.totalFilesDiscovered);
+        System.out.println("Total files processed: " + summary.totalFilesProcessed);
+
+        for (TableSummary t : summary.tables.values()) {
+            System.out.println("---- Summary for table: " + t.name + " ----");
+            System.out.println("table_start: " + t.start);
+            System.out.println("table_end  : " + t.end);
+            System.out.println("total_files: " + t.totalFiles);
+            System.out.println("files_success: " + t.filesSuccess);
+            System.out.println("files_failed: " + t.filesFailed);
+            System.out.println("table_status: " + t.status);
+            System.out.println("duration_seconds: " + t.getDurationSeconds());
+            System.out.println("-------------------------------------------");
+        }
+    }
+
+    private ProcessSummary parseLogFile(String logFilePath) throws IOException {
+        BufferedReader reader = new BufferedReader(new FileReader(logFilePath));
+        String line;
+        DateTimeFormatter logTimeFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+        ProcessSummary processSummary = new ProcessSummary();
+        TableSummary currentTable = null;
+
+        while ((line = reader.readLine()) != null) {
+            if (!line.contains("EVT_Type")) continue;
+
+            // Process start
+            if (line.contains("EVT_Type:PROCESS_START")) {
+                processSummary.start = parseLogTime(line);
+                processSummary.processName = parseField(line, "Process_Name");
+            }
+
+            // Process end
+            if (line.contains("EVT_Type:PROCESS_END")) {
+                processSummary.end = parseLogTime(line);
+                if (!line.toLowerCase().contains("success")) {
+                    processSummary.success = false;
+                }
+            }
+
+            // Total files discovered
+            if (line.contains("EVT_Type:FILE_DISCOVERY")) {
+                String tf = extractNumber(line, "Files_Found:");
+                if (tf != null) processSummary.totalFilesDiscovered = Integer.parseInt(tf);
+            }
+
+            // Total files processed
+            if (line.contains("EVT_Type:PARALLEL_END")) {
+                String tp = extractNumber(line, "Total_Files_Processed:");
+                if (tp != null) processSummary.totalFilesProcessed = Integer.parseInt(tp);
+            }
+
+            // Table start
+            if (line.contains("EVT_Type:TABLE_START")) {
+                String tbl = parseField(line, "Table");
+                if (tbl.toLowerCase().contains("config")) continue; // skip config tables
+                currentTable = new TableSummary();
+                currentTable.name = tbl;
+                currentTable.start = parseLogTime(line);
+                processSummary.tables.put(tbl, currentTable);
+            }
+
+            // Table end
+            if (line.contains("EVT_Type:TABLE_END") && currentTable != null) {
+                currentTable.end = parseLogTime(line);
+                currentTable.status = parseStatus(line);
+                currentTable = null;
+            }
+
+            // Files per table
+            if (line.contains("EVT_Type:FILE_START") && currentTable != null) {
+                currentTable.totalFiles++;
+            }
+            if (line.contains("EVT_Type:PSQL_IMPORT_SUCCESS") && currentTable != null) {
+                currentTable.filesSuccess++;
+            }
+        }
+
+        reader.close();
+        return processSummary;
+    }
+
+    private LocalDateTime parseLogTime(String line) {
+        try {
+            String ts = line.substring(8, 27); // e.g., "2025-09-24 14:43:44"
+            return LocalDateTime.parse(ts, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String parseField(String line, String fieldName) {
+        try {
+            int idx = line.indexOf(fieldName + ":");
+            if (idx < 0) return null;
+            String part = line.substring(idx + fieldName.length() + 1).trim();
+            if (part.contains(" ")) part = part.split(" ")[0].trim();
+            return part;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String parseStatus(String line) {
+        try {
+            if (line.contains("Status:")) {
+                String part = line.substring(line.indexOf("Status:") + 7).trim();
+                if (part.contains(" ")) part = part.split(" ")[0];
+                return part;
+            }
+        } catch (Exception e) {}
+        return "Success";
+    }
+
+    private String extractNumber(String line, String key) {
+        try {
+            int idx = line.indexOf(key);
+            if (idx < 0) return null;
+            String part = line.substring(idx + key.length()).trim();
+            if (part.contains(" ")) part = part.split(" ")[0];
+            return part;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+}

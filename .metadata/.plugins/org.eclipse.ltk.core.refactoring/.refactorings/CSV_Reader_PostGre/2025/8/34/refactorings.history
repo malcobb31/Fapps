@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename type &apos;postgre_agent_v3.postgre_main&apos; to &apos;postgre_v3_main&apos;&#x0D;&#x0A;- Original project: &apos;CSV_Reader_PostGre&apos;&#x0D;&#x0A;- Original element: &apos;postgre_agent_v3.postgre_main&apos;&#x0D;&#x0A;- Renamed element: &apos;postgre_agent_v3.postgre_v3_main&apos;&#x0D;&#x0A;- Update references to refactored element&#x0D;&#x0A;- Update textual occurrences in comments and strings" description="Rename type &apos;postgre_main&apos;" flags="589830" id="org.eclipse.jdt.ui.rename.type" input="/src&lt;postgre_agent_v3{postgre_main.java[postgre_main" matchStrategy="1" name="postgre_v3_main" qualified="false" references="true" similarDeclarations="false" stamp="1755495139623" textual="false" version="1.0"/>
+</session>

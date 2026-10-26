@@ -1,0 +1,181 @@
+package rest_api;
+
+import java.sql.*;
+
+public class rest_api_DBConnection {
+    private Connection conn = null;
+
+    // Constructor to establish DB connection
+    public rest_api_DBConnection(String url, String user, String pass) throws SQLException {
+        try {
+            Class.forName("com.mysql.cj.jdbc.Driver"); // MySQL 8.x driver
+            conn = DriverManager.getConnection(url, user, pass);
+            conn.setAutoCommit(true);
+            System.out.println("DB connection established successfully");
+        } catch (ClassNotFoundException e) {
+            System.out.println("MySQL JDBC Driver not found!");
+            e.printStackTrace();
+        } catch (SQLException e) {
+            System.out.println("DB connection failed!");
+            throw e;
+        }
+    }
+
+    public void close() {
+        try {
+            if (conn != null) conn.close();
+        } catch (Exception e) {
+            // ignore
+        }
+    }
+
+    // ---------------- Utility methods for insert/update ----------------
+    public void insertOrUpdateRepository(int id, String name, long volumeQuota, String creationDateIso) throws SQLException {
+        try {
+            if (id > 0) {
+                String update = "UPDATE repository_details SET name = ?, volumeQuota = ?, creation_time = ? WHERE id = ?";
+                PreparedStatement ps = conn.prepareStatement(update);
+                ps.setString(1, name);
+                ps.setLong(2, volumeQuota);
+                ps.setTimestamp(3, toTimestamp(creationDateIso));
+                ps.setInt(4, id);
+                if (ps.executeUpdate() > 0) { ps.close(); return; }
+                ps.close();
+            }
+
+            String sel = "SELECT id FROM repository_details WHERE name = ?";
+            PreparedStatement psSel = conn.prepareStatement(sel);
+            psSel.setString(1, name);
+            ResultSet rs = psSel.executeQuery();
+            if (rs.next()) {
+                int existingId = rs.getInt(1);
+                rs.close(); psSel.close();
+                String upd = "UPDATE repository_details SET volumeQuota = ?, creation_time = ? WHERE id = ?";
+                PreparedStatement psUpd = conn.prepareStatement(upd);
+                psUpd.setLong(1, volumeQuota);
+                psUpd.setTimestamp(2, toTimestamp(creationDateIso));
+                psUpd.setInt(3, existingId);
+                psUpd.executeUpdate();
+                psUpd.close();
+                return;
+            }
+            rs.close(); psSel.close();
+
+            String insert = "INSERT INTO repository_details (id, name, volumeQuota, creation_time) VALUES (?, ?, ?, ?)";
+            PreparedStatement psIns = conn.prepareStatement(insert);
+            if (id > 0) psIns.setInt(1, id); else psIns.setNull(1, Types.INTEGER);
+            psIns.setString(2, name);
+            psIns.setLong(3, volumeQuota);
+            psIns.setTimestamp(4, toTimestamp(creationDateIso));
+            psIns.executeUpdate();
+            psIns.close();
+        } catch (SQLException e) {
+            System.out.println("Error in insertOrUpdateRepository: " + e.getMessage());
+            throw e;
+        }
+    }
+
+    public void insertOrUpdateProject(int id, String name, String creationDateIso) throws SQLException {
+        try {
+            if (id > 0) {
+                String update = "UPDATE archiving_project_details SET name = ?, creation_date = ? WHERE id = ?";
+                PreparedStatement ps = conn.prepareStatement(update);
+                ps.setString(1, name);
+                ps.setTimestamp(2, toTimestamp(creationDateIso));
+                ps.setInt(3, id);
+                if (ps.executeUpdate() > 0) { ps.close(); return; }
+                ps.close();
+            }
+
+            String sel = "SELECT id FROM archiving_project_details WHERE name = ?";
+            PreparedStatement psSel = conn.prepareStatement(sel);
+            psSel.setString(1, name);
+            ResultSet rs = psSel.executeQuery();
+            if (rs.next()) {
+                int existingId = rs.getInt(1);
+                rs.close(); psSel.close();
+                String upd = "UPDATE archiving_project_details SET creation_date = ? WHERE id = ?";
+                PreparedStatement psUpd = conn.prepareStatement(upd);
+                psUpd.setTimestamp(1, toTimestamp(creationDateIso));
+                psUpd.setInt(2, existingId);
+                psUpd.executeUpdate();
+                psUpd.close();
+                return;
+            }
+            rs.close(); psSel.close();
+
+            String insert = "INSERT INTO archiving_project_details (id, name, creation_date) VALUES (?, ?, ?)";
+            PreparedStatement psIns = conn.prepareStatement(insert);
+            if (id > 0) psIns.setInt(1, id); else psIns.setNull(1, Types.INTEGER);
+            psIns.setString(2, name);
+            psIns.setTimestamp(3, toTimestamp(creationDateIso));
+            psIns.executeUpdate();
+            psIns.close();
+        } catch (SQLException e) {
+            System.out.println("Error in insertOrUpdateProject: " + e.getMessage());
+            throw e;
+        }
+    }
+
+    public void insertOrUpdateBucket(int id, String name, String creationDateIso) throws SQLException {
+        try {
+            if (id > 0) {
+                String update = "UPDATE bucket_details SET name = ?, creation_date = ? WHERE id = ?";
+                PreparedStatement ps = conn.prepareStatement(update);
+                ps.setString(1, name);
+                ps.setTimestamp(2, toTimestamp(creationDateIso));
+                ps.setInt(3, id);
+                if (ps.executeUpdate() > 0) { ps.close(); return; }
+                ps.close();
+            }
+
+            String sel = "SELECT id FROM bucket_details WHERE name = ?";
+            PreparedStatement psSel = conn.prepareStatement(sel);
+            psSel.setString(1, name);
+            ResultSet rs = psSel.executeQuery();
+            if (rs.next()) {
+                int existingId = rs.getInt(1);
+                rs.close(); psSel.close();
+                String upd = "UPDATE bucket_details SET creation_date = ? WHERE id = ?";
+                PreparedStatement psUpd = conn.prepareStatement(upd);
+                psUpd.setTimestamp(1, toTimestamp(creationDateIso));
+                psUpd.setInt(2, existingId);
+                psUpd.executeUpdate();
+                psUpd.close();
+                return;
+            }
+            rs.close(); psSel.close();
+
+            String insert = "INSERT INTO bucket_details (id, name, creation_date) VALUES (?, ?, ?)";
+            PreparedStatement psIns = conn.prepareStatement(insert);
+            if (id > 0) psIns.setInt(1, id); else psIns.setNull(1, Types.INTEGER);
+            psIns.setString(2, name);
+            psIns.setTimestamp(3, toTimestamp(creationDateIso));
+            psIns.executeUpdate();
+            psIns.close();
+        } catch (SQLException e) {
+            System.out.println("Error in insertOrUpdateBucket: " + e.getMessage());
+            throw e;
+        }
+    }
+
+    // ------------------ Helper ------------------
+    private Timestamp toTimestamp(String isoDate) {
+        try {
+            if (isoDate == null || isoDate.isEmpty() || isoDate.equals("null")) {
+                return new Timestamp(System.currentTimeMillis());
+            }
+            String s = isoDate.replace("Z", "").replace('T', ' ');
+            if (s.contains(".")) {
+                String[] parts = s.split("\\.");
+                String ms = parts[1].length() >= 3 ? parts[1].substring(0, 3) : String.format("%-3s", parts[1]).replace(' ', '0');
+                s = parts[0] + "." + ms;
+            }
+            java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
+            java.util.Date d = sdf.parse(s);
+            return new Timestamp(d.getTime());
+        } catch (Exception e) {
+            return new Timestamp(System.currentTimeMillis());
+        }
+    }
+}

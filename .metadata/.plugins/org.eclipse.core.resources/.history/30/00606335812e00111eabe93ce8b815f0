@@ -1,0 +1,128 @@
+package com.fapps.api;
+
+import com.fapps.db.PostgreSQLConnection;
+import com.fapps.util.PrintUtilMsg;
+
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+
+/**
+ * SourceData - Data Retrieval from PostgreSQL Source Table
+ * 
+ * Methods:
+ * 1. fetchSourceData() - Get all data from source table with specified columns
+ */
+public class SourceData {
+    
+    PrintUtilMsg pu = new PrintUtilMsg();
+    
+    /**
+     * Fetch data from source table
+     * 
+     * @param sourceTableName - Source table name
+     * @param sourceColumns - Array of source column names to copy directly
+     * @param sourceCheckColumn - Column containing 'I'/'A' values
+     * @param dbURL - Database URL
+     * @param dbUser - Database username
+     * @param dbPass - Database password
+     * @return HashMap<UniqueKey, String[]> - All source data
+     */
+    public HashMap<String, String[]> fetchSourceData(String sourceTableName,
+                                                      String[] sourceColumns,
+                                                      String sourceCheckColumn,
+                                                      String dbURL,
+                                                      String dbUser,
+                                                      String dbPass) {
+        
+        HashMap<String, String[]> sourceData = null;
+        Connection conn = null;
+        Statement stmt = null;
+        ResultSet rs = null;
+        String query = null;
+        int rowCount = 0;
+        
+        try {
+            // Build SELECT query
+            StringBuilder selectQuery = new StringBuilder("SELECT ");
+            
+            // Add source columns
+            for (int i = 0; i < sourceColumns.length; i++) {
+                selectQuery.append(sourceColumns[i]);
+                selectQuery.append(", ");
+            }
+            
+            // Add check column
+            selectQuery.append(sourceCheckColumn);
+            
+            selectQuery.append(" FROM ").append(sourceTableName);
+            
+            query = selectQuery.toString();
+            
+            pu.sop("fetchSourceData", "Query: " + query);
+            
+            conn = new PostgreSQLConnection().getConnection(dbURL, dbUser, dbPass);
+            stmt = conn.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+            rs = stmt.executeQuery(query);
+            
+            rs.last();
+            rowCount = rs.getRow();
+            rs.beforeFirst();
+            
+            pu.sop("fetchSourceData", "Total source records fetched: " + rowCount);
+            
+            if (rowCount > 0) {
+                sourceData = new LinkedHashMap<String, String[]>();
+                
+                // Calculate total columns (source columns + check column)
+                int totalColumns = sourceColumns.length + 1;
+                
+                int count = 0;
+                while (rs.next()) {
+                    String[] record = new String[totalColumns];
+                    
+                    int colIndex = 0;
+                    
+                    // Get source columns
+                    for (int i = 0; i < sourceColumns.length; i++) {
+                        record[colIndex] = rs.getString(sourceColumns[i]);
+                        colIndex++;
+                    }
+                    
+                    // Get check column value
+                    record[colIndex] = rs.getString(sourceCheckColumn);
+                    
+                    // Create unique key: auto-incrementing count
+                    sourceData.put(String.valueOf(count), record);
+                    count++;
+                    
+                    // Log progress for large datasets
+                    if (count % 1000 == 0) {
+                        pu.sop("fetchSourceData", "Fetched " + count + " records so far...");
+                    }
+                }
+                
+                pu.sop("fetchSourceData", "Total records stored in HashMap: " + sourceData.size());
+            }
+            
+        } catch (Exception ex) {
+            System.out.println("EXCEPTION in fetchSourceData: " + ex.toString());
+            ex.printStackTrace();
+            sourceData = null;
+        } finally {
+            try {
+                if (conn != null) {
+                    if (rs != null) rs.close();
+                    if (stmt != null) stmt.close();
+                    conn.close();
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+        
+        return sourceData;
+    }
+}

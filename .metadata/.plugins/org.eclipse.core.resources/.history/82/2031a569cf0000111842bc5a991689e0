@@ -1,0 +1,371 @@
+package ntt_otp_main;
+
+import org.openqa.selenium.*;
+import org.openqa.selenium.chrome.ChromeDriver;
+import org.openqa.selenium.chrome.ChromeOptions;
+import org.openqa.selenium.support.ui.ExpectedConditions;
+import org.openqa.selenium.support.ui.WebDriverWait;
+
+import java.io.*;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.sql.*;
+import java.time.Duration;
+import java.util.*;
+
+public class ntt_otp_full {
+
+    //  DB (captcha + otp)
+    static String DB_URL = "jdbc:mysql://127.0.0.1:3306/urlScan";
+    static String DB_USER = "root";
+    static String DB_PASS = "admin@321";
+
+    //  CAPTCHA API
+    static String CAPTCHA_API =
+            "http://10.10.2.131/urlScan/fcm_test.php?fileName=";
+
+    //  Paths
+    static String CAPTCHA_DIR =
+            "/home/pview/apache_pview/htdocs/urlScan/captcha/";
+
+    static String DOWNLOAD_DIR =
+            "/home/pview/apache_pview/htdocs/urlScan/uploads/planFiles/";
+
+    public static void main(String[] args) throws Exception {
+
+        if (args.length < 1) {
+            System.out.println("Usage: java -jar automation.jar <order_id>");
+            return;
+        }
+
+        String order_id = args[0];
+
+        System.setProperty("webdriver.chrome.driver", "/usr/local/bin/chromedriver");
+
+        ChromeOptions options = new ChromeOptions();
+
+        options.addArguments("--headless=new");
+        options.addArguments("--remote-allow-origins=*");
+        options.addArguments("--disable-notifications");
+        options.addArguments("--window-size=1920,1080");
+        options.addArguments("--no-sandbox");
+        options.addArguments("--disable-dev-shm-usage");
+        options.setAcceptInsecureCerts(true);
+
+        //  FORCE DOWNLOAD PATH
+        Map<String, Object> prefs = new HashMap<>();
+        prefs.put("download.default_directory", DOWNLOAD_DIR);
+        prefs.put("download.prompt_for_download", false);
+        prefs.put("download.directory_upgrade", true);
+        prefs.put("safebrowsing.enabled", true);
+
+        options.setExperimentalOption("prefs", prefs);
+
+        WebDriver driver = new ChromeDriver(options);
+        WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(20));
+
+        try {
+
+            driver.get("https://ocbms.dot.gov.in/#/login-page");
+
+            //  USERNAME
+            WebElement userIdField = wait.until(
+                    ExpectedConditions.visibilityOfElementLocated(
+                            By.cssSelector("input[formcontrolname='email']")
+                    ));
+            userIdField.sendKeys("nttin.escalation.manager@global.ntt");
+
+            wait.until(ExpectedConditions.elementToBeClickable(
+                    By.xpath("//button[contains(., 'Submit')]"))).click();
+
+            //  PASSWORD
+            WebElement passwordField = wait.until(
+                    ExpectedConditions.visibilityOfElementLocated(
+                            By.cssSelector("input[placeholder='Enter password']")
+                    ));
+            passwordField.sendKeys("Microf@cus@1234");
+
+            //  CAPTURE CAPTCHA
+            WebElement captchaImg = wait.until(
+                    ExpectedConditions.presenceOfElementLocated(
+                            By.xpath("//img[contains(@src, 'data:image')]"))
+            );
+
+            String src = captchaImg.getAttribute("src");
+            String base64Image = src.split(",")[1];
+            byte[] imageBytes = Base64.getDecoder().decode(base64Image);
+
+            String captchaFileName = "captcha_" + order_id + ".png";
+            File captchaFile = new File(CAPTCHA_DIR + captchaFileName);
+
+            try (FileOutputStream fos = new FileOutputStream(captchaFile)) {
+                fos.write(imageBytes);
+            }
+
+            System.out.println("Captcha saved: " + captchaFile.getAbsolutePath());
+
+            //  CALL CAPTCHA API
+            callCaptchaAPI(captchaFileName, order_id);
+
+            //  WAIT CAPTCHA FROM DB
+            CaptchaResult captchaResult = waitForCaptchaFromDB(20, 5);
+
+            if (captchaResult == null) {
+                System.out.println("Captcha not received.");
+                driver.quit();
+                return;
+            }
+
+            //  INJECT CAPTCHA
+            driver.findElement(
+                    By.cssSelector("input[placeholder='Enter captcha']")
+            ).sendKeys(captchaResult.captchaCode);
+
+            wait.until(ExpectedConditions.elementToBeClickable(
+                    By.xpath("//button[contains(., 'Next')]"))).click();
+
+            //  WAIT OTP
+            String otp = waitForOTPFromDB(5, 20, captchaResult.createdAt);
+
+            if (otp == null) {
+                System.out.println("OTP not received.");
+                driver.quit();
+                return;
+            }
+
+            WebElement otpField = wait.until(
+                    ExpectedConditions.visibilityOfElementLocated(
+                            By.cssSelector("input[formcontrolname='otp']")
+                    ));
+            otpField.sendKeys(otp);
+
+            //  LOGIN
+            WebElement loginBtn = wait.until(
+                    ExpectedConditions.elementToBeClickable(
+                            By.cssSelector("div.row.mb-1.px-3.mt-4.float-right button.btn-primary")
+                    ));
+
+            ((JavascriptExecutor) driver)
+                    .executeScript("arguments[0].click();", loginBtn);
+
+            System.out.println("Login Successful!");
+
+            wait.until(ExpectedConditions.invisibilityOfElementLocated(By.id("pause")));
+
+            //  GO TO PENDING
+            WebElement totalPendingBtn = wait.until(
+                    ExpectedConditions.presenceOfElementLocated(
+                            By.cssSelector("div.col-auto.icon i.fas.fa-archive")
+                    ));
+
+            ((JavascriptExecutor) driver)
+                    .executeScript("arguments[0].click();", totalPendingBtn);
+
+            Thread.sleep(2000);
+
+            //  SEARCH ORDER
+            WebElement searchBox = wait.until(
+                    ExpectedConditions.visibilityOfElementLocated(
+                            By.cssSelector("#myTable_filter input[type='search']")
+                    ));
+
+            searchBox.clear();
+            searchBox.sendKeys(order_id);
+
+            wait.until(ExpectedConditions.presenceOfElementLocated(
+                    By.cssSelector("#myTable tbody tr")));
+
+            List<WebElement> rows =
+                    driver.findElements(By.cssSelector("#myTable tbody tr"));
+
+            boolean found = false;
+
+            for (WebElement row : rows) {
+
+                try {
+
+                    WebElement orderLink =
+                            row.findElement(By.cssSelector("a.regclickpreview"));
+
+                    if (orderLink.getText().trim().equalsIgnoreCase(order_id)) {
+
+                        ((JavascriptExecutor) driver)
+                                .executeScript("arguments[0].click();", orderLink);
+
+                        found = true;
+                        break;
+                    }
+
+                } catch (Exception ignored) {}
+            }
+
+            if (!found) {
+                System.out.println("Order NOT found!");
+                driver.quit();
+                return;
+            }
+
+            //  DETECT BLOCK / UNBLOCK
+            String statusType = "unknown";
+
+            wait.until(ExpectedConditions.visibilityOfElementLocated(
+                    By.cssSelector("app-preview .modal-dialog")));
+
+            WebElement blockInput = driver.findElement(By.id("blocking"));
+            WebElement unblockInput = driver.findElement(By.id("unblocking"));
+
+            if (blockInput.isSelected())
+                statusType = "Blocking";
+            else if (unblockInput.isSelected())
+                statusType = "Unblocking";
+
+            System.out.println("Detected Type: " + statusType);
+
+            //  EXPORT
+            WebElement exportButton = wait.until(
+                    ExpectedConditions.elementToBeClickable(
+                            By.cssSelector("span.btn-export")));
+
+            ((JavascriptExecutor) driver)
+                    .executeScript("arguments[0].click();", exportButton);
+
+            System.out.println("Waiting for XLS download...");
+            Thread.sleep(8000);
+
+            //  RENAME FILE
+            File dir = new File(DOWNLOAD_DIR);
+
+            File latest = Arrays.stream(dir.listFiles())
+                    .filter(f -> f.getName().endsWith(".xls"))
+                    .max(Comparator.comparingLong(File::lastModified))
+                    .orElse(null);
+
+            if (latest != null) {
+
+                File renamed = new File(
+                        DOWNLOAD_DIR + statusType + "_" + order_id + ".xls");
+
+                latest.renameTo(renamed);
+
+                System.out.println("Saved: " + renamed.getAbsolutePath());
+            }
+
+        } finally {
+            driver.quit();
+        }
+    }
+
+
+    // CAPTCHA API
+    
+
+    public static void callCaptchaAPI(String file, String order_id) {
+
+        try {
+
+            String fullUrl = CAPTCHA_API + file + "&notice_id=" + order_id;
+
+            URL url = new URL(fullUrl);
+            HttpURLConnection conn =
+                    (HttpURLConnection) url.openConnection();
+
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(10000);
+
+            System.out.println("Captcha API Response: " + conn.getResponseCode());
+
+        } catch (Exception e) {
+            System.out.println("Captcha API Failed: " + e.getMessage());
+        }
+    }
+
+    // CAPTCHA DB
+
+
+    public static CaptchaResult waitForCaptchaFromDB(int max, int waitSec) {
+
+        for (int i = 1; i <= max; i++) {
+
+            try (Connection conn =
+                         DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {
+
+                String q = "SELECT sno,captcha_code,created_at " +
+                        "FROM captcha_table WHERE is_used=0 " +
+                        "ORDER BY sno DESC LIMIT 1";
+
+                ResultSet rs = conn.prepareStatement(q).executeQuery();
+
+                if (rs.next()) {
+
+                    int sno = rs.getInt("sno");
+
+                    conn.prepareStatement(
+                            "UPDATE captcha_table SET is_used=1 WHERE sno=" + sno
+                    ).executeUpdate();
+
+                    return new CaptchaResult(
+                            rs.getString("captcha_code"),
+                            rs.getTimestamp("created_at")
+                    );
+                }
+
+            } catch (Exception e) {
+                System.out.println("Captcha DB error: " + e.getMessage());
+            }
+
+            sleep(waitSec);
+        }
+
+        return null;
+    }
+
+
+    // OTP DB
+ 
+
+    public static String waitForOTPFromDB(
+            int max, int waitSec, Timestamp captchaTime) {
+
+        for (int i = 1; i <= max; i++) {
+
+            try (Connection conn =
+                         DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {
+
+                PreparedStatement ps = conn.prepareStatement(
+                        "SELECT otp FROM otp_table WHERE created_at >= ? " +
+                                "ORDER BY sno DESC LIMIT 1");
+
+                ps.setTimestamp(1, captchaTime);
+
+                ResultSet rs = ps.executeQuery();
+
+                if (rs.next())
+                    return rs.getString("otp");
+
+            } catch (Exception e) {
+                System.out.println("OTP DB error: " + e.getMessage());
+            }
+
+            sleep(waitSec);
+        }
+
+        return null;
+    }
+
+    static void sleep(int s) {
+        try { Thread.sleep(s * 1000L); }
+        catch (Exception ignored) {}
+    }
+
+    static class CaptchaResult {
+
+        String captchaCode;
+        Timestamp createdAt;
+
+        CaptchaResult(String c, Timestamp t) {
+            captchaCode = c;
+            createdAt = t;
+        }
+    }
+}

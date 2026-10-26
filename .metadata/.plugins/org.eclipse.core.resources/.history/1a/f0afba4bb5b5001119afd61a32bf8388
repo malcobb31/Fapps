@@ -1,0 +1,1366 @@
+package ntp20_process_v1;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.sql.BatchUpdateException;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+class ntp20_process_methods {
+
+    private final String processName;
+    private final String processVersion;
+    private final String jdbcUrl;
+    private final String dbUser;
+    private final String dbPassword;
+    private final String delimiter;
+    private final String serverIP;
+    private final boolean debugEnabled;
+    private final DateTimeFormatter logFormat;
+    private final Charset fileCharset;
+
+    private static final int MAX_PARALLEL_FILES = 5;
+    private static final int BATCH_SIZE = 1000;
+
+    private static final String TARGET_SCHEMA = "re_mgmt";
+    private static final String TARGET_TABLE = "user_branch_region_pview";
+
+    private static final String REPORTING_ENTITY_LOOKUP_SQL =
+            "SELECT id, fi_code FROM re_mgmt.reporting_entity";
+
+    private static final String REGION_LOOKUP_SQL =
+            "SELECT id, region_code, reporting_entity_id FROM re_mgmt.region";
+
+    private static final String BRANCH_LOOKUP_SQL =
+            "SELECT id, branch_code, region_id FROM re_mgmt.branch";
+
+    private static final String EXISTING_TARGET_USER_IDS_SQL =
+            "SELECT user_id FROM re_mgmt.user_branch_region_pview";
+
+    private static final String RE_USER_STATUS_LOOKUP_SQL =
+            "SELECT user_id, status FROM re_mgmt.re_user_pview";
+
+    private static final String ACTIVE_STATUS_VALUE = "TESTBED";
+
+    private static final Set<String> ELIGIBLE_USER_TYPES;
+    static {
+        Set<String> s = new HashSet<String>();
+        s.add("IRA");
+        s.add("IRU");
+        s.add("IBU");
+        ELIGIBLE_USER_TYPES = Collections.unmodifiableSet(s);
+    }
+
+    private static final String INSERT_SQL =
+            "INSERT INTO re_mgmt.user_branch_region_pview (" +
+            "id, user_id, branch_id, region_id, active, version, created_at, created_by, updated_at, updated_by" +
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+    private static final List<String> INSERT_COLUMNS = Collections.unmodifiableList(Arrays.asList(
+            "id",
+            "user_id",
+            "branch_id",
+            "region_id",
+            "active",
+            "version",
+            "created_at",
+            "created_by",
+            "updated_at",
+            "updated_by"
+    ));
+
+    private static final Map<String, List<String>> SOURCE_ALIASES;
+    static {
+        Map<String, List<String>> m = new LinkedHashMap<String, List<String>>();
+        m.put("user_id", Arrays.asList("user_id", "USER_ID"));
+        m.put("bc_organisation", Arrays.asList("bc_organisation", "BC_ORGANISATION"));
+        m.put("region_code", Arrays.asList("region_code", "REGION_CODE"));
+        m.put("user_branch_id", Arrays.asList("user_branch_id", "USER_BRANCH_ID"));
+        m.put("user_mode", Arrays.asList("user_mode", "USER_MODE"));
+        m.put("active", Arrays.asList("active", "ACTIVE", "agent_status", "AGENT_STATUS"));
+        m.put("version", Arrays.asList("version_no", "version", "VERSION_NO", "VERSION"));
+        m.put("created_at", Arrays.asList("user_created_date", "created_at", "CREATED_AT"));
+        m.put("created_by", Arrays.asList("user_created_by", "created_by", "CREATED_BY"));
+        m.put("updated_at", Arrays.asList("user_acti_deacti_maker_time", "last_updated_date", "updated_at", "UPDATED_AT"));
+        m.put("updated_by", Arrays.asList("user_acti_deacti_maker_id", "last_updated_by", "updated_by", "UPDATED_BY"));
+        SOURCE_ALIASES = Collections.unmodifiableMap(m);
+    }
+
+    ntp20_process_methods(String processName,
+                          String processVersion,
+                          String jdbcUrl,
+                          String dbUser,
+                          String dbPassword,
+                          String delimiter,
+                          String serverIP) {
+        this.processName = processName == null ? "NTP20" : processName;
+        this.processVersion = processVersion == null ? "1.0.0" : processVersion;
+        this.jdbcUrl = jdbcUrl;
+        this.dbUser = dbUser;
+        this.dbPassword = dbPassword;
+        this.delimiter = (delimiter == null || delimiter.length() == 0) ? "|" : delimiter;
+        this.serverIP = serverIP;
+        this.debugEnabled = true;
+        this.logFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+        this.fileCharset = StandardCharsets.UTF_8;
+    }
+
+    public void process(File input) {
+        if (input == null) {
+            log("ERROR", "Input path is null", serverIP, "FATAL_ERROR");
+            return;
+        }
+
+        log("INFO", "Process started: " + input.getAbsolutePath(), serverIP, "START");
+
+        Map<String, ReportingEntityRow> reportingEntityLookup;
+        Map<String, RegionRow> regionLookup;
+        Map<String, BranchRow> branchLookup;
+        Set<String> existingTargetUserIds;
+        Map<String, String> reUserStatusLookup;
+
+        try {
+            reportingEntityLookup = loadReportingEntityLookup();
+            regionLookup = loadRegionLookup();
+            branchLookup = loadBranchLookup();
+            existingTargetUserIds = loadExistingTargetUserIds();
+            reUserStatusLookup = loadReUserStatusLookup();
+        } catch (SQLException e) {
+            log("ERROR", "Fatal error loading lookups: " + rootCause(e), serverIP, "FATAL_ERROR");
+            return;
+        }
+
+        log("INFO", "Lookup loaded: reporting_entity=" + reportingEntityLookup.size()
+                + " region=" + regionLookup.size()
+                + " branch=" + branchLookup.size()
+                + " target_user_ids=" + existingTargetUserIds.size()
+                + " re_user_status=" + reUserStatusLookup.size(), serverIP, "LOOKUP_LOADED");
+
+        if (input.isFile()) {
+            DirectorySummary ds = new DirectorySummary();
+            FileSummary fs = processOneFile(input, reportingEntityLookup, regionLookup, branchLookup, existingTargetUserIds, reUserStatusLookup);
+            ds.totalFiles = 1;
+            if (fs != null) {
+                ds.accumulate(fs);
+            }
+            log("INFO", buildDirectorySummary(ds), serverIP, "DIR_SUMMARY");
+            return;
+        }
+
+        File[] files = input.listFiles();
+        if (files == null || files.length == 0) {
+            DirectorySummary ds = new DirectorySummary();
+            log("INFO", buildDirectorySummary(ds), serverIP, "DIR_SUMMARY");
+            return;
+        }
+
+        List<File> csvFiles = new ArrayList<File>();
+        for (File f : files) {
+            if (f != null && f.isFile() && f.getName().toLowerCase(Locale.ENGLISH).endsWith(".csv")) {
+                csvFiles.add(f);
+            }
+        }
+
+        Collections.sort(csvFiles, new Comparator<File>() {
+            @Override
+            public int compare(File a, File b) {
+                return a.getName().compareToIgnoreCase(b.getName());
+            }
+        });
+
+        DirectorySummary ds = new DirectorySummary();
+        ds.totalFiles = csvFiles.size();
+
+        final Map<String, ReportingEntityRow> finalReportingEntityLookup = reportingEntityLookup;
+        final Map<String, RegionRow> finalRegionLookup = regionLookup;
+        final Map<String, BranchRow> finalBranchLookup = branchLookup;
+        final Set<String> finalExistingTargetUserIds = existingTargetUserIds;
+        final Map<String, String> finalReUserStatusLookup = reUserStatusLookup;
+
+        ExecutorService executor = Executors.newFixedThreadPool(Math.min(MAX_PARALLEL_FILES, Math.max(1, csvFiles.size())));
+        List<Future<FileSummary>> futures = new ArrayList<Future<FileSummary>>();
+
+        for (final File file : csvFiles) {
+            futures.add(executor.submit(new Callable<FileSummary>() {
+                @Override
+                public FileSummary call() {
+                    return processOneFile(file, finalReportingEntityLookup, finalRegionLookup, finalBranchLookup, finalExistingTargetUserIds, finalReUserStatusLookup);
+                }
+            }));
+        }
+
+        executor.shutdown();
+
+        for (Future<FileSummary> future : futures) {
+            try {
+                FileSummary fs = future.get();
+                if (fs != null) {
+                    ds.accumulate(fs);
+                }
+            } catch (Exception e) {
+                ds.errorFiles++;
+                log("ERROR", "Fatal file execution error: " + rootCause(e), serverIP, "FATAL_ERROR");
+            }
+        }
+
+        log("INFO", buildDirectorySummary(ds), serverIP, "DIR_SUMMARY");
+    }
+
+    private Map<String, ReportingEntityRow> loadReportingEntityLookup() throws SQLException {
+        Map<String, ReportingEntityRow> map = new HashMap<String, ReportingEntityRow>();
+        Connection connection = null;
+        Statement st = null;
+        ResultSet rs = null;
+
+        try {
+            connection = openConnection();
+            st = connection.createStatement();
+            rs = st.executeQuery(REPORTING_ENTITY_LOOKUP_SQL);
+
+            while (rs.next()) {
+                UUID id = parseUuid(rs.getObject("id"));
+                String fiCode = normalizeKey(rs.getString("fi_code"));
+                if (id == null || fiCode == null) {
+                    continue;
+                }
+
+                ReportingEntityRow row = new ReportingEntityRow(id, fiCode);
+                if (!map.containsKey(fiCode)) {
+                    map.put(fiCode, row);
+                }
+            }
+        } finally {
+            closeQuietly(rs);
+            closeQuietly(st);
+            closeQuietly(connection);
+        }
+
+        return map;
+    }
+
+    private Map<String, RegionRow> loadRegionLookup() throws SQLException {
+        Map<String, RegionRow> map = new HashMap<String, RegionRow>();
+        Connection connection = null;
+        Statement st = null;
+        ResultSet rs = null;
+
+        try {
+            connection = openConnection();
+            st = connection.createStatement();
+            rs = st.executeQuery(REGION_LOOKUP_SQL);
+
+            while (rs.next()) {
+                UUID id = parseUuid(rs.getObject("id"));
+                UUID reportingEntityId = parseUuid(rs.getObject("reporting_entity_id"));
+                String regionCode = normalizeKey(rs.getString("region_code"));
+
+                if (id == null || reportingEntityId == null || regionCode == null) {
+                    continue;
+                }
+
+                String key = composeKey(regionCode, reportingEntityId);
+                RegionRow row = new RegionRow(id, regionCode, reportingEntityId);
+                if (!map.containsKey(key)) {
+                    map.put(key, row);
+                }
+            }
+        } finally {
+            closeQuietly(rs);
+            closeQuietly(st);
+            closeQuietly(connection);
+        }
+
+        return map;
+    }
+
+    private Map<String, BranchRow> loadBranchLookup() throws SQLException {
+        Map<String, BranchRow> map = new HashMap<String, BranchRow>();
+        Connection connection = null;
+        Statement st = null;
+        ResultSet rs = null;
+
+        try {
+            connection = openConnection();
+            st = connection.createStatement();
+            rs = st.executeQuery(BRANCH_LOOKUP_SQL);
+
+            while (rs.next()) {
+                UUID id = parseUuid(rs.getObject("id"));
+                UUID regionId = parseUuid(rs.getObject("region_id"));
+                String branchCode = normalizeKey(rs.getString("branch_code"));
+
+                if (id == null || regionId == null || branchCode == null) {
+                    continue;
+                }
+
+                String key = composeKey(branchCode, regionId);
+                BranchRow row = new BranchRow(id, branchCode, regionId);
+                if (!map.containsKey(key)) {
+                    map.put(key, row);
+                }
+            }
+        } finally {
+            closeQuietly(rs);
+            closeQuietly(st);
+            closeQuietly(connection);
+        }
+
+        return map;
+    }
+
+    private Set<String> loadExistingTargetUserIds() throws SQLException {
+        Set<String> set = new HashSet<String>();
+        Connection connection = null;
+        Statement st = null;
+        ResultSet rs = null;
+
+        try {
+            connection = openConnection();
+            st = connection.createStatement();
+            rs = st.executeQuery(EXISTING_TARGET_USER_IDS_SQL);
+
+            while (rs.next()) {
+                String userId = normalize(rs.getString("user_id"));
+                if (userId != null) {
+                    set.add(userId);
+                }
+            }
+        } finally {
+            closeQuietly(rs);
+            closeQuietly(st);
+            closeQuietly(connection);
+        }
+
+        return set;
+    }
+
+    /**
+     * Loads user_id -> re_user.status for every user in re_mgmt.re_user_pview.
+     * Used to derive the 'active' flag written to re_mgmt.user_branch_region_v1:
+     *   status == 'TESTBED' -> active = true
+     *   any other status (or no re_user match at all) -> active = false
+     */
+    private Map<String, String> loadReUserStatusLookup() throws SQLException {
+        Map<String, String> map = new HashMap<String, String>();
+        Connection connection = null;
+        Statement st = null;
+        ResultSet rs = null;
+
+        try {
+            connection = openConnection();
+            st = connection.createStatement();
+            rs = st.executeQuery(RE_USER_STATUS_LOOKUP_SQL);
+
+            while (rs.next()) {
+                String userId = normalize(rs.getString("user_id"));
+                String status = normalize(rs.getString("status"));
+                if (userId == null) {
+                    continue;
+                }
+                map.put(userId, status);
+            }
+        } finally {
+            closeQuietly(rs);
+            closeQuietly(st);
+            closeQuietly(connection);
+        }
+
+        return map;
+    }
+
+    private FileSummary processOneFile(File file,
+                                       Map<String, ReportingEntityRow> reportingEntityLookup,
+                                       Map<String, RegionRow> regionLookup,
+                                       Map<String, BranchRow> branchLookup,
+                                       Set<String> existingTargetUserIds,
+                                       Map<String, String> reUserStatusLookup) {
+        FileSummary summary = new FileSummary(file == null ? "NA" : file.getName());
+        summary.status = "STARTED";
+        summary.effectiveBatchSize = BATCH_SIZE;
+
+        log("INFO", "File start: " + summary.fileName, serverIP, "FILE_START");
+
+        BufferedReader reader = null;
+        Connection connection = null;
+        PreparedStatement ps = null;
+        boolean fatal = false;
+
+        Set<String> seenUserIds = new HashSet<String>();
+        Set<String> duplicateUserIds = new HashSet<String>();
+        List<String> lookupFailures = new ArrayList<String>();
+
+        try {
+            if (file == null || !file.exists()) {
+                summary.status = "MISSING";
+                summary.dbFailed++;
+                fatal = true;
+                return summary;
+            }
+
+            reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), fileCharset));
+            String headerLine = reader.readLine();
+
+            if (headerLine == null) {
+                summary.status = "EMPTY_FILE";
+                summary.emptyFile = true;
+                File moved = moveAfterSuccess(file);
+                summary.moved = moved != null;
+                log("INFO", "File moved: " + summary.fileName + " -> " + (moved != null ? moved.getAbsolutePath() : "NA"), serverIP, "FILE_MOVED");
+                logFileSummary(summary);
+                return summary;
+            }
+
+            List<String> headers = parseCsvLine(headerLine, delimiter.charAt(0));
+            Map<String, Integer> headerIndex = buildHeaderIndex(headers);
+
+            if (headerIndex.isEmpty()) {
+                summary.status = "HEADER_ONLY";
+                summary.headerOnlyFile = true;
+                File moved = moveAfterSuccess(file);
+                summary.moved = moved != null;
+                log("INFO", "File moved: " + summary.fileName + " -> " + (moved != null ? moved.getAbsolutePath() : "NA"), serverIP, "FILE_MOVED");
+                logFileSummary(summary);
+                return summary;
+            }
+
+            connection = openConnection();
+            connection.setAutoCommit(false);
+            ps = connection.prepareStatement(INSERT_SQL);
+
+            String line;
+            int batchCount = 0;
+            int lineNumber = 1;
+
+            while ((line = reader.readLine()) != null) {
+                lineNumber++;
+
+                if (line.trim().length() == 0) {
+                    summary.blankLines++;
+                    continue;
+                }
+
+                summary.dataRows++;
+
+                List<String> rowTokens = parseCsvLine(line, delimiter.charAt(0));
+                RowBuildResult row = buildRow(
+                        rowTokens,
+                        headerIndex,
+                        reportingEntityLookup,
+                        regionLookup,
+                        branchLookup,
+                        existingTargetUserIds,
+                        reUserStatusLookup,
+                        seenUserIds,
+                        duplicateUserIds,
+                        lookupFailures,
+                        lineNumber);
+
+                if (row.logMessage != null) {
+                    log(row.logLevel, row.logMessage, serverIP, row.evtType);
+                }
+
+                if (!row.ok) {
+                    if (row.skipIneligibleType) {
+                        summary.skippedIneligibleType++;
+                    } else if (row.duplicateInFile) {
+                        summary.duplicateInFile++;
+                    } else if (row.duplicateInTarget) {
+                        summary.duplicateInTarget++;
+                    } else if (row.lookupFailure) {
+                        summary.lookupFailures++;
+                    } else {
+                        summary.rowErrors++;
+                    }
+                    summary.skipped++;
+                    continue;
+                }
+
+                bindRow(ps, row.rowValues);
+                ps.addBatch();
+                batchCount++;
+
+                if (batchCount >= BATCH_SIZE) {
+                    executeBatch(ps, summary, file.getName(), batchCount);
+                    batchCount = 0;
+                }
+            }
+
+            if (batchCount > 0) {
+                executeBatch(ps, summary, file.getName(), batchCount);
+            }
+
+            connection.commit();
+            summary.status = summary.dataRows == 0 ? "HEADER_ONLY" : "SUCCESS";
+            if (summary.dataRows == 0) {
+                summary.headerOnlyFile = true;
+            }
+
+            if (!duplicateUserIds.isEmpty()) {
+                log("WARN",
+                        "Duplicate user_ids found (" + duplicateUserIds.size() + "): " + joinSet(duplicateUserIds),
+                        serverIP,
+                        "DUPLICATE_SUMMARY");
+            }
+
+            if (!lookupFailures.isEmpty()) {
+                log("WARN",
+                        "Lookup failures found (" + lookupFailures.size() + "): " + joinList(lookupFailures),
+                        serverIP,
+                        "LOOKUP_FAILURES");
+            }
+
+            File moved = moveAfterSuccess(file);
+            summary.moved = moved != null;
+            if (moved != null) {
+                log("INFO", "File moved: " + summary.fileName + " -> " + moved.getAbsolutePath(), serverIP, "FILE_MOVED");
+            } else {
+                log("WARN", "File not moved after commit: " + summary.fileName, serverIP, "FILE_MOVED");
+            }
+
+            logFileSummary(summary);
+        } catch (BatchUpdateException bue) {
+            summary.batchFailures++;
+            summary.dbFailed++;
+            summary.status = "BATCH_FAILURE";
+            fatal = true;
+            log("ERROR", "Batch failure on file " + summary.fileName + ": " + rootCause(bue), serverIP, "BATCH_FAILURE");
+        } catch (SQLException sqle) {
+            summary.dbFailed++;
+            summary.status = "DB_ERROR";
+            fatal = true;
+            log("ERROR", "Database error on file " + summary.fileName + ": " + rootCause(sqle), serverIP, "FATAL_ERROR");
+        } catch (Exception e) {
+            summary.dbFailed++;
+            summary.status = "FATAL_ERROR";
+            fatal = true;
+            log("ERROR", "Fatal error on file " + summary.fileName + ": " + rootCause(e), serverIP, "FATAL_ERROR");
+        } finally {
+            if (fatal) {
+                rollbackQuietly(connection);
+                summary.moved = false;
+                log("WARN", "File retained in source directory: " + summary.fileName, serverIP, "FILE_RETAINED");
+                logFileSummary(summary);
+            }
+            closeQuietly(ps);
+            closeQuietly(connection);
+            closeQuietly(reader);
+        }
+
+        return summary;
+    }
+
+    private Connection openConnection() throws SQLException {
+        return DriverManager.getConnection(jdbcUrl, dbUser, dbPassword);
+    }
+
+    private void executeBatch(PreparedStatement ps, FileSummary summary, String fileName, int batchCount) throws SQLException {
+        try {
+            ps.executeBatch();
+            ps.clearBatch();
+            summary.inserted += batchCount;
+        } catch (BatchUpdateException bue) {
+            summary.batchFailures++;
+            log("ERROR", "Batch execution failure for file " + fileName + ": " + rootCause(bue), serverIP, "BATCH_FAILURE");
+            throw bue;
+        }
+    }
+
+    /**
+     * Lookup flow:
+     * IBU:
+     *   1) bc_organisation -> reporting_entity.fi_code -> reporting_entity.id
+     *   2) region_code + reporting_entity.id -> region.region_code + region.reporting_entity_id -> region.id
+     *   3) user_branch_id + region.id -> branch.branch_code + branch.region_id -> branch.id
+     *
+     * IRA / IRU:
+     *   1) bc_organisation -> reporting_entity.fi_code -> reporting_entity.id
+     *   2) region_code + reporting_entity.id -> region.region_code + region.reporting_entity_id -> region.id
+     *   3) branch_id is not required and is inserted as NULL
+     *
+     * Any missing mandatory step is logged and the row is skipped.
+     *
+     * active flag:
+     *   Looked up from re_mgmt.re_user_pview.status for this user_id.
+     *   status == 'TESTBED' -> active = true
+     *   any other status, or no re_user match -> active = false
+     */
+    private RowBuildResult buildRow(List<String> rowTokens,
+                                    Map<String, Integer> headerIndex,
+                                    Map<String, ReportingEntityRow> reportingEntityLookup,
+                                    Map<String, RegionRow> regionLookup,
+                                    Map<String, BranchRow> branchLookup,
+                                    Set<String> existingTargetUserIds,
+                                    Map<String, String> reUserStatusLookup,
+                                    Set<String> seenUserIds,
+                                    Set<String> duplicateUserIds,
+                                    List<String> lookupFailures,
+                                    int lineNumber) {
+
+        String userTypeRaw = normalize(getValueFromAliases(rowTokens, headerIndex, "user_mode"));
+        String userType = userTypeRaw == null ? null : userTypeRaw.toUpperCase(Locale.ENGLISH);
+
+        if (userType == null || !ELIGIBLE_USER_TYPES.contains(userType)) {
+            return RowBuildResult.skipType(
+                    "Skipping line=" + lineNumber + " because user_mode=" + userTypeRaw + " is not eligible",
+                    "ROW_SKIPPED");
+        }
+
+        Map<String, Object> values = new LinkedHashMap<String, Object>();
+
+        UUID generatedId = UUID.randomUUID();
+        values.put("id", generatedId);
+
+        String userId = normalize(getValueFromAliases(rowTokens, headerIndex, "user_id"));
+        if (userId == null) {
+            return RowBuildResult.rowError(
+                    "Skipping line=" + lineNumber + " because user_id is missing",
+                    "ROW_ERROR");
+        }
+
+        if (!seenUserIds.add(userId)) {
+            if (duplicateUserIds.add(userId)) {
+                log("WARN",
+                        "Duplicate user_id found in CSV line=" + lineNumber + " user_id=" + userId,
+                        serverIP,
+                        "DUPLICATE_USER_ID");
+            }
+            return RowBuildResult.duplicateInFile(
+                    "Skipping line=" + lineNumber + " because user_id=" + userId + " is duplicated in CSV",
+                    "DUPLICATE_USER_ID");
+        }
+
+        if (existingTargetUserIds != null && existingTargetUserIds.contains(userId)) {
+            return RowBuildResult.duplicateInTarget(
+                    "Skipping line=" + lineNumber + " because user_id=" + userId + " already exists in target table; this row would replace an existing record if upsert were enabled",
+                    "DUPLICATE_REPLACE_CANDIDATE");
+        }
+
+        values.put("user_id", userId);
+
+        /*
+         * Mandatory parent check:
+         * user_branch_region_pview.user_id -> re_user.user_id
+         *
+         * If the user does not exist in re_user, do not add the row
+         * to the JDBC batch because it would fail the FK constraint.
+         */
+        if (reUserStatusLookup == null || !reUserStatusLookup.containsKey(userId)) {
+            String msg = "Skipping line=" + lineNumber
+                    + " user_id=" + userId
+                    + " because user_id not found in re_mgmt.re_user_pview";
+
+            lookupFailures.add(msg);
+            return RowBuildResult.lookupFailure(msg, "LOOKUP_MISS");
+        }
+
+        String fiCode = normalize(getValueFromAliases(rowTokens, headerIndex, "bc_organisation"));
+
+        
+        if (fiCode == null) {
+            String msg = "Skipping line=" + lineNumber + " user_id=" + userId + " because bc_organisation is missing";
+            lookupFailures.add(msg);
+            return RowBuildResult.lookupFailure(msg, "LOOKUP_MISS");
+        }
+
+        ReportingEntityRow reportingEntity = reportingEntityLookup == null ? null : reportingEntityLookup.get(normalizeKey(fiCode));
+        if (reportingEntity == null || reportingEntity.id == null) {
+            String msg = "Skipping line=" + lineNumber + " user_id=" + userId + " because reporting_entity not found for bc_organisation=" + fiCode;
+            lookupFailures.add(msg);
+            return RowBuildResult.lookupFailure(msg, "LOOKUP_MISS");
+        }
+
+        String regionCode = normalize(getValueFromAliases(rowTokens, headerIndex, "region_code"));
+        if (regionCode == null) {
+            String msg = "Skipping line=" + lineNumber + " user_id=" + userId + " because region_code is missing";
+            lookupFailures.add(msg);
+            return RowBuildResult.lookupFailure(msg, "LOOKUP_MISS");
+        }
+
+        String regionKey = composeKey(regionCode, reportingEntity.id);
+        RegionRow region = regionLookup == null ? null : regionLookup.get(regionKey);
+        if (region == null || region.id == null) {
+            String msg = "Skipping line=" + lineNumber + " user_id=" + userId +
+                    " because region not found for region_code=" + regionCode +
+                    " and reporting_entity_id=" + reportingEntity.id;
+            lookupFailures.add(msg);
+            return RowBuildResult.lookupFailure(msg, "LOOKUP_MISS");
+        }
+
+        values.put("region_id", region.id);
+
+        if ("IBU".equals(userType)) {
+            String branchCode = normalize(getValueFromAliases(rowTokens, headerIndex, "user_branch_id"));
+            if (branchCode == null) {
+                String msg = "Skipping line=" + lineNumber + " user_id=" + userId + " because user_branch_id is missing";
+                lookupFailures.add(msg);
+                return RowBuildResult.lookupFailure(msg, "LOOKUP_MISS");
+            }
+
+            String branchKey = composeKey(branchCode, region.id);
+            BranchRow branch = branchLookup == null ? null : branchLookup.get(branchKey);
+            if (branch == null || branch.id == null) {
+                String msg = "Skipping line=" + lineNumber + " user_id=" + userId +
+                        " because branch not found for user_branch_id=" + branchCode +
+                        " and region_id=" + region.id;
+                lookupFailures.add(msg);
+                return RowBuildResult.lookupFailure(msg, "LOOKUP_MISS");
+            }
+
+            values.put("branch_id", branch.id);
+        } else {
+            values.put("branch_id", null);
+        }
+
+        String reUserStatus = reUserStatusLookup == null ? null : reUserStatusLookup.get(userId);
+        boolean active = ACTIVE_STATUS_VALUE.equalsIgnoreCase(reUserStatus);
+
+        values.put("active", Boolean.valueOf(active));
+        values.put("version", parseLong(getValueFromAliases(rowTokens, headerIndex, "version"), Long.valueOf(0L)));
+        values.put("created_at", parseTimestamp(getValueFromAliases(rowTokens, headerIndex, "created_at"), currentTimestamp()));
+
+        String createdBy = normalize(getValueFromAliases(rowTokens, headerIndex, "created_by"));
+        values.put("created_by", createdBy == null ? "SYSTEM" : createdBy);
+
+        values.put("updated_at", parseTimestamp(getValueFromAliases(rowTokens, headerIndex, "updated_at"), currentTimestamp()));
+
+        String updatedBy = normalize(getValueFromAliases(rowTokens, headerIndex, "updated_by"));
+        values.put("updated_by", updatedBy == null ? "SYSTEM" : updatedBy);
+
+        return RowBuildResult.success(values);
+    }
+
+    private void bindRow(PreparedStatement ps, Map<String, Object> rowValues) throws SQLException {
+        int i = 1;
+        for (String column : INSERT_COLUMNS) {
+            Object value = rowValues.get(column);
+
+            if ("id".equals(column) || "branch_id".equals(column) || "region_id".equals(column)) {
+                ps.setObject(i, value);
+            } else if ("active".equals(column)) {
+                if (value == null) {
+                    ps.setNull(i, java.sql.Types.BOOLEAN);
+                } else {
+                    ps.setBoolean(i, ((Boolean) value).booleanValue());
+                }
+            } else if ("version".equals(column)) {
+                if (value == null) {
+                    ps.setNull(i, java.sql.Types.BIGINT);
+                } else {
+                    ps.setLong(i, ((Long) value).longValue());
+                }
+            } else if ("created_at".equals(column) || "updated_at".equals(column)) {
+                if (value == null) {
+                    ps.setTimestamp(i, null);
+                } else {
+                    ps.setTimestamp(i, (Timestamp) value);
+                }
+            } else {
+                ps.setString(i, value == null ? null : String.valueOf(value));
+            }
+            i++;
+        }
+    }
+
+    private Map<String, Integer> buildHeaderIndex(List<String> headers) {
+        Map<String, Integer> map = new HashMap<String, Integer>();
+        if (headers == null) {
+            return map;
+        }
+
+        for (int i = 0; i < headers.size(); i++) {
+            String h = normalizeHeader(headers.get(i));
+            if (h != null && h.length() > 0 && !map.containsKey(h)) {
+                map.put(h, Integer.valueOf(i));
+            }
+        }
+        return map;
+    }
+
+    private String getValueFromAliases(List<String> rowTokens, Map<String, Integer> headerIndex, String targetColumn) {
+        List<String> aliases = SOURCE_ALIASES.get(targetColumn);
+        if (aliases == null) {
+            return null;
+        }
+
+        for (String alias : aliases) {
+            Integer idx = headerIndex.get(normalizeHeader(alias));
+            if (idx != null && idx.intValue() >= 0 && idx.intValue() < rowTokens.size()) {
+                return rowTokens.get(idx.intValue());
+            }
+        }
+        return null;
+    }
+
+    private List<String> parseCsvLine(String line, char delim) {
+        List<String> result = new ArrayList<String>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (inQuotes) {
+                if (c == '"') {
+                    if (i + 1 < line.length() && line.charAt(i + 1) == '"') {
+                        current.append('"');
+                        i++;
+                    } else {
+                        inQuotes = false;
+                    }
+                } else {
+                    current.append(c);
+                }
+            } else {
+                if (c == '"') {
+                    inQuotes = true;
+                } else if (c == delim) {
+                    result.add(current.toString());
+                    current.setLength(0);
+                } else {
+                    current.append(c);
+                }
+            }
+        }
+
+        result.add(current.toString());
+        return result;
+    }
+
+    private UUID parseUuid(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof UUID) {
+            return (UUID) value;
+        }
+        try {
+            return UUID.fromString(String.valueOf(value).trim());
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private Boolean parseBoolean(String value, Boolean defaultValue) {
+        String n = normalize(value);
+        if (n == null) {
+            return defaultValue;
+        }
+
+        String v = n.toLowerCase(Locale.ENGLISH);
+        if ("true".equals(v) || "t".equals(v) || "1".equals(v) || "yes".equals(v) || "y".equals(v)) {
+            return Boolean.TRUE;
+        }
+        if ("false".equals(v) || "f".equals(v) || "0".equals(v) || "no".equals(v) || "n".equals(v)) {
+            return Boolean.FALSE;
+        }
+        return defaultValue;
+    }
+
+    private Long parseLong(String value, Long defaultValue) {
+        String n = normalize(value);
+        if (n == null) {
+            return defaultValue;
+        }
+        try {
+            return Long.valueOf(n);
+        } catch (Exception e) {
+            return defaultValue;
+        }
+    }
+
+    private Timestamp parseTimestamp(String value, Timestamp defaultValue) {
+        String n = normalize(value);
+        if (n == null) {
+            return defaultValue;
+        }
+
+        List<DateTimeFormatter> f = Arrays.asList(
+                DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"),
+                DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss"),
+                DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss"),
+                DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"),
+                DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS"),
+                DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"),
+                DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss.SSS")
+        );
+
+        for (int i = 0; i < f.size(); i++) {
+            try {
+                return Timestamp.valueOf(LocalDateTime.parse(n, f.get(i)));
+            } catch (DateTimeParseException ignore) {
+                // try next
+            }
+        }
+
+        try {
+            return Timestamp.from(OffsetDateTime.parse(n).toInstant());
+        } catch (Exception ignore) {
+            // try next
+        }
+
+        return defaultValue;
+    }
+
+    private Timestamp currentTimestamp() {
+        return Timestamp.from(LocalDateTime.now().atZone(ZoneId.systemDefault()).toInstant());
+    }
+
+    private String normalize(String value) {
+        if (value == null) {
+            return null;
+        }
+        String t = value.trim();
+        if (t.length() == 0) {
+            return null;
+        }
+        if ("\\N".equalsIgnoreCase(t)) {
+            return null;
+        }
+        if ("NULL".equalsIgnoreCase(t)) {
+            return null;
+        }
+        return t;
+    }
+
+    private String normalizeHeader(String value) {
+        String n = normalize(value);
+        return n == null ? null : n.toLowerCase(Locale.ENGLISH);
+    }
+
+    private String normalizeKey(String value) {
+        String n = normalize(value);
+        return n == null ? null : n.toUpperCase(Locale.ENGLISH);
+    }
+
+    private String composeKey(String left, UUID right) {
+        String l = normalizeKey(left);
+        if (l == null || right == null) {
+            return null;
+        }
+        return l + "|" + right.toString().toLowerCase(Locale.ENGLISH);
+    }
+
+    private File moveAfterSuccess(File sourceFile) {
+        if (sourceFile == null || !sourceFile.exists()) {
+            return null;
+        }
+
+        File parent = sourceFile.getParentFile();
+        if (parent == null) {
+            return null;
+        }
+
+        File processedDir = new File(parent, "processed");
+        if (!processedDir.exists()) {
+            processedDir.mkdirs();
+        }
+
+        File target = new File(processedDir, sourceFile.getName());
+        int attempt = 0;
+
+        while (target.exists()) {
+            attempt++;
+            String name = sourceFile.getName();
+            int dot = name.lastIndexOf('.');
+            String base = dot > 0 ? name.substring(0, dot) : name;
+            String ext = dot > 0 ? name.substring(dot) : "";
+            target = new File(processedDir, base + "_" + attempt + ext);
+        }
+
+        try {
+            Files.move(sourceFile.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            return target;
+        } catch (IOException e) {
+            log("ERROR", "File move failed for " + sourceFile.getName() + ": " + rootCause(e), serverIP, "FILE_MOVE_FAILED");
+            return null;
+        }
+    }
+
+    private void logFileSummary(FileSummary s) {
+        StringBuilder sb = new StringBuilder(256);
+        sb.append("file=").append(s.fileName)
+          .append(" status=").append(s.status)
+          .append(" data_rows=").append(s.dataRows)
+          .append(" inserted=").append(s.inserted)
+          .append(" skipped=").append(s.skipped)
+          .append(" skipped_ineligible_type=").append(s.skippedIneligibleType)
+          .append(" duplicate_in_file=").append(s.duplicateInFile)
+          .append(" duplicate_in_target=").append(s.duplicateInTarget)
+          .append(" lookup_failures=").append(s.lookupFailures)
+          .append(" db_failed=").append(s.dbFailed)
+          .append(" row_errors=").append(s.rowErrors)
+          .append(" batch_failures=").append(s.batchFailures)
+          .append(" blank_lines=").append(s.blankLines)
+          .append(" effective_batch_size=").append(s.effectiveBatchSize)
+          .append(" moved=").append(s.moved);
+        log("INFO", sb.toString(), serverIP, "FILE_SUMMARY");
+    }
+
+    private String buildDirectorySummary(DirectorySummary s) {
+        return "total_files=" + s.totalFiles +
+                " completed_files=" + s.completedFiles +
+                " retained_files=" + s.retainedFiles +
+                " empty_files=" + s.emptyFiles +
+                " header_only_files=" + s.headerOnlyFiles +
+                " error_files=" + s.errorFiles +
+                " total_rows=" + s.totalRows +
+                " inserted=" + s.inserted +
+                " skipped=" + s.skipped +
+                " skipped_ineligible_type=" + s.skippedIneligibleType +
+                " duplicate_in_file=" + s.duplicateInFile +
+                " duplicate_in_target=" + s.duplicateInTarget +
+                " lookup_failures=" + s.lookupFailures +
+                " db_failed=" + s.dbFailed +
+                " row_errors=" + s.rowErrors +
+                " batch_failures=" + s.batchFailures +
+                " blank_lines=" + s.blankLines;
+    }
+
+    private void closeQuietly(AutoCloseable c) {
+        if (c == null) {
+            return;
+        }
+        try {
+            c.close();
+        } catch (Exception ignore) {
+            // quiet
+        }
+    }
+
+    private void rollbackQuietly(Connection c) {
+        if (c == null) {
+            return;
+        }
+        try {
+            c.rollback();
+        } catch (Exception ignore) {
+            // quiet
+        }
+    }
+
+    private String rootCause(Throwable t) {
+        if (t == null) {
+            return "";
+        }
+        Throwable cur = t;
+        while (cur.getCause() != null && cur.getCause() != cur) {
+            cur = cur.getCause();
+        }
+        String msg = cur.getMessage();
+        return (msg == null || msg.trim().length() == 0) ? cur.getClass().getName() : msg;
+    }
+
+    private String toJson(Map<String, String> map) {
+        if (map == null || map.size() == 0) {
+            return "{}";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append('{');
+        boolean first = true;
+        for (Map.Entry<String, String> e : map.entrySet()) {
+            if (!first) {
+                sb.append(',');
+            }
+            first = false;
+            sb.append('"').append(escapeJson(e.getKey())).append('"').append(':').append('"').append(escapeJson(e.getValue())).append('"');
+        }
+        sb.append('}');
+        return sb.toString();
+    }
+
+    private String escapeJson(String value) {
+        if (value == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(value.length() + 16);
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            switch (c) {
+                case '"':
+                    sb.append("\\\"");
+                    break;
+                case '\\':
+                    sb.append("\\\\");
+                    break;
+                case '\b':
+                    sb.append("\\b");
+                    break;
+                case '\f':
+                    sb.append("\\f");
+                    break;
+                case '\n':
+                    sb.append("\\n");
+                    break;
+                case '\r':
+                    sb.append("\\r");
+                    break;
+                case '\t':
+                    sb.append("\\t");
+                    break;
+                default:
+                    if (c < 32) {
+                        sb.append(String.format(Locale.ENGLISH, "\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+            }
+        }
+        return sb.toString();
+    }
+
+    private void log(String level, String message, String serverIP, String evtType) {
+        if ("DEBUG".equalsIgnoreCase(level) && !debugEnabled) {
+            return;
+        }
+
+        String timestamp = LocalDateTime.now().format(logFormat);
+        StringBuilder logBuilder = new StringBuilder(512);
+
+        logBuilder.append("Time:").append(timestamp).append(" [").append(capitalize(level)).append("] ")
+                .append("Process_Name: ").append(processName).append(" ");
+
+        if (serverIP != null && serverIP.length() > 0) {
+            logBuilder.append("Server_IP: ").append(serverIP).append(" ");
+        }
+
+        logBuilder.append("Process_Version: ").append(processVersion).append(" ")
+                .append("Log_Level: EVT_LOG ")
+                .append("EVT_Type: ").append(evtType != null ? evtType : "NA")
+                .append(" Description: ").append(message != null ? message : "");
+
+        System.err.println(logBuilder.toString().trim());
+    }
+
+    private String capitalize(String value) {
+        if (value == null || value.length() == 0) {
+            return "INFO";
+        }
+        String lower = value.toLowerCase(Locale.ENGLISH);
+        return Character.toUpperCase(lower.charAt(0)) + lower.substring(1);
+    }
+
+    private String joinSet(Set<String> set) {
+        if (set == null || set.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        boolean first = true;
+        for (String s : set) {
+            if (!first) {
+                sb.append(", ");
+            }
+            first = false;
+            sb.append(s);
+        }
+        return sb.toString();
+    }
+
+    private String joinList(List<String> list) {
+        if (list == null || list.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        boolean first = true;
+        for (String s : list) {
+            if (!first) {
+                sb.append(" | ");
+            }
+            first = false;
+            sb.append(s);
+        }
+        return sb.toString();
+    }
+
+    private static final class ReportingEntityRow {
+        private final UUID id;
+        private final String fiCode;
+
+        private ReportingEntityRow(UUID id, String fiCode) {
+            this.id = id;
+            this.fiCode = fiCode;
+        }
+    }
+
+    private static final class RegionRow {
+        private final UUID id;
+        private final String regionCode;
+        private final UUID reportingEntityId;
+
+        private RegionRow(UUID id, String regionCode, UUID reportingEntityId) {
+            this.id = id;
+            this.regionCode = regionCode;
+            this.reportingEntityId = reportingEntityId;
+        }
+    }
+
+    private static final class BranchRow {
+        private final UUID id;
+        private final String branchCode;
+        private final UUID regionId;
+
+        private BranchRow(UUID id, String branchCode, UUID regionId) {
+            this.id = id;
+            this.branchCode = branchCode;
+            this.regionId = regionId;
+        }
+    }
+
+    private static final class FileSummary {
+        private final String fileName;
+        private String status = "NA";
+        private int dataRows;
+        private int inserted;
+        private int skipped;
+        private int skippedIneligibleType;
+        private int duplicateInFile;
+        private int duplicateInTarget;
+        private int lookupFailures;
+        private int dbFailed;
+        private int rowErrors;
+        private int batchFailures;
+        private int blankLines;
+        private int effectiveBatchSize;
+        private boolean moved;
+        private boolean emptyFile;
+        private boolean headerOnlyFile;
+
+        private FileSummary(String fileName) {
+            this.fileName = fileName == null ? "NA" : fileName;
+        }
+    }
+
+    private static final class DirectorySummary {
+        private int totalFiles;
+        private int completedFiles;
+        private int retainedFiles;
+        private int emptyFiles;
+        private int headerOnlyFiles;
+        private int errorFiles;
+        private int totalRows;
+        private int inserted;
+        private int skipped;
+        private int skippedIneligibleType;
+        private int duplicateInFile;
+        private int duplicateInTarget;
+        private int lookupFailures;
+        private int dbFailed;
+        private int rowErrors;
+        private int batchFailures;
+        private int blankLines;
+
+        private void accumulate(FileSummary fs) {
+            if (fs == null) {
+                return;
+            }
+            completedFiles++;
+            if (!fs.moved && ("FATAL_ERROR".equalsIgnoreCase(fs.status) || "DB_ERROR".equalsIgnoreCase(fs.status) || "BATCH_FAILURE".equalsIgnoreCase(fs.status))) {
+                retainedFiles++;
+            }
+            if (fs.emptyFile) {
+                emptyFiles++;
+            }
+            if (fs.headerOnlyFile) {
+                headerOnlyFiles++;
+            }
+            totalRows += fs.dataRows;
+            inserted += fs.inserted;
+            skipped += fs.skipped;
+            skippedIneligibleType += fs.skippedIneligibleType;
+            duplicateInFile += fs.duplicateInFile;
+            duplicateInTarget += fs.duplicateInTarget;
+            lookupFailures += fs.lookupFailures;
+            dbFailed += fs.dbFailed;
+            rowErrors += fs.rowErrors;
+            batchFailures += fs.batchFailures;
+            blankLines += fs.blankLines;
+        }
+    }
+
+    private static final class RowBuildResult {
+        private final boolean ok;
+        private final boolean skipIneligibleType;
+        private final boolean duplicateInFile;
+        private final boolean duplicateInTarget;
+        private final boolean lookupFailure;
+        private final Map<String, Object> rowValues;
+        private final String evtType;
+        private final String logLevel;
+        private final String logMessage;
+
+        private RowBuildResult(boolean ok,
+                               boolean skipIneligibleType,
+                               boolean duplicateInFile,
+                               boolean duplicateInTarget,
+                               boolean lookupFailure,
+                               Map<String, Object> rowValues,
+                               String evtType,
+                               String logLevel,
+                               String logMessage) {
+            this.ok = ok;
+            this.skipIneligibleType = skipIneligibleType;
+            this.duplicateInFile = duplicateInFile;
+            this.duplicateInTarget = duplicateInTarget;
+            this.lookupFailure = lookupFailure;
+            this.rowValues = rowValues;
+            this.evtType = evtType;
+            this.logLevel = logLevel;
+            this.logMessage = logMessage;
+        }
+
+        private static RowBuildResult success(Map<String, Object> rowValues) {
+            return new RowBuildResult(true, false, false, false, false, rowValues, null, null, null);
+        }
+
+        private static RowBuildResult skipType(String message, String evtType) {
+            return new RowBuildResult(false, true, false, false, false, null, evtType, "WARN", message);
+        }
+
+        private static RowBuildResult duplicateInFile(String message, String evtType) {
+            return new RowBuildResult(false, false, true, false, false, null, evtType, "WARN", message);
+        }
+
+        private static RowBuildResult duplicateInTarget(String message, String evtType) {
+            return new RowBuildResult(false, false, false, true, false, null, evtType, "WARN", message);
+        }
+
+        private static RowBuildResult lookupFailure(String message, String evtType) {
+            return new RowBuildResult(false, false, false, false, true, null, evtType, "WARN", message);
+        }
+
+        private static RowBuildResult rowError(String message, String evtType) {
+            return new RowBuildResult(false, false, false, false, false, null, evtType, "WARN", message);
+        }
+    }
+}

@@ -1,0 +1,26 @@
+package rest_api_volQuota;
+
+import java.sql.*;
+
+public class DBConnection {
+    private static final String URL = "jdbc:mysql://localhost:3306/your_db";
+    private static final String USER = "root";
+    private static final String PASS = "your_password";
+
+    public void insertEnterpriseDetails(String enterpriseName, String enterpriseId, String volumeQuota) {
+        String sql = "INSERT INTO Enterprise_detail (enterprise_name, enterprise_id, s3_path, volume_quota, disk_path) VALUES (?, ?, '', ?, '')";
+
+        try (Connection conn = DriverManager.getConnection(URL, USER, PASS);
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+
+            ps.setString(1, enterpriseName);
+            ps.setString(2, enterpriseId);
+            ps.setString(3, volumeQuota);
+            ps.executeUpdate();
+
+            System.out.println("[DB] Record inserted successfully for enterprise: " + enterpriseName);
+        } catch (Exception e) {
+            System.out.println("[DB ERROR] " + e.getMessage());
+        }
+    }
+}

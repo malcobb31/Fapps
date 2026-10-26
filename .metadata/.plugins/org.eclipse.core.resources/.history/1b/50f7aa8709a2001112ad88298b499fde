@@ -1,0 +1,2193 @@
+package delete_process_v2;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Pattern;
+
+/**
+ * delete_process_methods_v2
+ *
+ * V2 PK-driven DELETE synchronizer between MySQL trigger tables and
+ * PostgreSQL target tables.
+ *
+ * This is a direct evolution of delete_process_methods (V1). The entire
+ * processing model (configuration selection, maxSno/lastSno checkpointing,
+ * bounded sno-range batching, trigger status transitions, Records_Deleted
+ * accounting, error handling, and identifier validation) is preserved
+ * unchanged in shape and behavior.
+ *
+ * THE ONLY MAJOR BEHAVIORAL CHANGE:
+ *
+ *  V1 built the DELETE predicate from:
+ *      primary_columns_name + primary_columns_value
+ *
+ *  V2 builds the DELETE predicate from:
+ *      where_clause
+ *          -> parsed into column/value pairs
+ *          -> mapped positionally via config.220_Col / config.Psql_Col
+ *          -> normal-column ("col = ?") or JSONB ("col ->> 'key' = ?")
+ *             predicates
+ *          -> combined with AND
+ *          -> bound as parameterized PostgreSQL DELETE
+ *
+ * IMPORTANT:
+ *
+ *  - insert_clause is NEVER read.
+ *  - The 220/source business table is NEVER queried.
+ *  - primary_columns_name / primary_columns_value are retained in the
+ *    trigger row (still selected, still logged) but are NOT used to build
+ *    the DELETE predicate anymore. where_clause is authoritative.
+ *  - All runtime values are bound through PreparedStatement.
+ *  - SQL identifiers are validated before being embedded in SQL.
+ *  - This class does NOT open or close DB connections.
+ */
+public class delete_process_methods {
+
+    /*
+     * Range/checkpoint size. Same as V1.
+     */
+    private static final long RANGE_SIZE = 100000L;
+
+    /*
+     * Allow:
+     *
+     * document_id
+     * metadata
+     * kyc.documents
+     *
+     * Do not allow arbitrary SQL expressions.
+     */
+    private static final Pattern SAFE_IDENTIFIER =
+            Pattern.compile(
+                    "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?$"
+            );
+
+    /*
+     * JSONB key is deliberately more restrictive.
+     */
+    private static final Pattern SAFE_JSONB_KEY =
+            Pattern.compile("^[A-Za-z0-9_]+$");
+
+    /*
+     * where_clause condition delimiter, e.g.:
+     *
+     * kig_id=12455299355^|knt_kyc_no=60044577650299
+     */
+    private static final String WHERE_CLAUSE_CONDITION_DELIMITER = "\\^\\|";
+
+    /*
+     * Literal string representing SQL NULL inside where_clause.
+     */
+    private static final String WHERE_CLAUSE_NULL_LITERAL = "NULL";
+
+    private final Logger logger;
+
+    public delete_process_methods(Logger logger) {
+        this.logger = logger;
+    }
+
+    // =====================================================================
+    // CONFIGURATION
+    // =====================================================================
+
+    /**
+     * Load only configurations that are ready to run.
+     *
+     * Column names updated for V2 config_delete table:
+     *
+     *  220_Table_name
+     *  220_Col   (renamed from 220_PK)
+     *  Psql_Col  (renamed from Psql_PK)
+     */
+    public List<ParserConfigV2> loadEligibleConfigurations(
+            Connection mysqlConn,
+            String configTable) throws SQLException {
+
+        validateIdentifier(configTable, "config_table");
+
+        String sql =
+                "SELECT "
+                        + "sno, "
+                        + "Psql_Table_name, "
+                        + "`220_Table_name`, "
+                        + "`220_Col`, "
+                        + "Psql_Col, "
+                        + "Status, "
+                        + "Records_Deleted, "
+                        + "Trigger_Table, "
+                        + "maxSno, "
+                        + "lastSno "
+                        + "FROM " + configTable + " "
+                        + "WHERE Status = 'INIT' "
+                        + "ORDER BY sno";
+
+        List<ParserConfigV2> configs = new ArrayList<>();
+
+        try (PreparedStatement ps = mysqlConn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+
+            while (rs.next()) {
+
+                ParserConfigV2 cfg = new ParserConfigV2();
+
+                cfg.sno = rs.getLong("sno");
+                cfg.psqlTableName = rs.getString("Psql_Table_name");
+                cfg.sourceTableName = rs.getString("220_Table_name");
+                cfg.sourceCol = rs.getString("220_Col");
+                cfg.psqlCol = rs.getString("Psql_Col");
+                cfg.status = rs.getString("Status");
+                cfg.recordsDeleted = rs.getLong("Records_Deleted");
+                cfg.triggerTable = rs.getString("Trigger_Table");
+                cfg.maxSno = rs.getLong("maxSno");
+                cfg.lastSno = rs.getLong("lastSno");
+
+                configs.add(cfg);
+            }
+        }
+
+        logger.log(
+                "INFO",
+                "CONFIG_SELECTED",
+                "Eligible_Configs=" + configs.size()
+        );
+
+        return configs;
+    }
+
+    /**
+     * Update configuration status. Unchanged from V1.
+     */
+    public void updateConfigStatus(
+            Connection mysqlConn,
+            String configTable,
+            long configSno,
+            String newStatus) throws SQLException {
+
+        validateIdentifier(configTable, "config_table");
+
+        String sql =
+                "UPDATE " + configTable
+                        + " SET Status = ? "
+                        + "WHERE sno = ?";
+
+        try (PreparedStatement ps = mysqlConn.prepareStatement(sql)) {
+
+            ps.setString(1, newStatus);
+            ps.setLong(2, configSno);
+
+            ps.executeUpdate();
+        }
+
+        logger.log(
+                "INFO",
+                "CONFIG_STATUS_UPDATED",
+                "Config_Sno=" + configSno
+                        + " Status=" + newStatus
+        );
+    }
+
+    /**
+     * Persist Records_Deleted. Unchanged from V1.
+     */
+    public void updateRecordsDeleted(
+            Connection mysqlConn,
+            String configTable,
+            long configSno,
+            long recordsDeleted) throws SQLException {
+
+        validateIdentifier(configTable, "config_table");
+
+        String sql =
+                "UPDATE " + configTable
+                        + " SET Records_Deleted = ? "
+                        + "WHERE sno = ?";
+
+        try (PreparedStatement ps = mysqlConn.prepareStatement(sql)) {
+
+            ps.setLong(1, recordsDeleted);
+            ps.setLong(2, configSno);
+
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * Persist maxSno snapshot. Unchanged from V1.
+     */
+    public void updateMaxSno(
+            Connection mysqlConn,
+            String configTable,
+            long configSno,
+            long maxSno) throws SQLException {
+
+        validateIdentifier(configTable, "config_table");
+
+        String sql =
+                "UPDATE " + configTable
+                        + " SET maxSno = ? "
+                        + "WHERE sno = ?";
+
+        try (PreparedStatement ps = mysqlConn.prepareStatement(sql)) {
+
+            ps.setLong(1, maxSno);
+            ps.setLong(2, configSno);
+
+            ps.executeUpdate();
+        }
+
+        logger.log(
+                "INFO",
+                "MAX_SNO_SNAPSHOT",
+                "Config_Sno=" + configSno
+                        + " Max_Sno=" + maxSno
+        );
+    }
+
+    /**
+     * Persist lastSno checkpoint. Unchanged from V1.
+     */
+    public void updateLastSno(
+            Connection mysqlConn,
+            String configTable,
+            long configSno,
+            long lastSno) throws SQLException {
+
+        validateIdentifier(configTable, "config_table");
+
+        String sql =
+                "UPDATE " + configTable
+                        + " SET lastSno = ? "
+                        + "WHERE sno = ?";
+
+        try (PreparedStatement ps = mysqlConn.prepareStatement(sql)) {
+
+            ps.setLong(1, lastSno);
+            ps.setLong(2, configSno);
+
+            ps.executeUpdate();
+        }
+
+        logger.log(
+                "INFO",
+                "CHECKPOINT_UPDATED",
+                "Config_Sno=" + configSno
+                        + " Last_Sno=" + lastSno
+        );
+    }
+
+    // =====================================================================
+    // MAX SNO / CHECKPOINT
+    // =====================================================================
+
+    /**
+     * Read MAX(sno) from the configured trigger table. Unchanged from V1.
+     */
+    public long getTriggerMaxSno(
+            Connection mysqlConn,
+            String triggerTable) throws SQLException {
+
+        validateIdentifier(triggerTable, "trigger_table");
+
+        String sql =
+                "SELECT COALESCE(MAX(sno), 0) "
+                        + "FROM " + triggerTable;
+
+        try (PreparedStatement ps = mysqlConn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+
+            if (rs.next()) {
+                return rs.getLong(1);
+            }
+        }
+
+        return 0L;
+    }
+
+    /**
+     * Establish maxSno only when it has not already been captured.
+     * Unchanged from V1.
+     */
+    public long initializeMaxSno(
+            Connection mysqlConn,
+            String configTable,
+            ParserConfigV2 config) throws SQLException {
+
+        if (config.maxSno > 0) {
+            return config.maxSno;
+        }
+
+        long maxSno =
+                getTriggerMaxSno(
+                        mysqlConn,
+                        config.triggerTable
+                );
+
+        updateMaxSno(
+                mysqlConn,
+                configTable,
+                config.sno,
+                maxSno
+        );
+
+        config.maxSno = maxSno;
+
+        return maxSno;
+    }
+
+    // =====================================================================
+    // TRIGGER FETCH
+    // =====================================================================
+
+    /**
+     * Fetch a batch within a fixed sno range.
+     *
+     * V2 adds where_clause to the selected columns. Everything else about
+     * the bounded range / batch fetch behavior is unchanged from V1.
+     *
+     * The query intentionally still DOES NOT select insert_clause.
+     */
+    public List<TriggerRowV2> fetchDeleteTriggerBatch(
+            Connection mysqlConn,
+            String triggerTable,
+            String sourceTableName,
+            long cursorSno,
+            long rangeEnd,
+            int batchSize) throws SQLException {
+
+        validateIdentifier(triggerTable, "trigger_table");
+
+        String sql =
+                "SELECT "
+                        + "sno, "
+                        + "record_time, "
+                        + "table_name, "
+                        + "primary_columns_name, "
+                        + "primary_columns_value, "
+                        + "type_of_operation, "
+                        + "sync_status, "
+                        + "where_clause "
+                        + "FROM " + triggerTable + " "
+                        + "WHERE sno > ? "
+                        + "AND sno <= ? "
+                        + "AND table_name = ? "
+                        + "AND type_of_operation = 'DELETE' "
+                        + "ORDER BY sno "
+                        + "LIMIT ?";
+
+        List<TriggerRowV2> rows = new ArrayList<>();
+
+        try (PreparedStatement ps = mysqlConn.prepareStatement(sql)) {
+
+            ps.setLong(1, cursorSno);
+            ps.setLong(2, rangeEnd);
+            ps.setString(3, sourceTableName);
+            ps.setInt(4, batchSize);
+
+            try (ResultSet rs = ps.executeQuery()) {
+
+                while (rs.next()) {
+
+                    TriggerRowV2 row = new TriggerRowV2();
+
+                    row.sno = rs.getLong("sno");
+                    row.recordTime = rs.getTimestamp("record_time");
+                    row.tableName = rs.getString("table_name");
+                    row.primaryColumnsName =
+                            rs.getString("primary_columns_name");
+                    row.primaryColumnsValue =
+                            rs.getString("primary_columns_value");
+                    row.typeOfOperation =
+                            rs.getString("type_of_operation");
+                    row.syncStatus =
+                            rs.getString("sync_status");
+                    row.whereClause =
+                            rs.getString("where_clause");
+
+                    rows.add(row);
+                }
+            }
+        }
+
+        return rows;
+    }
+
+    // =====================================================================
+    // TRIGGER STATUS
+    // =====================================================================
+
+    public void markTriggerProcessing(
+            Connection mysqlConn,
+            String triggerTable,
+            long triggerSno) throws SQLException {
+
+        updateTriggerSyncStatus(
+                mysqlConn,
+                triggerTable,
+                triggerSno,
+                "processing"
+        );
+    }
+
+    public void markTriggerCompleted(
+            Connection mysqlConn,
+            String triggerTable,
+            long triggerSno) throws SQLException {
+
+        updateTriggerSyncStatus(
+                mysqlConn,
+                triggerTable,
+                triggerSno,
+                "completed"
+        );
+    }
+
+    public void markTriggerFailed(
+            Connection mysqlConn,
+            String triggerTable,
+            long triggerSno) throws SQLException {
+
+        updateTriggerSyncStatus(
+                mysqlConn,
+                triggerTable,
+                triggerSno,
+                "failed"
+        );
+    }
+
+    private void updateTriggerSyncStatus(
+            Connection mysqlConn,
+            String triggerTable,
+            long triggerSno,
+            String status) throws SQLException {
+
+        validateIdentifier(triggerTable, "trigger_table");
+
+        String sql =
+                "UPDATE " + triggerTable
+                        + " SET sync_status = ? "
+                        + "WHERE sno = ?";
+
+        try (PreparedStatement ps = mysqlConn.prepareStatement(sql)) {
+
+            ps.setString(1, status);
+            ps.setLong(2, triggerSno);
+
+            ps.executeUpdate();
+        }
+    }
+
+    // =====================================================================
+    // WHERE_CLAUSE PARSING
+    // =====================================================================
+
+    /**
+     * Parse a where_clause string of the form:
+     *
+     *   col1=val1^|col2=val2^|col3=val3
+     *
+     * into an ordered column -> value map.
+     *
+     * Rules:
+     *
+     *  - '^|' separates conditions.
+     *  - Each condition is split at the FIRST '=' only, so values that
+     *    themselves contain '=' are preserved intact.
+     *  - Column names and values are trimmed of surrounding whitespace.
+     *  - The literal value "NULL" is preserved as the literal string
+     *    "NULL" here; NULL semantics are applied later when building the
+     *    predicate (see buildPredicateValue / isNullLiteral).
+     *  - Empty/blank conditions are skipped.
+     *  - A condition with no '=' at all is skipped and logged, since it
+     *    cannot be interpreted as column=value.
+     */
+    public Map<String, String> parseWhereClause(
+            String whereClause,
+            ParserConfigV2 config,
+            TriggerRowV2 row) {
+
+        Map<String, String> parsed = new LinkedHashMap<>();
+
+        if (whereClause == null || whereClause.trim().isEmpty()) {
+            return parsed;
+        }
+
+        String[] conditions =
+                whereClause.split(WHERE_CLAUSE_CONDITION_DELIMITER);
+
+        for (String condition : conditions) {
+
+            if (condition == null || condition.trim().isEmpty()) {
+                continue;
+            }
+
+            String trimmedCondition = condition.trim();
+
+            int eqIndex = trimmedCondition.indexOf('=');
+
+            if (eqIndex < 0) {
+
+                logger.log(
+                        "WARN",
+                        "WHERE_CLAUSE_MALFORMED_CONDITION",
+                        "Config_Sno=" + config.sno
+                                + " Trigger_Sno=" + row.sno
+                                + " Condition=" + trimmedCondition
+                                + " Reason=No '=' found"
+                );
+
+                continue;
+            }
+
+            String col =
+                    trimmedCondition.substring(0, eqIndex).trim();
+
+            String val =
+                    trimmedCondition.substring(eqIndex + 1).trim();
+
+            if (col.isEmpty()) {
+
+                logger.log(
+                        "WARN",
+                        "WHERE_CLAUSE_MALFORMED_CONDITION",
+                        "Config_Sno=" + config.sno
+                                + " Trigger_Sno=" + row.sno
+                                + " Condition=" + trimmedCondition
+                                + " Reason=Empty column name"
+                );
+
+                continue;
+            }
+
+            /*
+             * If a duplicate column name shows up in where_clause, the
+             * first occurrence wins; later ones are logged and ignored.
+             * This should not normally happen but is handled defensively.
+             */
+            if (parsed.containsKey(col)) {
+
+                logger.log(
+                        "WARN",
+                        "WHERE_CLAUSE_DUPLICATE_COLUMN",
+                        "Config_Sno=" + config.sno
+                                + " Trigger_Sno=" + row.sno
+                                + " Column=" + col
+                );
+
+                continue;
+            }
+
+            parsed.put(col, val);
+        }
+
+        return parsed;
+    }
+
+    private boolean isNullLiteral(String value) {
+        return value == null
+                || WHERE_CLAUSE_NULL_LITERAL.equalsIgnoreCase(value.trim());
+    }
+
+    // =====================================================================
+    // CONFIG COLUMN MAPPING (220_Col / Psql_Col)
+    // =====================================================================
+
+    /**
+     * A single positional mapping pair from config, e.g.:
+     *
+     *  220_Col[i]  = kig_id
+     *  Psql_Col[i] = document_id
+     *
+     * or:
+     *
+     *  220_Col[i]  = knt_alphanumeric_no
+     *  Psql_Col[i] = metadata.alphanumeric_no
+     */
+    static final class ColumnMapping {
+
+        final String sourceCol;
+        final ResolvedTarget target;
+
+        ColumnMapping(String sourceCol, ResolvedTarget target) {
+            this.sourceCol = sourceCol;
+            this.target = target;
+        }
+    }
+
+    /**
+     * Split and validate config.220_Col / config.Psql_Col into an ordered
+     * list of positional column mappings.
+     *
+     * 220_Col and Psql_Col are comma-separated lists that must have the
+     * same number of entries. Order is positional and guaranteed correct
+     * by configuration (220_Col[i] maps to Psql_Col[i]).
+     */
+    public List<ColumnMapping> resolveColumnMappings(
+            ParserConfigV2 config) {
+
+        if (config.sourceCol == null
+                || config.sourceCol.trim().isEmpty()) {
+
+            throw new IllegalArgumentException(
+                    "220_Col is empty for Config_Sno=" + config.sno
+            );
+        }
+
+        if (config.psqlCol == null
+                || config.psqlCol.trim().isEmpty()) {
+
+            throw new IllegalArgumentException(
+                    "Psql_Col is empty for Config_Sno=" + config.sno
+            );
+        }
+
+        String[] sourceCols = config.sourceCol.split(",", -1);
+        String[] psqlCols = config.psqlCol.split(",", -1);
+
+        if (sourceCols.length != psqlCols.length) {
+
+            throw new IllegalArgumentException(
+                    "220_Col / Psql_Col count mismatch for Config_Sno="
+                            + config.sno
+                            + " 220_Col=" + config.sourceCol
+                            + " Psql_Col=" + config.psqlCol
+            );
+        }
+
+        List<ColumnMapping> mappings = new ArrayList<>();
+
+        for (int i = 0; i < sourceCols.length; i++) {
+
+            String srcCol = sourceCols[i].trim();
+            String psqlColRaw = psqlCols[i].trim();
+
+            if (srcCol.isEmpty() || psqlColRaw.isEmpty()) {
+
+                throw new IllegalArgumentException(
+                        "Empty column entry in 220_Col/Psql_Col for Config_Sno="
+                                + config.sno
+                                + " 220_Col=" + config.sourceCol
+                                + " Psql_Col=" + config.psqlCol
+                );
+            }
+
+            /*
+             * Source column names (220_Col) are keys used to look up
+             * values inside where_clause, not SQL identifiers embedded
+             * into a query, so they are not passed through
+             * validateIdentifier(). Psql_Col entries ARE embedded into
+             * SQL and are validated via resolvePsqlCol().
+             */
+            ResolvedTarget target = resolvePsqlCol(psqlColRaw);
+
+            mappings.add(new ColumnMapping(srcCol, target));
+        }
+
+        return mappings;
+    }
+
+    // =====================================================================
+    // POSTGRESQL TARGET COLUMN RESOLUTION
+    // =====================================================================
+
+    static final class ResolvedTarget {
+
+        final boolean jsonb;
+        final String jsonbColumn;
+        final String jsonbKey;
+        final String plainColumn;
+
+        /*
+         * Original Psql_Col text, kept for logging.
+         */
+        final String rawPsqlCol;
+
+        private ResolvedTarget(
+                boolean jsonb,
+                String jsonbColumn,
+                String jsonbKey,
+                String plainColumn,
+                String rawPsqlCol) {
+
+            this.jsonb = jsonb;
+            this.jsonbColumn = jsonbColumn;
+            this.jsonbKey = jsonbKey;
+            this.plainColumn = plainColumn;
+            this.rawPsqlCol = rawPsqlCol;
+        }
+
+        static ResolvedTarget plain(String column, String rawPsqlCol) {
+            return new ResolvedTarget(
+                    false,
+                    null,
+                    null,
+                    column,
+                    rawPsqlCol
+            );
+        }
+
+        static ResolvedTarget jsonb(
+                String column,
+                String key,
+                String rawPsqlCol) {
+
+            return new ResolvedTarget(
+                    true,
+                    column,
+                    key,
+                    null,
+                    rawPsqlCol
+            );
+        }
+
+        /**
+         * The predicate fragment using '?' as the placeholder, e.g.:
+         *
+         *   document_id
+         *   metadata ->> 'alphanumeric_no'
+         *
+         * NULL variants are handled by the caller (IS NULL vs = ?).
+         */
+        String toSqlLhs() {
+
+            if (jsonb) {
+                return jsonbColumn + " ->> '" + jsonbKey + "'";
+            }
+
+            return plainColumn;
+        }
+
+        String toLogLabel() {
+            return rawPsqlCol;
+        }
+    }
+
+    /**
+     * Resolve one Psql_Col entry.
+     *
+     * Supported:
+     *
+     * document_id
+     *
+     * metadata.alphanumeric_no  (JSONB)
+     */
+    public ResolvedTarget resolvePsqlCol(
+            String psqlCol) {
+
+        if (psqlCol == null || psqlCol.trim().isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Psql_Col is empty"
+            );
+        }
+
+        String trimmed = psqlCol.trim();
+
+        int dotIndex = trimmed.indexOf('.');
+
+        if (dotIndex < 0) {
+
+            validateIdentifier(
+                    trimmed,
+                    "Psql_Col"
+            );
+
+            return ResolvedTarget.plain(trimmed, psqlCol);
+        }
+
+        String column =
+                trimmed.substring(0, dotIndex);
+
+        String key =
+                trimmed.substring(dotIndex + 1);
+
+        if (column.isEmpty()
+                || key.isEmpty()
+                || key.indexOf('.') >= 0) {
+
+            throw new IllegalArgumentException(
+                    "Unsupported Psql_Col shape: "
+                            + psqlCol
+            );
+        }
+
+        validateIdentifier(
+                column,
+                "Psql_Col jsonb column"
+        );
+
+        validateJsonbKey(key);
+
+        return ResolvedTarget.jsonb(
+                column,
+                key,
+                psqlCol
+        );
+    }
+
+    // =====================================================================
+    // PREDICATE BUILDING
+    // =====================================================================
+
+    /**
+     * One resolved predicate ready to be embedded in the DELETE statement
+     * and bound (unless it is a NULL predicate, which needs no binding).
+     */
+    static final class ResolvedPredicate {
+
+        final ResolvedTarget target;
+        final String sourceCol;
+        final String sourceValue;
+        final boolean isNull;
+
+        ResolvedPredicate(
+                ResolvedTarget target,
+                String sourceCol,
+                String sourceValue,
+                boolean isNull) {
+
+            this.target = target;
+            this.sourceCol = sourceCol;
+            this.sourceValue = sourceValue;
+            this.isNull = isNull;
+        }
+
+        String toSqlFragment() {
+
+            if (isNull) {
+                return target.toSqlLhs() + " IS NULL";
+            }
+
+            return target.toSqlLhs() + " = ?";
+        }
+    }
+
+    /**
+     * Build the ordered list of predicates for a trigger row, or return
+     * null if a required source column could not be found in
+     * where_clause (caller must treat that as a mapping failure).
+     *
+     * Does NOT guess, does NOT substitute primary_columns_value, and does
+     * NOT silently fall back to another column, per spec.
+     */
+    public List<ResolvedPredicate> buildPredicates(
+            List<ColumnMapping> mappings,
+            Map<String, String> parsedWhereClause,
+            ParserConfigV2 config,
+            TriggerRowV2 row) {
+
+        List<ResolvedPredicate> predicates = new ArrayList<>();
+
+        for (ColumnMapping mapping : mappings) {
+
+            if (!parsedWhereClause.containsKey(mapping.sourceCol)) {
+
+                logger.log(
+                        "ERROR",
+                        "WHERE_CLAUSE_MAPPING_FAILED",
+                        "Trigger_Sno=" + row.sno
+                                + " Source_Table=" + row.tableName
+                                + " Configured_220_Col=" + config.sourceCol
+                                + " Configured_Psql_Col=" + config.psqlCol
+                                + " where_clause=" + row.whereClause
+                                + " Missing_Source_Column="
+                                + mapping.sourceCol
+                );
+
+                return null;
+            }
+
+            String rawValue = parsedWhereClause.get(mapping.sourceCol);
+
+            boolean isNull = isNullLiteral(rawValue);
+
+            predicates.add(
+                    new ResolvedPredicate(
+                            mapping.target,
+                            mapping.sourceCol,
+                            isNull ? null : rawValue,
+                            isNull
+                    )
+            );
+        }
+
+        return predicates;
+    }
+
+    // =====================================================================
+    // POSTGRESQL DELETE
+    // =====================================================================
+
+    /**
+     * Execute one target DELETE built from the resolved predicates.
+     *
+     * Returns:
+     *
+     * > 0  = actual target row(s) deleted
+     * 0    = target not found
+     */
+    public int executeTargetDelete(
+            Connection psqlConn,
+            ParserConfigV2 config,
+            TriggerRowV2 row,
+            List<ResolvedPredicate> predicates) throws SQLException {
+
+        validateIdentifier(
+                config.psqlTableName,
+                "Psql_Table_name"
+        );
+
+        StringBuilder sql = new StringBuilder();
+
+        sql.append("DELETE FROM ")
+                .append(config.psqlTableName)
+                .append(" WHERE ");
+
+        for (int i = 0; i < predicates.size(); i++) {
+
+            if (i > 0) {
+                sql.append(" AND ");
+            }
+
+            sql.append(predicates.get(i).toSqlFragment());
+        }
+
+        int rowsAffected;
+
+        try (PreparedStatement ps =
+                     psqlConn.prepareStatement(sql.toString())) {
+
+            /*
+             * Bind only the non-NULL predicates. Their parameter index
+             * within the PreparedStatement must track their position
+             * among the '?' placeholders actually emitted (NULL
+             * predicates emit no placeholder).
+             */
+            int paramIndex = 1;
+
+            for (ResolvedPredicate predicate : predicates) {
+
+                if (predicate.isNull) {
+                    continue;
+                }
+
+                bindPredicateValue(
+                        ps,
+                        paramIndex,
+                        predicate,
+                        config,
+                        row
+                );
+
+                paramIndex++;
+            }
+
+            rowsAffected = ps.executeUpdate();
+        }
+
+        if (rowsAffected > 0) {
+
+            logger.log(
+                    "INFO",
+                    "DELETE_SUCCESS",
+                    "Trigger_Sno=" + row.sno
+                            + " Source_Table=" + row.tableName
+                            + " Source_Columns=" + describeSourceColumns(predicates)
+                            + " Source_Values=" + describeSourceValues(predicates)
+                            + " Target_Table=" + config.psqlTableName
+                            + " Target_Columns=" + describeTargetColumns(predicates)
+                            + " Target_Values=" + describeSourceValues(predicates)
+                            + " Rows_Deleted=" + rowsAffected
+            );
+
+            writeDeletedRowReport(
+                    config,
+                    row,
+                    predicates,
+                    rowsAffected
+            );
+
+        } else {
+
+            logger.log(
+                    "WARN",
+                    "TARGET_NOT_FOUND",
+                    "Config_Sno=" + config.sno
+                            + " Trigger_Sno=" + row.sno
+                            + " Target_Table=" + config.psqlTableName
+                            + " Target_Columns=" + describeTargetColumns(predicates)
+                            + " Target_Values=" + describeSourceValues(predicates)
+            );
+        }
+
+        return rowsAffected;
+    }
+
+    private String describeSourceColumns(List<ResolvedPredicate> predicates) {
+
+        StringBuilder sb = new StringBuilder();
+
+        for (int i = 0; i < predicates.size(); i++) {
+
+            if (i > 0) {
+                sb.append(",");
+            }
+
+            sb.append(predicates.get(i).sourceCol);
+        }
+
+        return sb.toString();
+    }
+
+    private String describeTargetColumns(List<ResolvedPredicate> predicates) {
+
+        StringBuilder sb = new StringBuilder();
+
+        for (int i = 0; i < predicates.size(); i++) {
+
+            if (i > 0) {
+                sb.append(",");
+            }
+
+            sb.append(predicates.get(i).target.toLogLabel());
+        }
+
+        return sb.toString();
+    }
+
+    private String describeSourceValues(List<ResolvedPredicate> predicates) {
+
+        StringBuilder sb = new StringBuilder();
+
+        for (int i = 0; i < predicates.size(); i++) {
+
+            if (i > 0) {
+                sb.append(",");
+            }
+
+            ResolvedPredicate p = predicates.get(i);
+
+            sb.append(p.isNull ? "NULL" : p.sourceValue);
+        }
+
+        return sb.toString();
+    }
+
+    // =====================================================================
+    // DELETED ROW REPORT (for reporting successful deletions to seniors)
+    // =====================================================================
+
+    /*
+     * Report file path. A CSV file, one line per successfully deleted
+     * trigger row, appended as processing runs. This is purely additive
+     * reporting and does not affect any existing processing, checkpoint,
+     * batching, or logging behavior.
+     */
+    private static final String DELETED_ROWS_REPORT_FILE =
+            "deleted_rows_report.csv";
+
+    private static final String REPORT_CSV_HEADER =
+            "Trigger_Sno,Record_Time,Config_Sno,Source_Table,"
+                    + "Source_Columns,Source_Values,Target_Table,"
+                    + "Target_Columns,Target_Values,Rows_Deleted,"
+                    + "Deleted_At";
+
+    private static final java.time.format.DateTimeFormatter REPORT_TIME_FORMAT =
+            java.time.format.DateTimeFormatter.ofPattern(
+                    "yyyy-MM-dd HH:mm:ss"
+            );
+
+    /*
+     * Ensures the CSV header is written only once per JVM run, the first
+     * time a successful deletion is reported.
+     */
+    private static volatile boolean reportHeaderWritten = false;
+
+    private static final Object REPORT_FILE_LOCK = new Object();
+
+    /**
+     * Append one CSV line to the deleted-rows report for a successfully
+     * deleted trigger row. Failures to write the report are logged but
+     * never interrupt the main DELETE processing flow.
+     */
+    private void writeDeletedRowReport(
+            ParserConfigV2 config,
+            TriggerRowV2 row,
+            List<ResolvedPredicate> predicates,
+            int rowsAffected) {
+
+        try {
+
+            synchronized (REPORT_FILE_LOCK) {
+
+                java.io.File reportFile =
+                        new java.io.File(DELETED_ROWS_REPORT_FILE);
+
+                boolean needsHeader =
+                        !reportHeaderWritten && !reportFile.exists();
+
+                try (java.io.FileWriter fw =
+                             new java.io.FileWriter(reportFile, true);
+                     java.io.BufferedWriter bw =
+                             new java.io.BufferedWriter(fw)) {
+
+                    if (needsHeader) {
+
+                        bw.write(REPORT_CSV_HEADER);
+                        bw.newLine();
+                    }
+
+                    String recordTime =
+                            row.recordTime != null
+                                    ? row.recordTime.toString()
+                                    : "";
+
+                    String deletedAt =
+                            java.time.LocalDateTime.now()
+                                    .format(REPORT_TIME_FORMAT);
+
+                    bw.write(
+                            csvEscape(String.valueOf(row.sno)) + ","
+                                    + csvEscape(recordTime) + ","
+                                    + csvEscape(String.valueOf(config.sno)) + ","
+                                    + csvEscape(row.tableName) + ","
+                                    + csvEscape(describeSourceColumns(predicates)) + ","
+                                    + csvEscape(describeSourceValues(predicates)) + ","
+                                    + csvEscape(config.psqlTableName) + ","
+                                    + csvEscape(describeTargetColumns(predicates)) + ","
+                                    + csvEscape(describeSourceValues(predicates)) + ","
+                                    + csvEscape(String.valueOf(rowsAffected)) + ","
+                                    + csvEscape(deletedAt)
+                    );
+                    bw.newLine();
+
+                    reportHeaderWritten = true;
+                }
+            }
+
+        } catch (java.io.IOException ioEx) {
+
+            logger.log(
+                    "WARN",
+                    "DELETED_ROW_REPORT_WRITE_FAILED",
+                    "Config_Sno=" + config.sno
+                            + " Trigger_Sno=" + row.sno
+                            + " Report_File=" + DELETED_ROWS_REPORT_FILE
+                            + " Error=" + ioEx.getMessage()
+            );
+        }
+    }
+
+    private String csvEscape(String value) {
+
+        if (value == null) {
+            return "";
+        }
+
+        if (value.contains(",")
+                || value.contains("\"")
+                || value.contains("\n")) {
+
+            return "\"" + value.replace("\"", "\"\"") + "\"";
+        }
+
+        return value;
+    }
+
+    /**
+     * Bind one predicate's value into the PreparedStatement at the given
+     * 1-based parameter index.
+     *
+     * This reuses the same JDBC-type-detection approach as the working
+     * V1 parser: consult ParameterMetaData for the expected PostgreSQL
+     * parameter type and bind accordingly, falling back to VARCHAR/String
+     * binding when metadata is unavailable.
+     *
+     * JSONB predicates (col ->> 'key' = ?) always compare as text, so
+     * those are always bound as String regardless of metadata.
+     */
+    private void bindPredicateValue(
+            PreparedStatement ps,
+            int paramIndex,
+            ResolvedPredicate predicate,
+            ParserConfigV2 config,
+            TriggerRowV2 row) throws SQLException {
+
+        String value = predicate.sourceValue;
+
+        if (value == null) {
+
+            throw new SQLException(
+                    "Predicate value is unexpectedly NULL for non-NULL "
+                            + "predicate. "
+                            + "Config_Sno=" + config.sno
+                            + " Trigger_Sno=" + row.sno
+                            + " Source_Col=" + predicate.sourceCol
+                            + " Target_Col=" + predicate.target.toLogLabel()
+            );
+        }
+
+        if (predicate.target.jsonb) {
+
+            /*
+             * JSONB ->> always returns text.
+             */
+            ps.setString(paramIndex, value);
+            return;
+        }
+
+        /*
+         * Normal PostgreSQL column.
+         *
+         * We deliberately do NOT assume BIGINT here.
+         * The actual parameter type is determined by PostgreSQL
+         * through ParameterMetaData after the statement is prepared.
+         */
+        int jdbcType;
+
+        try {
+
+            jdbcType =
+                    ps.getParameterMetaData()
+                            .getParameterType(paramIndex);
+
+        } catch (SQLException metadataEx) {
+
+            /*
+             * Parameter metadata is database-driver dependent.
+             * If unavailable, fall back to VARCHAR.
+             *
+             * The exception is not hidden; it is logged for
+             * diagnosis, but deletion can still proceed for
+             * string-compatible columns.
+             */
+            logger.log(
+                    "WARN",
+                    "PARAMETER_TYPE_FALLBACK",
+                    "Config_Sno=" + config.sno
+                            + " Trigger_Sno=" + row.sno
+                            + " Target_Table=" + config.psqlTableName
+                            + " Target_Col=" + predicate.target.toLogLabel()
+                            + " Parameter_Type_Metadata_Unavailable"
+                            + " Error=" + metadataEx.getMessage()
+            );
+
+            jdbcType = java.sql.Types.VARCHAR;
+        }
+
+        switch (jdbcType) {
+
+            case java.sql.Types.BIGINT:
+
+                try {
+
+                    ps.setLong(
+                            paramIndex,
+                            Long.parseLong(value.trim())
+                    );
+
+                } catch (NumberFormatException ex) {
+
+                    throw new SQLException(
+                            "Invalid BIGINT PK value. "
+                                    + "Config_Sno=" + config.sno
+                                    + " Trigger_Sno=" + row.sno
+                                    + " Target_Table=" + config.psqlTableName
+                                    + " Target_Col=" + predicate.target.toLogLabel()
+                                    + " Value=" + value,
+                            ex
+                    );
+                }
+
+                break;
+
+            case java.sql.Types.INTEGER:
+
+                try {
+
+                    ps.setInt(
+                            paramIndex,
+                            Integer.parseInt(value.trim())
+                    );
+
+                } catch (NumberFormatException ex) {
+
+                    throw new SQLException(
+                            "Invalid INTEGER PK value. "
+                                    + "Config_Sno=" + config.sno
+                                    + " Trigger_Sno=" + row.sno
+                                    + " Target_Table=" + config.psqlTableName
+                                    + " Target_Col=" + predicate.target.toLogLabel()
+                                    + " Value=" + value,
+                            ex
+                    );
+                }
+
+                break;
+
+            case java.sql.Types.SMALLINT:
+
+                try {
+
+                    ps.setShort(
+                            paramIndex,
+                            Short.parseShort(value.trim())
+                    );
+
+                } catch (NumberFormatException ex) {
+
+                    throw new SQLException(
+                            "Invalid SMALLINT PK value. "
+                                    + "Config_Sno=" + config.sno
+                                    + " Trigger_Sno=" + row.sno
+                                    + " Target_Table=" + config.psqlTableName
+                                    + " Target_Col=" + predicate.target.toLogLabel()
+                                    + " Value=" + value,
+                            ex
+                    );
+                }
+
+                break;
+
+            case java.sql.Types.TINYINT:
+
+                try {
+
+                    ps.setByte(
+                            paramIndex,
+                            Byte.parseByte(value.trim())
+                    );
+
+                } catch (NumberFormatException ex) {
+
+                    throw new SQLException(
+                            "Invalid TINYINT PK value. "
+                                    + "Config_Sno=" + config.sno
+                                    + " Trigger_Sno=" + row.sno
+                                    + " Target_Table=" + config.psqlTableName
+                                    + " Target_Col=" + predicate.target.toLogLabel()
+                                    + " Value=" + value,
+                            ex
+                    );
+                }
+
+                break;
+
+            case java.sql.Types.NUMERIC:
+            case java.sql.Types.DECIMAL:
+
+                try {
+
+                    ps.setBigDecimal(
+                            paramIndex,
+                            new java.math.BigDecimal(
+                                    value.trim()
+                            )
+                    );
+
+                } catch (NumberFormatException ex) {
+
+                    throw new SQLException(
+                            "Invalid NUMERIC/DECIMAL PK value. "
+                                    + "Config_Sno=" + config.sno
+                                    + " Trigger_Sno=" + row.sno
+                                    + " Target_Table=" + config.psqlTableName
+                                    + " Target_Col=" + predicate.target.toLogLabel()
+                                    + " Value=" + value,
+                            ex
+                    );
+                }
+
+                break;
+
+            case java.sql.Types.REAL:
+
+                try {
+
+                    ps.setFloat(
+                            paramIndex,
+                            Float.parseFloat(value.trim())
+                    );
+
+                } catch (NumberFormatException ex) {
+
+                    throw new SQLException(
+                            "Invalid REAL PK value. "
+                                    + "Config_Sno=" + config.sno
+                                    + " Trigger_Sno=" + row.sno
+                                    + " Target_Table=" + config.psqlTableName
+                                    + " Target_Col=" + predicate.target.toLogLabel()
+                                    + " Value=" + value,
+                            ex
+                    );
+                }
+
+                break;
+
+            case java.sql.Types.FLOAT:
+            case java.sql.Types.DOUBLE:
+
+                try {
+
+                    ps.setDouble(
+                            paramIndex,
+                            Double.parseDouble(value.trim())
+                    );
+
+                } catch (NumberFormatException ex) {
+
+                    throw new SQLException(
+                            "Invalid FLOAT/DOUBLE PK value. "
+                                    + "Config_Sno=" + config.sno
+                                    + " Trigger_Sno=" + row.sno
+                                    + " Target_Table=" + config.psqlTableName
+                                    + " Target_Col=" + predicate.target.toLogLabel()
+                                    + " Value=" + value,
+                            ex
+                    );
+                }
+
+                break;
+
+            case java.sql.Types.BOOLEAN:
+            case java.sql.Types.BIT:
+
+                ps.setBoolean(
+                        paramIndex,
+                        Boolean.parseBoolean(
+                                value.trim()
+                        )
+                );
+
+                break;
+
+            case java.sql.Types.DATE:
+
+                try {
+
+                    ps.setDate(
+                            paramIndex,
+                            java.sql.Date.valueOf(
+                                    value.trim()
+                            )
+                    );
+
+                } catch (IllegalArgumentException ex) {
+
+                    throw new SQLException(
+                            "Invalid DATE PK value. "
+                                    + "Config_Sno=" + config.sno
+                                    + " Trigger_Sno=" + row.sno
+                                    + " Target_Table=" + config.psqlTableName
+                                    + " Target_Col=" + predicate.target.toLogLabel()
+                                    + " Value=" + value,
+                            ex
+                    );
+                }
+
+                break;
+
+            case java.sql.Types.TIMESTAMP:
+            case java.sql.Types.TIMESTAMP_WITH_TIMEZONE:
+
+                /*
+                 * For target columns that are timestamp-based, let
+                 * PostgreSQL receive the textual representation.
+                 */
+                ps.setString(
+                        paramIndex,
+                        value
+                );
+
+                break;
+
+            case java.sql.Types.OTHER:
+
+                /*
+                 * PostgreSQL UUID and other PostgreSQL-specific
+                 * types commonly appear as OTHER.
+                 *
+                 * Try UUID first. If it isn't a UUID, pass the
+                 * string object through to the PostgreSQL driver.
+                 */
+                try {
+
+                    java.util.UUID uuid =
+                            java.util.UUID.fromString(
+                                    value.trim()
+                            );
+
+                    ps.setObject(
+                            paramIndex,
+                            uuid
+                    );
+
+                } catch (IllegalArgumentException ex) {
+
+                    ps.setObject(
+                            paramIndex,
+                            value
+                    );
+                }
+
+                break;
+
+            case java.sql.Types.CHAR:
+            case java.sql.Types.VARCHAR:
+            case java.sql.Types.LONGVARCHAR:
+
+                ps.setString(
+                        paramIndex,
+                        value
+                );
+
+                break;
+
+            default:
+
+                /*
+                 * Safe generic fallback.
+                 */
+                ps.setObject(
+                        paramIndex,
+                        value
+                );
+
+                break;
+        }
+    }
+
+    // =====================================================================
+    // MAIN CONFIGURATION PROCESSING
+    // =====================================================================
+
+    /**
+     * Processes one configuration from lastSno through maxSno.
+     *
+     * Identical range/batch/checkpoint control flow to V1. Only the
+     * per-row predicate construction (where_clause parsing + column
+     * mapping + predicate building) and the executeTargetDelete call
+     * differ.
+     */
+    public void processConfiguration(
+            Connection mysqlConn,
+            Connection psqlConn,
+            String configTable,
+            ParserConfigV2 config,
+            int batchSize) {
+
+        long totalDeleted = config.recordsDeleted;
+
+        try {
+
+            // -------------------------------------------------------------
+            // 1. Establish maxSno snapshot
+            // -------------------------------------------------------------
+
+            long maxSno =
+                    initializeMaxSno(
+                            mysqlConn,
+                            configTable,
+                            config
+                    );
+
+            if (maxSno == 0) {
+
+                logger.log(
+                        "INFO",
+                        "CONFIG_EMPTY",
+                        "Config_Sno=" + config.sno
+                                + " Trigger_Table=" + config.triggerTable
+                                + " No trigger records found"
+                );
+
+                updateConfigStatus(
+                        mysqlConn,
+                        configTable,
+                        config.sno,
+                        "COMPLETED"
+                );
+
+                return;
+            }
+
+            // -------------------------------------------------------------
+            // 2. Check checkpoint
+            // -------------------------------------------------------------
+
+            long lastSno = config.lastSno;
+
+            logger.log(
+                    "INFO",
+                    "CONFIG_START",
+                    "Config_Sno=" + config.sno
+                            + " Source_Table=" + config.sourceTableName
+                            + " Target_Table=" + config.psqlTableName
+                            + " Trigger_Table=" + config.triggerTable
+                            + " Source_Col=" + config.sourceCol
+                            + " Target_Col=" + config.psqlCol
+                            + " Last_Sno=" + lastSno
+                            + " Max_Sno=" + maxSno
+                            + " Range_Size=" + RANGE_SIZE
+                            + " Batch_Size=" + batchSize
+            );
+
+            if (lastSno >= maxSno) {
+
+                updateConfigStatus(
+                        mysqlConn,
+                        configTable,
+                        config.sno,
+                        "COMPLETED"
+                );
+
+                logger.log(
+                        "INFO",
+                        "CONFIG_ALREADY_COMPLETE",
+                        "Config_Sno=" + config.sno
+                                + " Last_Sno=" + lastSno
+                                + " Max_Sno=" + maxSno
+                );
+
+                return;
+            }
+
+            // -------------------------------------------------------------
+            // 3. Resolve column mappings once per configuration
+            // -------------------------------------------------------------
+
+            List<ColumnMapping> mappings =
+                    resolveColumnMappings(config);
+
+            // -------------------------------------------------------------
+            // 4. Mark configuration IN_PROCESS
+            // -------------------------------------------------------------
+
+            updateConfigStatus(
+                    mysqlConn,
+                    configTable,
+                    config.sno,
+                    "IN_PROCESS"
+            );
+
+            // -------------------------------------------------------------
+            // 5. Range loop
+            // -------------------------------------------------------------
+
+            while (lastSno < maxSno) {
+
+                long rangeEnd =
+                        Math.min(
+                                lastSno + RANGE_SIZE,
+                                maxSno
+                        );
+
+                logger.log(
+                        "INFO",
+                        "RANGE_START",
+                        "Config_Sno=" + config.sno
+                                + " Range_Start=" + lastSno
+                                + " Range_End=" + rangeEnd
+                );
+
+                long cursorSno = lastSno;
+
+                long rangeTriggerCount = 0;
+                long rangeDeletedCount = 0;
+                long rangeNotFoundCount = 0;
+                long rangeFailedCount = 0;
+
+                boolean rangeFailed = false;
+
+                // ---------------------------------------------------------
+                // 6. Batch loop inside range
+                // ---------------------------------------------------------
+
+                while (true) {
+
+                    List<TriggerRowV2> batch =
+                            fetchDeleteTriggerBatch(
+                                    mysqlConn,
+                                    config.triggerTable,
+                                    config.sourceTableName,
+                                    cursorSno,
+                                    rangeEnd,
+                                    batchSize
+                            );
+
+                    if (batch.isEmpty()) {
+                        break;
+                    }
+
+                    long batchDeleted = 0;
+
+                    for (TriggerRowV2 row : batch) {
+
+                        rangeTriggerCount++;
+
+                        /*
+                         * Cursor advances using trigger sno, regardless of
+                         * success/failure, so a failed row is not processed
+                         * repeatedly in the same run.
+                         */
+                        cursorSno = row.sno;
+
+                        try {
+
+                            markTriggerProcessing(
+                                    mysqlConn,
+                                    config.triggerTable,
+                                    row.sno
+                            );
+
+                            Map<String, String> parsedWhereClause =
+                                    parseWhereClause(
+                                            row.whereClause,
+                                            config,
+                                            row
+                                    );
+
+                            List<ResolvedPredicate> predicates =
+                                    buildPredicates(
+                                            mappings,
+                                            parsedWhereClause,
+                                            config,
+                                            row
+                                    );
+
+                            if (predicates == null) {
+
+                                /*
+                                 * Required source column missing from
+                                 * where_clause. Do not guess, do not fall
+                                 * back to primary_columns_value.
+                                 */
+                                rangeFailedCount++;
+                                rangeFailed = true;
+
+                                markTriggerFailed(
+                                        mysqlConn,
+                                        config.triggerTable,
+                                        row.sno
+                                );
+
+                                continue;
+                            }
+
+                            int deleted =
+                                    executeTargetDelete(
+                                            psqlConn,
+                                            config,
+                                            row,
+                                            predicates
+                                    );
+
+                            if (deleted > 0) {
+
+                                batchDeleted += deleted;
+                                rangeDeletedCount += deleted;
+                                totalDeleted += deleted;
+                            } else {
+
+                                rangeNotFoundCount++;
+                            }
+
+                            /*
+                             * TARGET_NOT_FOUND is considered successfully
+                             * reconciled because the target is already absent.
+                             */
+                            markTriggerCompleted(
+                                    mysqlConn,
+                                    config.triggerTable,
+                                    row.sno
+                            );
+
+                        } catch (SQLException rowEx) {
+
+                            rangeFailedCount++;
+                            rangeFailed = true;
+
+                            logger.log(
+                                    "ERROR",
+                                    "TRIGGER_FAILED",
+                                    "Config_Sno=" + config.sno
+                                            + " Trigger_Sno=" + row.sno
+                                            + " Source_Table=" + row.tableName
+                                            + " where_clause=" + row.whereClause
+                                            + " Error=" + rowEx.getMessage()
+                            );
+
+                            safeMarkTriggerFailed(
+                                    mysqlConn,
+                                    config.triggerTable,
+                                    row.sno
+                            );
+
+                        } catch (IllegalArgumentException configEx) {
+
+                            /*
+                             * Malformed Psql_Col (e.g. bad JSONB shape)
+                             * discovered while resolving a mapping. Treated
+                             * as a row-level mapping failure so a single
+                             * bad row does not silently corrupt the range;
+                             * range-level failure handling below prevents
+                             * checkpoint advancement.
+                             */
+                            rangeFailedCount++;
+                            rangeFailed = true;
+
+                            logger.log(
+                                    "ERROR",
+                                    "WHERE_CLAUSE_MAPPING_FAILED",
+                                    "Config_Sno=" + config.sno
+                                            + " Trigger_Sno=" + row.sno
+                                            + " Source_Table=" + row.tableName
+                                            + " Configured_220_Col=" + config.sourceCol
+                                            + " Configured_Psql_Col=" + config.psqlCol
+                                            + " where_clause=" + row.whereClause
+                                            + " Error=" + configEx.getMessage()
+                            );
+
+                            safeMarkTriggerFailed(
+                                    mysqlConn,
+                                    config.triggerTable,
+                                    row.sno
+                            );
+                        }
+                    }
+
+                    /*
+                     * Persist deleted counter once per batch, not once per
+                     * individual DELETE.
+                     */
+                    if (batchDeleted > 0) {
+
+                        updateRecordsDeleted(
+                                mysqlConn,
+                                configTable,
+                                config.sno,
+                                totalDeleted
+                        );
+                    }
+
+                    logger.log(
+                            "INFO",
+                            "BATCH_COMPLETED",
+                            "Config_Sno=" + config.sno
+                                    + " Range_End=" + rangeEnd
+                                    + " Batch_Records=" + batch.size()
+                                    + " Batch_Deleted=" + batchDeleted
+                                    + " Cursor_Sno=" + cursorSno
+                    );
+                }
+
+                // ---------------------------------------------------------
+                // 7. Range completion / checkpoint
+                // ---------------------------------------------------------
+
+                if (rangeFailed) {
+
+                    /*
+                     * DO NOT advance checkpoint.
+                     *
+                     * The next execution will start again from the same
+                     * lastSno and retry all uncompleted/failed trigger rows.
+                     */
+                    updateConfigStatus(
+                            mysqlConn,
+                            configTable,
+                            config.sno,
+                            "INIT"
+                    );
+
+                    logger.log(
+                            "ERROR",
+                            "RANGE_FAILED",
+                            "Config_Sno=" + config.sno
+                                    + " Range_Start=" + lastSno
+                                    + " Range_End=" + rangeEnd
+                                    + " Trigger_Records=" + rangeTriggerCount
+                                    + " Rows_Deleted=" + rangeDeletedCount
+                                    + " Target_Not_Found=" + rangeNotFoundCount
+                                    + " Failed=" + rangeFailedCount
+                                    + " Last_Sno_Remains=" + lastSno
+                    );
+
+                    return;
+                }
+
+                /*
+                 * Entire range completed.
+                 * Only now move the persistent checkpoint.
+                 */
+                updateLastSno(
+                        mysqlConn,
+                        configTable,
+                        config.sno,
+                        rangeEnd
+                );
+
+                config.lastSno = rangeEnd;
+                lastSno = rangeEnd;
+
+                logger.log(
+                        "INFO",
+                        "RANGE_COMPLETED",
+                        "Config_Sno=" + config.sno
+                                + " Range_End=" + rangeEnd
+                                + " Trigger_Records=" + rangeTriggerCount
+                                + " Rows_Deleted=" + rangeDeletedCount
+                                + " Target_Not_Found=" + rangeNotFoundCount
+                                + " Failed=" + rangeFailedCount
+                                + " Last_Sno=" + lastSno
+                );
+            }
+
+            // -------------------------------------------------------------
+            // 8. Configuration completed
+            // -------------------------------------------------------------
+
+            updateRecordsDeleted(
+                    mysqlConn,
+                    configTable,
+                    config.sno,
+                    totalDeleted
+            );
+
+            updateConfigStatus(
+                    mysqlConn,
+                    configTable,
+                    config.sno,
+                    "COMPLETED"
+            );
+
+            logger.log(
+                    "INFO",
+                    "CONFIG_COMPLETED",
+                    "Config_Sno=" + config.sno
+                            + " Last_Sno=" + lastSno
+                            + " Max_Sno=" + maxSno
+                            + " Total_Deleted=" + totalDeleted
+            );
+
+        } catch (SQLException ex) {
+
+            /*
+             * Fatal configuration-level DB error.
+             * Do not move checkpoint beyond the last known successful range.
+             */
+            logger.log(
+                    "ERROR",
+                    "CONFIG_FAILED",
+                    "Config_Sno=" + config.sno
+                            + " Last_Sno=" + config.lastSno
+                            + " Max_Sno=" + config.maxSno
+                            + " Total_Deleted=" + totalDeleted
+                            + " Error=" + ex.getMessage()
+            );
+
+            safeMarkConfigFailed(
+                    mysqlConn,
+                    configTable,
+                    config.sno
+            );
+
+        } catch (RuntimeException ex) {
+
+            /*
+             * Covers, among other things, a completely malformed
+             * 220_Col/Psql_Col configuration discovered up-front via
+             * resolveColumnMappings() before the range loop even starts.
+             */
+            logger.log(
+                    "ERROR",
+                    "CONFIG_FAILED",
+                    "Config_Sno=" + config.sno
+                            + " Last_Sno=" + config.lastSno
+                            + " Max_Sno=" + config.maxSno
+                            + " Error=" + ex.getMessage()
+            );
+
+            safeMarkConfigFailed(
+                    mysqlConn,
+                    configTable,
+                    config.sno
+            );
+        }
+    }
+
+    // =====================================================================
+    // SAFE FAILURE HELPERS
+    // =====================================================================
+
+    private void safeMarkTriggerFailed(
+            Connection mysqlConn,
+            String triggerTable,
+            long triggerSno) {
+
+        try {
+
+            markTriggerFailed(
+                    mysqlConn,
+                    triggerTable,
+                    triggerSno
+            );
+
+        } catch (SQLException ex) {
+
+            logger.log(
+                    "ERROR",
+                    "TRIGGER_STATUS_ERROR",
+                    "Trigger_Sno=" + triggerSno
+                            + " Status=failed"
+                            + " Error=" + ex.getMessage()
+            );
+        }
+    }
+
+    private void safeMarkConfigFailed(
+            Connection mysqlConn,
+            String configTable,
+            long configSno) {
+
+        try {
+
+            updateConfigStatus(
+                    mysqlConn,
+                    configTable,
+                    configSno,
+                    "FAILED"
+            );
+
+        } catch (SQLException ex) {
+
+            logger.log(
+                    "ERROR",
+                    "CONFIG_STATUS_ERROR",
+                    "Config_Sno=" + configSno
+                            + " Status=FAILED"
+                            + " Error=" + ex.getMessage()
+            );
+        }
+    }
+
+    // =====================================================================
+    // IDENTIFIER VALIDATION
+    // =====================================================================
+
+    private void validateIdentifier(
+            String identifier,
+            String fieldLabel) {
+
+        if (identifier == null
+                || !SAFE_IDENTIFIER.matcher(
+                        identifier.trim()
+                ).matches()) {
+
+            throw new IllegalArgumentException(
+                    "Unsafe or invalid SQL identifier for "
+                            + fieldLabel
+                            + ": "
+                            + identifier
+            );
+        }
+    }
+
+    private void validateJsonbKey(String key) {
+
+        if (key == null
+                || !SAFE_JSONB_KEY.matcher(key).matches()) {
+
+            throw new IllegalArgumentException(
+                    "Unsafe or invalid JSONB key: "
+                            + key
+            );
+        }
+    }
+
+    // =====================================================================
+    // DATA HOLDERS
+    // =====================================================================
+
+    public static final class ParserConfigV2 {
+
+        public long sno;
+
+        public String psqlTableName;
+
+        public String sourceTableName;
+
+        /*
+         * V2: renamed from 220_PK. Comma-separated list of source
+         * where_clause column names, e.g. "kig_id,knt_kyc_no".
+         */
+        public String sourceCol;
+
+        /*
+         * V2: renamed from Psql_PK. Comma-separated list of target
+         * PostgreSQL column/JSONB references, positionally matched to
+         * sourceCol, e.g. "document_id,metadata.alphanumeric_no".
+         */
+        public String psqlCol;
+
+        public String status;
+
+        public long recordsDeleted;
+
+        public String triggerTable;
+
+        /*
+         * Snapshot upper boundary for this parser run.
+         */
+        public long maxSno;
+
+        /*
+         * Persistent completed-range checkpoint.
+         */
+        public long lastSno;
+    }
+
+    public static final class TriggerRowV2 {
+
+        public long sno;
+
+        public Timestamp recordTime;
+
+        public String tableName;
+
+        /*
+         * Retained from V1 for logging/reference only. V2 does NOT use
+         * these two fields to build the DELETE predicate.
+         */
+        public String primaryColumnsName;
+        public String primaryColumnsValue;
+
+        public String typeOfOperation;
+
+        public String syncStatus;
+
+        /*
+         * V2: authoritative source of DELETE predicate values.
+         * Format: col1=val1^|col2=val2^|...
+         */
+        public String whereClause;
+    }
+
+    // =====================================================================
+    // LOGGER CONTRACT
+    // =====================================================================
+
+    public interface Logger {
+
+        void log(
+                String level,
+                String evtType,
+                String message
+        );
+    }
+}

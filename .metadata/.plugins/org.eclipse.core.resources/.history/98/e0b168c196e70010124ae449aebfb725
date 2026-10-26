@@ -1,0 +1,86 @@
+package unstructured;
+
+import com.amazonaws.ClientConfiguration;
+import com.amazonaws.auth.AWSStaticCredentialsProvider;
+import com.amazonaws.auth.BasicAWSCredentials;
+import com.amazonaws.client.builder.AwsClientBuilder;
+import com.amazonaws.services.s3.*;
+import com.amazonaws.services.s3.model.*;
+
+public class unstructured_main {
+
+    private static final String S3_ENDPOINT = "http://172.20.161.11";
+    private static final String REGION = "us-east-1";
+    private static final String ACCESS_KEY = "HPZBCYK10H24VCNRKKM7";
+    private static final String SECRET_KEY = "hNz4QcK6TWQUmCuqfUSr+DBHXC2kHo93Fhq5xqLm";
+    private static final String SOURCE_BUCKET = "dc-bulkarch-bucket1";
+    private static final String DEST_BUCKET = "testincdata";
+    private static final String DEST_PREFIX = "dc-bulkarch-bucket1/";
+    public static void main(String[] args) {
+
+        AmazonS3 s3 = createS3Client();
+
+        ListObjectsV2Request listReq = new ListObjectsV2Request()
+                .withBucketName(SOURCE_BUCKET);
+
+        ListObjectsV2Result result;
+
+        do {
+            result = s3.listObjectsV2(listReq);
+
+            for (S3ObjectSummary obj : result.getObjectSummaries()) {
+
+                String sourceKey = obj.getKey();
+                String destKey = DEST_PREFIX + sourceKey;
+
+                if (destinationExists(s3, DEST_BUCKET, destKey)) {
+                    System.out.println("SKIPPED : " + sourceKey);
+                    continue;
+                }
+
+                CopyObjectRequest copyReq = new CopyObjectRequest(
+                        SOURCE_BUCKET, sourceKey,
+                        DEST_BUCKET, destKey
+                );
+
+                s3.copyObject(copyReq);
+                System.out.println("COPIED  : " + sourceKey);
+            }
+
+            listReq.setContinuationToken(result.getNextContinuationToken());
+
+        } while (result.isTruncated());
+
+        System.out.println("Incremental migration completed.");
+    }
+
+    private static AmazonS3 createS3Client() {
+
+        BasicAWSCredentials creds =
+                new BasicAWSCredentials(ACCESS_KEY, SECRET_KEY);
+
+        ClientConfiguration config = new ClientConfiguration();
+        config.setSignerOverride("AWSS3V4SignerType");
+
+        return AmazonS3ClientBuilder.standard()
+                .withEndpointConfiguration(
+                        new AwsClientBuilder.EndpointConfiguration(
+                                S3_ENDPOINT, REGION))
+                .withPathStyleAccessEnabled(true)
+                .withClientConfiguration(config)
+                .withCredentials(
+                        new AWSStaticCredentialsProvider(creds))
+                .build();
+    }
+
+    private static boolean destinationExists(
+            AmazonS3 s3, String bucket, String key) {
+
+        try {
+            s3.getObjectMetadata(bucket, key);
+            return true;
+        } catch (AmazonS3Exception e) {
+            return e.getStatusCode() != 404;
+        }
+    }
+}

@@ -1,0 +1,79 @@
+package url_parserV1;
+
+import java.io.*;
+import java.nio.file.*;
+
+public class url_parser_methods_login {
+    public static void main(String[] args) throws Exception {
+
+        // Run Tesseract command
+        Process process = new ProcessBuilder(
+                "tesseract",
+                "captcha.png",
+                "output",
+                "--dpi", "300",
+                "-l", "eng"
+        ).start();
+
+        process.waitFor();
+
+        // Read output file
+        String text = new String(Files.readAllBytes(Paths.get("output.txt"))).trim();
+
+        System.out.println("Extracted CAPTCHA: " + text);
+    }
+}
+
+//
+//
+//
+//package url_parserV1;
+//
+//import java.io.IOException;
+//import java.nio.file.DirectoryStream;
+//import java.nio.file.Files;
+//import java.nio.file.Path;
+//import java.nio.file.Paths;
+//import java.util.Comparator;
+//import java.util.Optional;
+//import java.util.stream.Stream;
+//
+//public class url_parser_methods_login {
+//
+//    public static void main(String[] args) {
+//
+////        Path downloadDir = Paths.get(System.getProperty("user.home"), "Downloads");
+//      
+//         Path downloadDir = Paths.get("C:\\Users\\User\\Downloads\\NTT");
+//
+//        try {
+//            Optional<Path> latestXlsFileOpt = Files.list(downloadDir)
+//                .filter(p -> p.getFileName().toString().toLowerCase().endsWith(".xls"))
+//                .max(Comparator.comparingLong(p -> {
+//                    try {
+//                        return Files.getLastModifiedTime(p).toMillis();
+//                    } catch (IOException e) {
+//                       
+//                        throw new RuntimeException(e);
+//                    }
+//                }));
+//
+//            if (latestXlsFileOpt.isPresent()) {
+//                Path latestXlsFile = latestXlsFileOpt.get();
+//                Path renamedPath = downloadDir.resolve("123_Blocked.xls");
+//                
+//             
+//                Files.move(latestXlsFile, renamedPath);
+//                
+//                System.out.println("File Renamed To: " + renamedPath.toAbsolutePath());
+//            } else {
+//                System.out.println("No XLS file found in Downloads!");
+//            }
+//
+//        } catch (IOException | RuntimeException e) {
+//            System.err.println("An error occurred during file operation: " + e.getMessage());
+//            e.printStackTrace();
+//        }
+//    }
+//}
+

@@ -1,0 +1,715 @@
+package call_processing_v1;
+
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.text.ParseException;
+import java.text.ParsePosition;
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+import java.util.Date;
+
+public class SNORangeFinder {
+	
+	PrintUtilMsg pu   = new PrintUtilMsg(); 
+	MySQLConnection msc = new MySQLConnection();
+	final String TAG = "New SNO Test";
+	
+	public int[] getStartEndIdOfTable(String table, String db_url,
+			String db_name, String db_pass) {
+		int[] startEndId = null;
+		String query = null;
+		Connection conn = null;
+		Statement stmt = null;
+		ResultSet rs = null;
+		try {
+			query = "select min(sno) min,max(sno) max from " + table;
+			conn = new MySQLConnection().getConnection(db_url,
+					db_name, db_pass);
+			stmt = conn.createStatement();
+			rs = stmt.executeQuery(query);
+			while (rs.next()) {
+				startEndId = new int[]{rs.getInt("min"), rs.getInt("max")};
+			}
+		} catch (Exception ex) {
+			startEndId = null;
+			ex.printStackTrace();
+		} finally {
+			try {
+				if (conn != null) {
+					if (rs != null) {
+						rs.close();
+					}
+					if (stmt != null) {
+						stmt.close();
+					}
+					conn.close();
+				}
+			} catch (Exception e) {
+			}
+		}
+		return startEndId;
+	}
+	
+	
+	
+	public int[] getStartAndEndId( String date, int startId, int endId, String tableName, String dateField, String trendType, String repId, boolean trendHaveSameLevalReport, String idColumn,String db_url,String db_name,String db_pass ){
+	//	pu.sop( "getStartAndEndId", " date " +date+"  dateField " +dateField+"");
+		int numOfAttr = 0;
+		int leftId  = 0;
+		int rightId = 0;
+		int midID   = 0;
+		int[] finalRange = null;
+		String tempDate  = null;
+		Date midDate     = null;
+		Date sDate       = null;
+		String day       = null;
+		String month     = null;
+		String startDay  = null;
+		String monthday  = null;
+		String query     = null;
+		Connection conn  = null;
+		Statement stmt   = null;
+		ResultSet rs     = null;
+		try{
+			midID   = (startId+endId)/2;
+			if(date != null){
+			//	 day   = date.substring( date.lastIndexOf("-"), date.indexOf(" ") );	
+				 //day   = date.substring( date.lastIndexOf("-"));//COMMENTED BY TANUJ ON 30-SEP-2018
+				 day   = date.substring( date.lastIndexOf("-") + 1 );//ADDED BY TANUJ ON 30-SEP-2018
+				 month = date.substring(5,date.lastIndexOf("-"));
+		//		 pu.sop( "getStartAndEndId called ", " day " +day+"  month " +month+"");
+			}
+			if( date != null){
+			//	monthday = date.substring( 4, date.indexOf(" ") );
+				//monthday = date.substring( 4 );//COMMENTED BY TANUJ ON 30-SEP-2018
+				monthday = date.substring( 5 );//ADDED BY TANUJ ON 30-SEP-2018
+		//		 pu.sop( "getStartAndEndId next called ", " monthday " +monthday+"");
+			}
+			if(trendHaveSameLevalReport){
+				if( trendType.equalsIgnoreCase("weekly") ){
+					startDay = this.getDayName( date );
+					//pu.sop("dayname","Date of ["+date+"] and Day name is ["+startDay+"]");
+					if(dateField == null){
+						dateField = "week";
+					}
+					query = "select DATE_FORMAT(STR_TO_DATE(concat(substr("+dateField+",2,length("+dateField+")), ' ', '"+startDay+"'),'%V%X %W'),'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;				
+				}else if(trendType.equalsIgnoreCase( "monthly" )){				
+					if(dateField == null){
+						dateField = "month";
+					}
+					query = "select if(substring(str_to_date(month,'%M'),6,2) = '"+month+"', DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date(month,'%M %Y'),'%Y-%m'),'"+day+"'),'%Y-%m-%d %H:%i:%s'), DATE_ADD(DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date(month,'%M %Y'),'%Y-%m'),'"+day+"'),'%Y-%m-%d %H:%i:%s'),INTERVAL 1 MONTH)) temp from "+tableName+" where "+idColumn+"="+midID;
+				}else if(trendType.equalsIgnoreCase( "yearly" )){
+					if(dateField == null){
+						dateField = "year";
+					}
+					query = "select DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date("+dateField+",'%Y'),'%Y'),'"+monthday+"'),'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID; 
+				}else{
+		//			pu.sop( "inside if else block called", "query ");
+				  //  query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+				    query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d') temp from "+tableName+" where "+idColumn+"="+midID;
+				  //   query = "select DATE_FORMAT(DATE(fb_ldate),'%Y-%m-%d %H:%i:%s') ftemp, DATE_FORMAT(DATE(twit_ldate),'%Y-%m-%d %H:%i:%s') ttemp,DATE_FORMAT(DATE(go_ldate),'%Y-%m-%d %H:%i:%s') gtemp from social_profile_update where "+idColumn+"="+midID;
+				}
+			}else{
+				if(tableName.toLowerCase().contains("_weekly") && dateField.equalsIgnoreCase("week")){
+					query = "select DATE_FORMAT(STR_TO_DATE(concat(substr("+dateField+",2,length("+dateField+")), ' ', '"+startDay+"'),'%V%X %W'),'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+				}else if(tableName.toLowerCase().contains("_monthly") && dateField.equalsIgnoreCase("month")){
+					query = "select if(substring(str_to_date(month,'%M'),6,2) = '"+month+"', DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date(month,'%M %Y'),'%Y-%m'),'"+day+"'),'%Y-%m-%d %H:%i:%s'), DATE_ADD(DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date(month,'%M %Y'),'%Y-%m'),'"+day+"'),'%Y-%m-%d %H:%i:%s'),INTERVAL 1 MONTH)) temp from "+tableName+" where "+idColumn+"="+midID;
+				}else if(tableName.toLowerCase().contains("_yearly") && dateField.equalsIgnoreCase("year")){										
+					query = "select DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date("+dateField+",'%Y'),'%Y'),'"+monthday+"'),'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+				}else{
+					if (dateField.indexOf(" or ")!=-1 ) {
+						String [] dfieldTemp=dateField.split(" or ");
+						String dateFieldTemp = "";
+						numOfAttr = dfieldTemp.length;
+						for (int i=0; i < dfieldTemp.length; i++  ) {
+						//	dateFieldTemp = dateFieldTemp + " DATE_FORMAT("+dfieldTemp[i]+", '%Y-%m-%d %H:%i:%s') temp"+i+",";
+							dateFieldTemp = dateFieldTemp + " DATE_FORMAT("+dfieldTemp[i]+", '%Y-%m-%d') temp"+i+",";
+						}
+						if( dateFieldTemp.indexOf(",") != -1 ) {
+							dateFieldTemp = dateFieldTemp.substring(0, dateFieldTemp.length() - 1);
+						}
+						//query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+						query = "select "+dateFieldTemp+" from "+tableName+" where "+idColumn+"="+midID;
+					
+					}else {
+			//			pu.sop( "inside else block called:::", "query ");
+					//query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+					query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d') temp from "+tableName+" where "+idColumn+"="+midID;
+					}
+					//query = "select DATE_FORMAT(DATE(fb_ldate),'%Y-%m-%d %H:%i:%s') ftemp, DATE_FORMAT(DATE(twit_ldate),'%Y-%m-%d %H:%i:%s') ttemp,DATE_FORMAT(DATE(go_ldate),'%Y-%m-%d %H:%i:%s') gtemp from social_profile_update where "+idColumn+"="+midID;
+				}
+			}
+			//pu.sop(TAG,"StartId:["+startId+"],EndId:["+endId+"],Query for getting mid id date ["+midID+"] ["+query+"]");
+			conn  = msc.getConnection(db_url,db_name,db_pass);
+			////pu.sop( "SNO Test", "Connection created.");
+		//	pu.sop( "getStartAndEndId function called", "query "+query+"");
+			stmt  = conn.createStatement();
+			rs    = stmt.executeQuery(query);
+			while( rs.next() ){
+				if( numOfAttr > 0 ) {
+					for( int i = 0; i < numOfAttr; i++ ) {
+						if ( rs.getString( "temp"+i ) != null && !rs.getString( "temp"+i ).equalsIgnoreCase("null") ) {
+							pu.sop("TempDate Check", "Date from DB is ["+rs.getString("temp"+i)+"]");
+							try {
+							tempDate = rs.getString("temp"+i).trim();
+							}catch(Exception ein) {
+								pu.sop("EXCEPTION", "Exception in getting date from DB ["+ein.getMessage()+"]");
+							}
+						}
+						if ( tempDate != null ) {
+							break;
+						}
+					}
+				}else {
+					try {
+						tempDate = rs.getString("temp").trim();
+					}catch(Exception e) {
+						tempDate = null;
+					}
+				}
+			}
+			try{
+				if( conn != null ){
+					if( rs != null )
+						rs.close();
+					if( stmt != null )
+						stmt.close();
+					conn.close();
+				}
+			}catch( Exception ex ){
+				pu.sop( "query executed ", "exception ex "+ex+"" );
+			}
+			
+		//	pu.sop( "getStartAndEndId function ::", "tempDate "+tempDate+" date :: "+date+"");
+			if( ( date != null && !date.equalsIgnoreCase("null") ) && ( tempDate != null && !tempDate.equalsIgnoreCase("null") ) ){
+				sDate   = this.getFormatedDate(date);
+				midDate = this.getFormatedDate(tempDate);
+				//pu.sop( TAG, "date:["+date+"],SDate:["+sDate+"],tempDate:["+tempDate+"],midDate:["+midDate+"] and comparision value:["+sDate.compareTo(midDate)+"]");
+				if( sDate.compareTo(midDate) < 0 && (endId-startId) > 1 ){
+					tempDate  = null;
+					midDate   = null;
+					sDate     = null;
+					day       = null;
+					month     = null;
+					startDay  = null;
+					monthday  = null;
+					query     = null;
+					finalRange = this.getStartAndEndId( date, startId, midID, tableName, dateField, trendType, repId, trendHaveSameLevalReport, idColumn ,db_url,db_name,db_pass);
+				}else if( sDate.compareTo(midDate) > 0 && (endId-startId) > 1 ){
+					tempDate  = null;
+					midDate   = null;
+					sDate     = null;
+					day       = null;
+					month     = null;
+					startDay  = null;
+					monthday  = null;
+					query     = null;
+					finalRange = this.getStartAndEndId( date, midID, endId, tableName, dateField, trendType, repId, trendHaveSameLevalReport, idColumn,db_url,db_name,db_pass );
+				}else{
+					tempDate  = null;
+					midDate   = null;
+					sDate     = null;
+					day       = null;
+					month     = null;
+					startDay  = null;
+					monthday  = null;
+					query     = null;
+					//pu.sop( "getStartAndEndId", "Going to calculate left ID.Start ID:["+startId+"] and Mid Id:["+midID+"]");
+					leftId  = this.getLeftSNO( date, startId, midID, tableName, dateField, trendType, repId, trendHaveSameLevalReport, idColumn ,db_url,db_name,db_pass);
+					//pu.sop( "getStartAndEndId", "Going to calculate right ID.Mid Id:["+midID+"] and End Id:["+endId+"]");
+					rightId = this.getRightSNO( date, midID, endId, tableName, dateField, trendType, repId, trendHaveSameLevalReport, idColumn ,db_url,db_name,db_pass);
+					finalRange = new int[]{ leftId, rightId };
+				}
+			}else if( tempDate == null) {
+				pu.sop( "temp date is null ", "temp date "+tempDate+"" );
+				finalRange = new int[] {startId, endId};
+				return finalRange;
+			}
+		}catch( Exception ex ){
+			ex.printStackTrace();
+		}finally{
+			try{
+				if( conn != null ){
+					if( rs != null )
+						rs.close();
+					if( stmt != null )
+						stmt.close();
+					conn.close();
+				}
+			}catch( Exception ex ){}
+			tempDate  = null;
+			midDate   = null;
+			sDate     = null;
+			day       = null;
+			month     = null;
+			startDay  = null;
+			monthday  = null;
+			query     = null;
+		}
+		if (tempDate == null){
+			return finalRange;
+		}
+		return finalRange;
+	}
+	
+	public int getLeftSNO(  String date, int startId, int endId, String tableName, String dateField, String trendType, String repId, boolean trendHaveSameLevalReport, String idColumn,String db_url,String db_name,String db_pass ){
+		int leftSNO = 0;
+		int midID   = 0;
+		int numOfAttr = 0;
+		String tempDate  = null;
+		Date midDate     = null;
+		Date sDate       = null;
+		String day       = null;
+		String month     = null;
+		String startDay  = null;
+		String monthday  = null;
+		String query     = null;
+		Connection conn  = null;
+		Statement stmt   = null;
+		ResultSet rs     = null;
+		try{
+			//pu.sop( "getLeftSNO", "Going to calculate left ID.Start ID:["+startId+"] and End Id:["+endId+"]");
+			midID   = (startId+endId)/2;
+			if(date != null){
+				// day   = date.substring( date.lastIndexOf("-"), date.indexOf(" ") );
+				 //day   = date.substring( date.lastIndexOf("-"));//COMMENTED BY TANUJ ON 30-SEP-2018
+				 day   = date.substring( date.lastIndexOf("-") + 1 );//ADDED BY TANUJ ON 30-SEP-2018
+				 month = date.substring(5,date.lastIndexOf("-"));
+			}
+			if( date != null){
+			//	monthday = date.substring( 4, date.indexOf(" ") );	
+				//monthday = date.substring( 4 );//COMMENTED BY TANUJ ON 30-SEP-2018
+				monthday = date.substring( 5 );//ADDED BY TANUJ ON 30-SEP-2018
+			}
+			if(trendHaveSameLevalReport){
+				if( trendType.equalsIgnoreCase("weekly") ){
+					startDay = this.getDayName( date );
+					//pu.sop("dayname","Date of ["+date+"] and Day name is ["+startDay+"]");
+					if(dateField == null){
+						dateField = "week";
+					}
+					query = "select DATE_FORMAT(STR_TO_DATE(concat(substr("+dateField+",2,length("+dateField+")), ' ', '"+startDay+"'),'%V%X %W'),'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;				
+				}else if(trendType.equalsIgnoreCase( "monthly" )){				
+					if(dateField == null){
+						dateField = "month";
+					}
+					query = "select if(substring(str_to_date(month,'%M'),6,2) = '"+month+"', DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date(month,'%M %Y'),'%Y-%m'),'"+day+"'),'%Y-%m-%d %H:%i:%s'), DATE_ADD(DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date(month,'%M %Y'),'%Y-%m'),'"+day+"'),'%Y-%m-%d %H:%i:%s'),INTERVAL 1 MONTH)) temp from "+tableName+" where "+idColumn+"="+midID;
+				}else if(trendType.equalsIgnoreCase( "yearly" )){
+					if(dateField == null){
+						dateField = "year";
+					}
+					query = "select DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date("+dateField+",'%Y'),'%Y'),'"+monthday+"'),'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID; 
+				}else{
+				//    query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+					 query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d ') temp from "+tableName+" where "+idColumn+"="+midID;
+				}
+			}else{
+				if(tableName.toLowerCase().contains("_weekly") && dateField.equalsIgnoreCase("week")){
+					query = "select DATE_FORMAT(STR_TO_DATE(concat(substr("+dateField+",2,length("+dateField+")), ' ', '"+startDay+"'),'%V%X %W'),'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+				}else if(tableName.toLowerCase().contains("_monthly") && dateField.equalsIgnoreCase("month")){
+					query = "select if(substring(str_to_date(month,'%M'),6,2) = '"+month+"', DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date(month,'%M %Y'),'%Y-%m'),'"+day+"'),'%Y-%m-%d %H:%i:%s'), DATE_ADD(DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date(month,'%M %Y'),'%Y-%m'),'"+day+"'),'%Y-%m-%d %H:%i:%s'),INTERVAL 1 MONTH)) temp from "+tableName+" where "+idColumn+"="+midID;
+				}else if(tableName.toLowerCase().contains("_yearly") && dateField.equalsIgnoreCase("year")){										
+					query = "select DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date("+dateField+",'%Y'),'%Y'),'"+monthday+"'),'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+				}
+				/*else{
+					query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+				}
+			}    */
+			
+			else{
+				if (dateField.indexOf(" or ")!=-1 ) {
+					String [] dfieldTemp=dateField.split(" or ");
+					String dateFieldTemp = "";
+					numOfAttr = dfieldTemp.length;
+					for (int i=0; i < dfieldTemp.length; i++  ) {
+					//	dateFieldTemp = dateFieldTemp + " DATE_FORMAT("+dfieldTemp[i]+", '%Y-%m-%d %H:%i:%s') temp"+i+",";
+						dateFieldTemp = dateFieldTemp + " DATE_FORMAT("+dfieldTemp[i]+", '%Y-%m-%d') temp"+i+",";
+					}
+					if( dateFieldTemp.indexOf(",") != -1 ) {
+						dateFieldTemp = dateFieldTemp.substring(0, dateFieldTemp.length() - 1);
+					}
+					//query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+					query = "select "+dateFieldTemp+" from "+tableName+" where "+idColumn+"="+midID;
+				
+				}else {
+				//	pu.sop( "inside else block calleds", "query ");
+				//query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+				query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d') temp from "+tableName+" where "+idColumn+"="+midID;
+				}
+				//query = "select DATE_FORMAT(DATE(fb_ldate),'%Y-%m-%d %H:%i:%s') ftemp, DATE_FORMAT(DATE(twit_ldate),'%Y-%m-%d %H:%i:%s') ttemp,DATE_FORMAT(DATE(go_ldate),'%Y-%m-%d %H:%i:%s') gtemp from social_profile_update where "+idColumn+"="+midID;
+			}
+		}
+			
+			
+			
+			
+		//	pu.sop(TAG,"Query for getting mid id : ["+midID+"] ["+query+"]");
+			conn  = msc.getConnection(db_url,db_name,db_pass);
+			//pu.sop( "SNO Test", "Connection created.");
+			stmt  = conn.createStatement();
+			rs    = stmt.executeQuery(query);
+			/*while( rs.next() ){
+				tempDate = rs.getString("temp");
+				
+			}  */
+			
+			while( rs.next() ){
+				if( numOfAttr > 0 ) {
+					for( int i = 0; i < numOfAttr; i++ ) {
+						if ( rs.getString( "temp"+i ) != null && !rs.getString( "temp"+i ).equalsIgnoreCase("null") ) {
+							pu.sop("TempDate Check", "Date from DB is ["+rs.getString("temp"+i)+"]");
+							try {
+							tempDate = rs.getString("temp"+i).trim();
+							}catch(Exception ein) {
+								pu.sop("EXCEPTION", "Exception in getting date from DB ["+ein.getMessage()+"]");
+							}
+						}
+						if ( tempDate != null ) {
+							break;
+						}
+					}
+				}else {
+					tempDate = rs.getString("temp").trim();
+				}
+			}
+			try{
+				if( conn != null ){
+					if( rs != null )
+						rs.close();
+					if( stmt != null )
+						stmt.close();
+					conn.close();
+				}
+			}catch( Exception ex ){}
+			//if( date != null ){
+			if( ( date != null || date.equalsIgnoreCase("null") ) && ( tempDate != null || tempDate.equalsIgnoreCase("null") ) ){
+
+				sDate    = this.getFormatedDate(date);
+				midDate = this.getFormatedDate(tempDate);
+				if( sDate.compareTo(midDate) == 0 && ( midID - startId ) > 1 ){
+					tempDate  = null;
+					midDate   = null;
+					sDate     = null;
+					day       = null;
+					month     = null;
+					startDay  = null;
+					monthday  = null;
+					query     = null;
+					leftSNO = this.getLeftSNO( date, startId, midID, tableName, dateField, trendType, repId, trendHaveSameLevalReport, idColumn,db_url,db_name,db_pass );
+				}else if( sDate.compareTo(midDate) > 0 && ( endId - midID ) > 1 ){
+					tempDate  = null;
+					midDate   = null;
+					sDate     = null;
+					day       = null;
+					month     = null;
+					startDay  = null;
+					monthday  = null;
+					query     = null;
+					leftSNO = this.getLeftSNO( date, midID, endId, tableName, dateField, trendType, repId, trendHaveSameLevalReport, idColumn,db_url,db_name,db_pass );
+				}else if( sDate.compareTo(midDate) < 0 && ( endId - midID ) > 1 ){
+					tempDate  = null;
+					midDate   = null;
+					sDate     = null;
+					day       = null;
+					month     = null;
+					startDay  = null;
+					monthday  = null;
+					query     = null;
+					leftSNO = this.getRightSNO( date, midID, endId, tableName, dateField, trendType, repId, trendHaveSameLevalReport, idColumn,db_url,db_name,db_pass );
+				}else{
+					leftSNO = startId;
+				}
+			}
+			else if( tempDate == null) {
+				pu.sop( "temp date is null ", "temp date "+tempDate+"" );
+				leftSNO = startId;
+				return leftSNO;
+			}
+		}catch( Exception ex ){
+			ex.printStackTrace();
+		}finally{
+			try{
+				if( conn != null ){
+					if( rs != null )
+						rs.close();
+					if( stmt != null )
+						stmt.close();
+					conn.close();
+				}
+			}catch( Exception ex ){}
+			tempDate  = null;
+			midDate   = null;
+			sDate     = null;
+			day       = null;
+			month     = null;
+			startDay  = null;
+			monthday  = null;
+			query     = null;
+		}
+		return leftSNO;
+	}
+	
+	public int getRightSNO(  String date, int startId, int endId, String tableName, String dateField, String trendType, String repId, boolean trendHaveSameLevalReport, String idColumn,String db_url,String db_name,String db_pass ){
+		int rightSNO = 0;
+		int midID   = 0;
+		int numOfAttr = 0;
+		String tempDate  = null;
+		Date midDate     = null;
+		Date sDate       = null;
+		String day       = null;
+		String month     = null;
+		String startDay  = null;
+		String monthday  = null;
+		String query     = null;
+		Connection conn  = null;
+		Statement stmt   = null;
+		ResultSet rs     = null;
+			try{
+				//pu.sop( "getRightSNO", "Going to calculate left ID.Start ID:["+startId+"] and End Id:["+endId+"]");
+				midID   = (startId+endId)/2;
+				if(date != null){
+				//	 day   = date.substring( date.lastIndexOf("-"), date.indexOf(" ") );
+					 //day   = date.substring( date.lastIndexOf("-"));//COMMENTED BY TANUJ ON 30-SEP-2018
+					 day   = date.substring( date.lastIndexOf("-") + 1 );//ADDED BY TANUJ ON 30-SEP-2018
+					 month = date.substring(5,date.lastIndexOf("-"));
+				}
+				if( date != null){
+				//	monthday = date.substring( 4, date.indexOf(" ") );
+					//monthday = date.substring( 4);//COMMENTED BY TANUJ ON 30-SEP-2018
+					monthday = date.substring( 5 );//ADDED BY TANUJ ON 30-SEP-2018
+				}
+				if(trendHaveSameLevalReport){
+					if( trendType.equalsIgnoreCase("weekly") ){
+						startDay = this.getDayName( date );
+						//pu.sop("dayname","Date of ["+date+"] and Day name is ["+startDay+"]");
+						if(dateField == null){
+							dateField = "week";
+						}
+						query = "select DATE_FORMAT(STR_TO_DATE(concat(substr("+dateField+",2,length("+dateField+")), ' ', '"+startDay+"'),'%V%X %W'),'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;				
+					}else if(trendType.equalsIgnoreCase( "monthly" )){				
+						if(dateField == null){
+							dateField = "month";
+						}
+						query = "select if(substring(str_to_date(month,'%M'),6,2) = '"+month+"', DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date(month,'%M %Y'),'%Y-%m'),'"+day+"'),'%Y-%m-%d %H:%i:%s'), DATE_ADD(DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date(month,'%M %Y'),'%Y-%m'),'"+day+"'),'%Y-%m-%d %H:%i:%s'),INTERVAL 1 MONTH)) temp from "+tableName+" where "+idColumn+"="+midID;
+					}else if(trendType.equalsIgnoreCase( "yearly" )){
+						if(dateField == null){
+							dateField = "year";
+						}
+						query = "select DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date("+dateField+",'%Y'),'%Y'),'"+monthday+"'),'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID; 
+					}else{
+					  //  query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+						query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d') temp from "+tableName+" where "+idColumn+"="+midID;
+					}
+				}else{
+					if(tableName.toLowerCase().contains("_weekly") && dateField.equalsIgnoreCase("week")){
+						query = "select DATE_FORMAT(STR_TO_DATE(concat(substr("+dateField+",2,length("+dateField+")), ' ', '"+startDay+"'),'%V%X %W'),'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+					}else if(tableName.toLowerCase().contains("_monthly") && dateField.equalsIgnoreCase("month")){
+						query = "select if(substring(str_to_date(month,'%M'),6,2) = '"+month+"', DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date(month,'%M %Y'),'%Y-%m'),'"+day+"'),'%Y-%m-%d %H:%i:%s'), DATE_ADD(DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date(month,'%M %Y'),'%Y-%m'),'"+day+"'),'%Y-%m-%d %H:%i:%s'),INTERVAL 1 MONTH)) temp from "+tableName+" where "+idColumn+"="+midID;
+					}else if(tableName.toLowerCase().contains("_yearly") && dateField.equalsIgnoreCase("year")){										
+						query = "select DATE_FORMAT(CONCAT(DATE_FORMAT(str_to_date("+dateField+",'%Y'),'%Y'),'"+monthday+"'),'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+					}
+					/*else{
+						query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+					}
+				}  */
+					else{
+						if (dateField.indexOf(" or ")!=-1 ) {
+							String [] dfieldTemp=dateField.split(" or ");
+							String dateFieldTemp = "";
+							numOfAttr = dfieldTemp.length;
+							for (int i=0; i < dfieldTemp.length; i++  ) {
+						//		dateFieldTemp = dateFieldTemp + " DATE_FORMAT("+dfieldTemp[i]+", '%Y-%m-%d %H:%i:%s') temp"+i+",";
+								dateFieldTemp = dateFieldTemp + " DATE_FORMAT("+dfieldTemp[i]+", '%Y-%m-%d') temp"+i+",";
+							}
+							if( dateFieldTemp.indexOf(",") != -1 ) {
+								dateFieldTemp = dateFieldTemp.substring(0, dateFieldTemp.length() - 1);
+							}
+							//query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+							query = "select "+dateFieldTemp+" from "+tableName+" where "+idColumn+"="+midID;
+						
+						}else {
+					//		pu.sop( "inside else block called", "query ");
+						//query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d %H:%i:%s') temp from "+tableName+" where "+idColumn+"="+midID;
+						query = "select DATE_FORMAT("+dateField+",'%Y-%m-%d') temp from "+tableName+" where "+idColumn+"="+midID;
+						}
+						//query = "select DATE_FORMAT(DATE(fb_ldate),'%Y-%m-%d %H:%i:%s') ftemp, DATE_FORMAT(DATE(twit_ldate),'%Y-%m-%d %H:%i:%s') ttemp,DATE_FORMAT(DATE(go_ldate),'%Y-%m-%d %H:%i:%s') gtemp from social_profile_update where "+idColumn+"="+midID;
+					}
+				}
+				
+				//pu.sop(TAG,"Query for getting mid id ["+midID+"] ["+query+"]");
+				conn  = msc.getConnection(db_url,db_name,db_pass);
+				//pu.sop( "SNO Test", "Connection created.");
+				stmt  = conn.createStatement();
+				rs    = stmt.executeQuery(query);
+			/*	while( rs.next() ){
+					tempDate = rs.getString("temp");				
+				}  */
+				
+				while( rs.next() ){
+					if( numOfAttr > 0 ) {
+						for( int i = 0; i < numOfAttr; i++ ) {
+							if ( rs.getString( "temp"+i ) != null && !rs.getString( "temp"+i ).equalsIgnoreCase("null") ) {
+								pu.sop("TempDate Check", "Date from DB is ["+rs.getString("temp"+i)+"]");
+								try {
+								tempDate = rs.getString("temp"+i).trim();
+								}catch(Exception ein) {
+									pu.sop("EXCEPTION", "Exception in getting date from DB ["+ein.getMessage()+"]");
+								}
+							}
+							if ( tempDate != null ) {
+								break;
+							}
+						}
+					}else {
+						tempDate = rs.getString("temp").trim();
+					}
+				}
+				try{
+					if( conn != null ){
+						if( rs != null )
+							rs.close();
+						if( stmt != null )
+							stmt.close();
+						conn.close();
+					}
+				}catch( Exception ex ){}
+				//if( date != null ){
+				if( ( date != null || date.equalsIgnoreCase("null") ) && ( tempDate != null || tempDate.equalsIgnoreCase("null") ) ){
+
+					sDate    = this.getFormatedDate(date);
+					midDate = this.getFormatedDate(tempDate);
+					if( sDate.compareTo(midDate) == 0 && ( endId - midID ) > 1 ){
+						tempDate  = null;
+						midDate   = null;
+						sDate     = null;
+						day       = null;
+						month     = null;
+						startDay  = null;
+						monthday  = null;
+						query     = null;
+						rightSNO = this.getRightSNO( date, midID, endId, tableName, dateField, trendType, repId, trendHaveSameLevalReport, idColumn,db_url,db_name,db_pass );
+					}else if( sDate.compareTo(midDate) < 0 && ( midID - startId ) > 1 ){
+						tempDate  = null;
+						midDate   = null;
+						sDate     = null;
+						day       = null;
+						month     = null;
+						startDay  = null;
+						monthday  = null;
+						query     = null;
+						rightSNO = this.getRightSNO( date, startId, midID, tableName, dateField, trendType, repId, trendHaveSameLevalReport, idColumn ,db_url,db_name,db_pass);
+					}else if( sDate.compareTo(midDate) > 0 && ( midID - startId ) > 1 ){
+						tempDate  = null;
+						midDate   = null;
+						sDate     = null;
+						day       = null;
+						month     = null;
+						startDay  = null;
+						monthday  = null;
+						query     = null;
+						rightSNO = this.getLeftSNO( date, startId, midID, tableName, dateField, trendType, repId, trendHaveSameLevalReport, idColumn,db_url,db_name,db_pass );
+					}else{
+						rightSNO = endId;
+					}
+				}
+				else if( tempDate == null) {
+					pu.sop( "temp date is null ", "temp date "+tempDate+"" );
+					rightSNO = endId;
+					return rightSNO;
+				}
+				}
+		catch( Exception ex ){
+			ex.printStackTrace();
+		}finally{
+			try{
+				if( conn != null ){
+					if( rs != null )
+						rs.close();
+					if( stmt != null )
+						stmt.close();
+					conn.close();
+				}
+			}catch( Exception ex ){}
+			tempDate  = null;
+			midDate   = null;
+			sDate     = null;
+			day       = null;
+			month     = null;
+			startDay  = null;
+			monthday  = null;
+			query     = null;
+		}
+		return rightSNO;
+	}
+	
+	public Date getFormatedDate( String date ){
+		Date result = null;
+		SimpleDateFormat sdf1 = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+		SimpleDateFormat sdf2 = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss");
+		SimpleDateFormat sdf3 = new SimpleDateFormat("yyyy-MM-dd HH");
+		SimpleDateFormat sdf4 = new SimpleDateFormat("yyyy-MM-dd");
+		SimpleDateFormat sdf5 = new SimpleDateFormat("yyyy/MM/dd");
+		try{
+			result = new Date();
+			if( date.matches("([0-9]{4})/([0-9]{2})/([0-9]{2})") ){
+			//	pu.sop( "Date Format of date", "Date is ["+date+"] and format is :[yyyy/MM/dd]");
+				result = sdf5.parse(date);
+			}else if( date.matches("([0-9]{4})-([0-9]{2})-([0-9]{2})") ){
+			//	pu.sop( "Date Format of date is", "Date is ["+date+"] and format is :[yyyy-MM-dd]");
+				result = sdf4.parse(date);
+			}else if( date.matches("([0-9]{4})-([0-9]{2})-([0-9]{2}) ([0-9]{2})") ){
+			//	pu.sop( "Date Format of date", "Date is ["+date+"] and format is :[yyyy-MM-dd HH]");
+				result = sdf3.parse(date);
+			}else if( date.matches("([0-9]{4})/([0-9]{2})/([0-9]{2}) ([0-9]{2}):([0-9]{2}):([0-9]{2})") ){
+			//	pu.sop( "Date Format of date", "Date is ["+date+"] and format is :[yyyy/MM/dd HH:mm:ss]");
+				result = sdf2.parse(date);
+			}else if( date.matches("([0-9]{4})-([0-9]{2})-([0-9]{2}) ([0-9]{2}):([0-9]{2}):([0-9]{2})") ){
+				result = sdf1.parse(date);
+				//result = sdf1.parse(date , new ParsePosition(0));
+			//	pu.sop( "Date Format of date", "Date is ["+date+"] and format is :[yyyy-MM-dd HH:mm:ss] and converted date:["+result+"]");
+			}
+		}catch( Exception ex ){
+			result = null;
+			pu.sop("getFormatedDate","No date format found :");
+			ex.printStackTrace();
+		}
+		return result;
+	}
+	
+	public String getDayName(String dateInString){
+        String dayname = null;		
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");            
+        try {
+			    Date date = sdf.parse(dateInString);
+			    Calendar calendar = Calendar.getInstance();
+	            calendar.setTime(date);
+		        int day = calendar.get(Calendar.DAY_OF_WEEK);			        
+		        switch (day) {
+		            case 1:
+		            	dayname = "Sunday";
+		                break;
+		            case 2:
+		            	dayname = "Monday";			                
+		                break;
+		            case 3:			                
+		                dayname = "Tuesday";
+		                break;
+		            case 4:			                
+		                dayname = "Wednesday";
+		                break;
+		            case 5:			                
+		                dayname = "Thursday";
+		                break;
+		            case 6:			                
+		                dayname = "Friday";
+		                break;
+		            case 7:			                
+		                dayname = "Saturday";
+		        }
+		}catch(ParseException e){
+			e.printStackTrace();
+		}
+       	return dayname;
+	}
+}

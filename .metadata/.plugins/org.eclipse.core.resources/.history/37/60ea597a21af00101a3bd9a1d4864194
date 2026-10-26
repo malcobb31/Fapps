@@ -1,0 +1,196 @@
+package rest_api_volQuota;
+
+import DBConnection;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class rest_api_methods {
+
+    // Base URL (note: your main used "https://poc.itsimple.in/restapi/schema/swagger/" in earlier messages,
+    // but actual endpoints used in code below are /restapi/auth/token and /restapi/datamanagement/repositories.
+    // Keep base as the API root used here.)
+    private static final String AUTH_ENDPOINT = "https://poc.itsimple.in/restapi/auth/token/";
+    private static final String REPO_ENDPOINT = "https://poc.itsimple.in/restapi/datamanagement/repositories/";
+
+    // Hardcoded credentials (as requested)
+    private static final String AUTH_NAME = "root";
+    private static final String AUTH_PASSWORD = "ATempo@123";
+
+    /**
+     * Public entry point called from rest_api_mainV2
+     */
+    public void run(String enterpriseName, String username, String password, String confirmPassword,
+                    String accessKey, String secretKey, String bucketName, String userQuota) throws Exception {
+
+        System.out.println("===== Starting API Flow for Enterprise: " + enterpriseName + " =====");
+
+        String token = authenticate();
+        if (token == null) {
+            System.out.println("[ERROR] Authentication failed. Exiting.");
+            return;
+        }
+
+        Map<String, String> repo = fetchRepositoryDetails(token);
+        if (repo == null || repo.isEmpty()) {
+            System.out.println("[ERROR] Failed to fetch repository details. Exiting.");
+            return;
+        }
+
+        // Insert into DB using DBConnection (this class will create table if not exists)
+        DBConnection db = new DBConnection();
+        db.insertEnterpriseDetails(
+            toIntOrNull(repo.get("id")),
+            repo.get("name"),
+            "", // s3_path empty as requested
+            repo.get("volumeQuota"),
+            ""  // disk_path empty as requested
+        );
+
+        System.out.println("===== API Flow Completed for: " + enterpriseName + " =====");
+    }
+
+    /**
+     * Authenticate and return access token (the "access" field)
+     */
+    private String authenticate() {
+        try {
+            System.out.println("[INFO] Authenticating with " + AUTH_ENDPOINT);
+
+            URL url = new URL(AUTH_ENDPOINT);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setDoOutput(true);
+
+            String body = "{\"name\":\"" + AUTH_NAME + "\",\"password\":\"" + AUTH_PASSWORD + "\"}";
+
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(body.getBytes());
+                os.flush();
+            }
+
+            int code = conn.getResponseCode();
+            if (code != 200 && code != 201 && code != 202) {
+                System.out.println("[ERROR] Auth responded with HTTP code: " + code);
+                readAndPrintStream(conn); // debug
+                return null;
+            }
+
+            String resp = readStream(conn);
+            // extract "access" value
+            String access = extractFirstMatch(resp, "\"access\"\\s*:\\s*\"([^\"]+)\"");
+            if (access == null) {
+                System.out.println("[ERROR] Access token not found in auth response.");
+                System.out.println("[DEBUG] Auth response: " + resp);
+                return null;
+            }
+
+            System.out.println("[INFO] Access token successfully retrieved (len=" + access.length() + ")");
+            return access;
+
+        } catch (Exception e) {
+            System.out.println("[EXCEPTION] authenticate(): " + e.getMessage());
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+    /**
+     * Calls /datamanagement/repositories/ with Bearer token and extracts id, name, volumeQuota.
+     * Works whether API returns an array or a single object (it extracts the first matching set).
+     */
+    private Map<String, String> fetchRepositoryDetails(String bearerToken) {
+        try {
+            System.out.println("[INFO] Fetching repositories from: " + REPO_ENDPOINT);
+
+            URL url = new URL(REPO_ENDPOINT);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("Authorization", "Bearer " + bearerToken);
+            conn.setRequestProperty("Accept", "application/json");
+
+            int code = conn.getResponseCode();
+            if (code != 200) {
+                System.out.println("[ERROR] Repositories API returned HTTP code: " + code);
+                readAndPrintStream(conn); // debug
+                return null;
+            }
+
+            String resp = readStream(conn);
+
+            // Extract first occurrence of id, name and volumeQuota
+            String id = extractFirstMatch(resp, "\"id\"\\s*:\\s*(\\d+)");
+            String name = extractFirstMatch(resp, "\"name\"\\s*:\\s*\"([^\"]+)\"");
+            String volumeQuota = extractFirstMatch(resp, "\"volumeQuota\"\\s*:\\s*\"?(\\d+)\"?");
+
+            if (id == null || name == null || volumeQuota == null) {
+                System.out.println("[ERROR] Required fields not found in repositories response.");
+                System.out.println("[DEBUG] Repositories response: " + resp);
+                return null;
+            }
+
+            Map<String, String> map = new HashMap<>();
+            map.put("id", id);
+            map.put("name", name);
+            map.put("volumeQuota", volumeQuota);
+
+            System.out.println("[INFO] Repository details extracted: id=" + id + ", name=" + name + ", volumeQuota=" + volumeQuota);
+            return map;
+
+        } catch (Exception e) {
+            System.out.println("[EXCEPTION] fetchRepositoryDetails(): " + e.getMessage());
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+    // ----------------- Helper utilities -----------------
+
+    private String readStream(HttpURLConnection conn) {
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line).append("\n");
+            return sb.toString();
+        } catch (Exception e) {
+            // try reading error stream
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getErrorStream()))) {
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while (br != null && (line = br.readLine()) != null) sb.append(line).append("\n");
+                return sb.toString();
+            } catch (Exception ex) {
+                return "";
+            }
+        }
+    }
+
+    private void readAndPrintStream(HttpURLConnection conn) {
+        String s = readStream(conn);
+        System.out.println("[STREAM] " + s);
+    }
+
+    /**
+     * Extracts first capturing group using regex. DOTALL enabled.
+     */
+    private String extractFirstMatch(String text, String regex) {
+        if (text == null) return null;
+        Pattern p = Pattern.compile(regex, Pattern.DOTALL);
+        Matcher m = p.matcher(text);
+        if (m.find()) return m.group(1);
+        return null;
+    }
+
+    private String toIntOrNull(String s) {
+        if (s == null) return null;
+        return s;
+    }
+}

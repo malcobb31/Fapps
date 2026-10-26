@@ -1,0 +1,530 @@
+package rest_api_job;
+
+import java.io.*;
+import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
+import javax.net.ssl.*;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.sql.Timestamp;
+
+public class rest_api_methods {
+
+    // Base URLs
+    private static final String BASE = "https://poc.itsimple.in/restapi";
+    private static final String AUTH_URL = BASE + "/auth/token/";
+    private static final String REPO_URL = BASE + "/datamanagement/repositories/";
+    private static final String CREATE_REPO_URL = BASE + "/datamanagement/repositories/";
+    private static final String CREATE_ARCHIVE_PROJECT_URL = BASE + "/organizations/archiving-projects/";
+    private static final String BUCKETS_URL_TEMPLATE = BASE + "/infrastructure/object-storages/%d/buckets/";
+    private static final int OBJECT_STORAGE_PK = 4;
+
+    // Hardcoded auth 
+    private static final String AUTH_BODY = "{\"dbName\": \"ADA\", \"name\": \"root\", \"password\": \"ATempo@123\", \"superUser\": true}";
+
+    // DB config - change these to your DB values
+    private static final String DB_URL = "jdbc:mysql://localhost:3306/pview";
+    private static final String DB_USER = "root";
+    private static final String DB_PASS = "padmin@321";
+
+    // default 10GB in bytes
+    private static final long TEN_GB_BYTES = 10L * 1024L * 1024L * 1024L;
+
+    // Public entry
+    public void run(String enterpriseName,
+                    String username,
+                    String password,
+                    String confirmPassword,
+                    String accessKey,
+                    String secretKey,
+                    String bucketName,
+                    String userQuota) throws Exception {
+
+        System.out.println("[INFO] Starting run for enterprise: " + enterpriseName);
+
+        disableSSLCertification();
+
+        // 1) Authenticate
+        String token = authenticateAndGetToken(BASE, "ADA", "root", "ATempo@123");
+        if (token == null) {
+            System.out.println("[ERROR] Authentication failed - aborting.");
+            return;
+        }
+
+        // 2) GET repositories and check
+        JSONObject foundRepo = findRepositoryByName(token, enterpriseName);
+        if (foundRepo != null) {
+            // repo exists -> upsert to DB
+            System.out.println("[INFO] Repository exists. Upserting into DB.");
+            upsertRepositoryToDB(foundRepo);
+        } else {
+            // not found -> create repo
+            System.out.println("[INFO] Repository not found. Creating repository.");
+            JSONObject createdRepo = createRepository(token, enterpriseName, username, TEN_GB_BYTES);
+            if (createdRepo != null) {
+                upsertRepositoryToDB(createdRepo);
+            } else {
+                System.out.println("[ERROR] Repository creation failed.");
+                // still proceed to next steps? We'll stop here to avoid inconsistent state
+                return;
+            }
+        }
+
+        // 3) Create Archiving Project
+        System.out.println("[INFO] Creating archiving project for enterprise.");
+        JSONObject projectResp = createArchivingProject(token, enterpriseName);
+        if (projectResp != null) {
+            upsertArchivingProjectToDB(projectResp);
+        } else {
+            System.out.println("[ERROR] Archiving project creation failed.");
+        }
+
+        // 4) Buckets - check existing buckets for objectStoragePk = 4
+        System.out.println("[INFO] Checking object storage buckets (pk=4).");
+        JSONObject matchedBucket = findBucketByNamingConvention(token, enterpriseName, username, bucketName);
+        if (matchedBucket != null) {
+            System.out.println("[INFO] Matching bucket found. Upserting to DB.");
+            upsertBucketToDB(matchedBucket);
+        } else {
+            System.out.println("[INFO] No matching bucket found. Creating bucket.");
+            JSONObject createdBucket = createBucket(token, bucketName, enterpriseName, username, accessKey, secretKey);
+            if (createdBucket != null) {
+                upsertBucketToDB(createdBucket);
+            } else {
+                System.out.println("[ERROR] Bucket creation failed.");
+            }
+        }
+
+        System.out.println("[INFO] Run complete for enterprise: " + enterpriseName);
+    }
+
+    // ----------------- Authentication -----------------
+    private static String authenticateAndGetToken(String baseUrl, String dbName, String username, String password) throws Exception {
+        String authUrl = baseUrl + "/auth/token/";
+        System.out.println("[INFO] Authenticating via: " + authUrl);
+
+        URL url = new URL(authUrl);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("POST");
+        conn.setDoOutput(true);
+
+        // Set proper JSON headers
+        conn.setRequestProperty("Content-Type", "application/json");
+        conn.setRequestProperty("Accept", "application/json");
+
+        // Build JSON body
+        JSONObject body = new JSONObject();
+        body.put("dbName", dbName);
+        body.put("name", username);
+        body.put("password", password);
+        body.put("superUser", true);
+
+        // Send JSON body
+        try (OutputStream os = conn.getOutputStream()) {
+            os.write(body.toString().getBytes(StandardCharsets.UTF_8));
+        }
+
+        int responseCode = conn.getResponseCode();
+        System.out.println("[INFO] Auth Response Code: " + responseCode);
+
+        InputStream is = (responseCode >= 200 && responseCode < 300) 
+                         ? conn.getInputStream() 
+                         : conn.getErrorStream();
+
+        String responseText = readStream(is);
+        System.out.println("[DEBUG] Auth Response: " + responseText);
+
+        if (!responseText.trim().startsWith("{")) {
+            System.err.println("[ERROR] Non-JSON auth response: " + responseText);
+            throw new Exception("Server did not return JSON");
+        }
+
+        JSONObject jsonResponse = new JSONObject(responseText);
+        if (jsonResponse.has("access")) {
+            return jsonResponse.getString("access");
+        } else {
+            System.err.println("[ERROR] Auth failed: " + responseText);
+            return null; // or throw Exception
+        }
+
+    }
+
+    // ----------------- Repositories -----------------
+    // returns the repo JSONObject (first match) or null
+    private JSONObject findRepositoryByName(String token, String enterpriseName) {
+        try {
+            System.out.println("[INFO] Fetching repositories from: " + REPO_URL);
+            URL url = new URL(REPO_URL);
+            HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+            conn.setRequestProperty("Accept", "application/json");
+
+            int code = conn.getResponseCode();
+            System.out.println("[INFO] Repositories GET Response Code: " + code);
+            InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+            String resp = readStream(is);
+            System.out.println("[DEBUG] Repositories Response:\n" + prettyJson(resp));
+
+            Object parsed = parseJsonResponse(resp);
+            JSONArray arr = null;
+
+            if (parsed instanceof JSONArray) {
+                arr = (JSONArray) parsed;  // old format
+            } else if (parsed instanceof JSONObject) {
+                JSONObject obj = (JSONObject) parsed;
+                if (obj.has("results")) {
+                    arr = obj.getJSONArray("results"); // new paginated format
+                } else {
+                    System.err.println("[ERROR] JSON object has no 'results' array:\n" + obj.toString(4));
+                    return null;
+                }
+            } else {
+                System.err.println("[ERROR] Unexpected response (not JSON): " + resp);
+                return null;
+            }
+
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject repo = arr.getJSONObject(i);
+                if (repo.optString("name", "").equalsIgnoreCase(enterpriseName)) {
+                    JSONObject out = new JSONObject();
+                    out.put("id", repo.optInt("id", -1));
+                    out.put("name", repo.optString("name", ""));
+                    Object vq = repo.opt("volumeQuota");
+                    out.put("volumeQuota", vq != null ? vq : JSONObject.NULL);
+                    out.put("creationDate", repo.optString("creationDate", repo.optString("creation_date", "")));
+                    return out;
+                }
+            }
+
+        } catch (Exception e) {
+            System.out.println("[ERROR] Exception in findRepositoryByName: " + e.getMessage());
+            e.printStackTrace();
+        }
+
+        return null;
+    }
+
+    private JSONObject createRepository(String token, String enterpriseName, String owner, long volumeQuotaBytes) {
+        try {
+            System.out.println("[INFO] Creating repository at: " + CREATE_REPO_URL);
+            URL url = new URL(CREATE_REPO_URL);
+            HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setDoOutput(true);
+
+            JSONObject body = new JSONObject();
+            body.put("name", enterpriseName);
+            body.put("comment", enterpriseName);
+            body.put("mode", "archiving");
+            body.put("owner", owner);
+            body.put("volumeQuota", volumeQuotaBytes);
+            body.put("organization", "_Archiving");
+
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(body.toString().getBytes(StandardCharsets.UTF_8));
+            }
+
+            int code = conn.getResponseCode();
+            System.out.println("[INFO] Create Repo Response Code: " + code);
+            InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+            String resp = readStream(is);
+            System.out.println("[DEBUG] Create Repo Response:\n" + prettyJson(resp));
+
+            if (code == 200 || code == 201 || code == 202) {
+                JSONObject json = new JSONObject(resp);
+                // normalise fields we need
+                JSONObject out = new JSONObject();
+                out.put("id", json.optInt("id", -1));
+                out.put("name", json.optString("name", enterpriseName));
+                out.put("volumeQuota", json.opt("volumeQuota"));
+                out.put("creationDate", json.optString("creationDate", ""));
+                return out;
+            } else {
+                System.out.println("[ERROR] Repository creation failed: " + resp);
+            }
+
+        } catch (Exception e) {
+            System.out.println("[ERROR] Exception in createRepository: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    // ----------------- Archiving Project -----------------
+    private JSONObject createArchivingProject(String token, String enterpriseName) {
+        try {
+            System.out.println("[INFO] Creating archiving project at: " + CREATE_ARCHIVE_PROJECT_URL);
+            URL url = new URL(CREATE_ARCHIVE_PROJECT_URL);
+            HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setDoOutput(true);
+
+            String projectName = enterpriseName + "-Project";
+            JSONObject body = new JSONObject();
+            body.put("name", projectName);
+            body.put("comment", projectName);
+
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(body.toString().getBytes(StandardCharsets.UTF_8));
+            }
+
+            int code = conn.getResponseCode();
+            System.out.println("[INFO] Create Project Response Code: " + code);
+            InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+            String resp = readStream(is);
+            System.out.println("[DEBUG] Create Project Response:\n" + prettyJson(resp));
+
+            if (code == 200 || code == 201 || code == 202) {
+                JSONObject json = new JSONObject(resp);
+                JSONObject out = new JSONObject();
+                out.put("id", json.optInt("id", -1));
+                out.put("name", json.optString("name", projectName));
+                out.put("creationDate", json.optString("creationDate", ""));
+                return out;
+            } else {
+                System.out.println("[ERROR] Project creation failed: " + resp);
+            }
+        } catch (Exception e) {
+            System.out.println("[ERROR] Exception in createArchivingProject: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    // ----------------- Buckets -----------------
+    // Attempt to find a bucket whose displayName matches the naming convention
+    private JSONObject findBucketByNamingConvention(String token, String enterpriseName, String userName, String bucketName) {
+        try {
+            String urlStr = String.format(BUCKETS_URL_TEMPLATE, OBJECT_STORAGE_PK);
+            System.out.println("[INFO] Fetching buckets from: " + urlStr);
+            URL url = new URL(urlStr);
+            HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+            conn.setRequestProperty("Accept", "application/json");
+
+            int code = conn.getResponseCode();
+            System.out.println("[INFO] Buckets GET Response Code: " + code);
+            InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+            String resp = readStream(is);
+            System.out.println("[DEBUG] Buckets Response:\n" + prettyJson(resp));
+
+            Object parsed = parseJsonResponse(resp);
+            JSONArray arr = null;
+
+            if (parsed instanceof JSONArray) {
+                arr = (JSONArray) parsed; // old format
+            } else if (parsed instanceof JSONObject) {
+                JSONObject obj = (JSONObject) parsed;
+                if (obj.has("results")) {
+                    arr = obj.getJSONArray("results"); // paginated response
+                } else {
+                    System.err.println("[ERROR] JSON object has no 'results' array:\n" + obj.toString(4));
+                    return null;
+                }
+            } else {
+                System.err.println("[ERROR] Unexpected response (not JSON): " + resp);
+                return null;
+            }
+
+            String expectedDisplay = enterpriseName + "-" + userName + "-" + bucketName + "-SMC";
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject b = arr.getJSONObject(i);
+                String displayName = b.optString("displayName", "");
+                if (displayName.equalsIgnoreCase(expectedDisplay)) {
+                    JSONObject out = new JSONObject();
+                    out.put("id", b.optInt("id", -1));
+                    out.put("name", b.optString("name", ""));
+                    out.put("displayName", displayName);
+                    out.put("creationDate", b.optString("creationDate", ""));
+                    return out;
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("[ERROR] Exception in findBucketByNamingConvention: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+
+
+    private JSONObject createBucket(String token, String bucketName, String enterpriseName, String userName, String accessKey, String secretKey) {
+        try {
+            String urlStr = String.format(BUCKETS_URL_TEMPLATE, OBJECT_STORAGE_PK);
+            System.out.println("[INFO] Creating bucket at: " + urlStr);
+            URL url = new URL(urlStr);
+            HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setDoOutput(true);
+
+            String displayName = enterpriseName + "-" + userName + "-" + bucketName + "-SMC";
+            JSONObject body = new JSONObject();
+            body.put("name", bucketName);
+            body.put("nbThreads", 2);
+            body.put("sendMetadata", true);
+            body.put("displayName", displayName);
+            body.put("accessKey", accessKey);
+            body.put("secretKey", secretKey);
+            JSONObject useAsSource = new JSONObject();
+            useAsSource.put("enabled", true);
+            useAsSource.put("alias", "");
+            body.put("useAsSource", useAsSource);
+
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(body.toString().getBytes(StandardCharsets.UTF_8));
+            }
+
+            int code = conn.getResponseCode();
+            System.out.println("[INFO] Create Bucket Response Code: " + code);
+            InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+            String resp = readStream(is);
+            System.out.println("[DEBUG] Create Bucket Response:\n" + prettyJson(resp));
+
+            if (code == 200 || code == 201 || code == 202) {
+                JSONObject json = new JSONObject(resp);
+                JSONObject out = new JSONObject();
+                out.put("id", json.optInt("id", -1));
+                out.put("name", json.optString("name", bucketName));
+                out.put("creationDate", json.optString("creationDate", ""));
+                return out;
+            } else {
+                System.out.println("[ERROR] Bucket creation failed: " + resp);
+            }
+        } catch (Exception e) {
+            System.out.println("[ERROR] Exception in createBucket: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    // ----------------- DB Upserts -----------------
+    private void upsertRepositoryToDB(JSONObject repo) {
+        try {
+            System.out.println("[INFO] Upserting repository into DB: " + repo.toString());
+            rest_api_DBConnection db = new rest_api_DBConnection(DB_URL, DB_USER, DB_PASS);
+            int id = repo.optInt("id", -1);
+            String name = repo.optString("name", "");
+            Object vq = repo.opt("volumeQuota");
+            long volumeQuota = 0L;
+            if (vq == JSONObject.NULL || vq == null) {
+                volumeQuota = 0L;
+            } else if (vq instanceof Number) {
+                volumeQuota = ((Number) vq).longValue();
+            } else {
+                try {
+                    volumeQuota = Long.parseLong(String.valueOf(vq));
+                } catch (Exception ex) {
+                    volumeQuota = 0L;
+                }
+            }
+            String creationDate = repo.optString("creationDate", "");
+            db.insertEnterprise(id, name, volumeQuota, creationDate);
+            db.close();
+            System.out.println("[INFO] Repository upsert completed.");
+        } catch (Exception e) {
+            System.out.println("[ERROR] Exception in upsertRepositoryToDB: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private void upsertArchivingProjectToDB(JSONObject project) {
+        try {
+            System.out.println("[INFO] Upserting archiving project into DB: " + project.toString());
+            rest_api_DBConnection db = new rest_api_DBConnection(DB_URL, DB_USER, DB_PASS);
+            int id = project.optInt("id", -1);
+            String name = project.optString("name", "");
+            String creationDate = project.optString("creationDate", "");
+            db.insertOrUpdateProject(id, name, creationDate);
+            db.close();
+            System.out.println("[INFO] Archiving project upsert completed.");
+        } catch (Exception e) {
+            System.out.println("[ERROR] Exception in upsertArchivingProjectToDB: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private void upsertBucketToDB(JSONObject bucket) {
+        try {
+            System.out.println("[INFO] Upserting bucket into DB: " + bucket.toString());
+            rest_api_DBConnection db = new rest_api_DBConnection(DB_URL, DB_USER, DB_PASS);
+            int id = bucket.optInt("id", -1);
+            String name = bucket.optString("name", "");
+            String creationDate = bucket.optString("creationDate", "");
+            db.insertOrUpdateBucket(id, name, creationDate);
+            db.close();
+            System.out.println("[INFO] Bucket upsert completed.");
+        } catch (Exception e) {
+            System.out.println("[ERROR] Exception in upsertBucketToDB: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    // ----------------- Utilities -----------------
+    private static String readStream(InputStream is) throws IOException {
+        if (is == null) return "";
+        BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
+        StringBuilder sb = new StringBuilder();
+        String line;
+        while ((line = br.readLine()) != null) sb.append(line);
+        br.close();
+        return sb.toString();
+    }
+
+    private static String prettyJson(String json) {
+        try {
+            String trimmed = json.trim();
+            if (trimmed.startsWith("[")) {
+                JSONArray arr = new JSONArray(trimmed);
+                return arr.toString(4);
+            } else {
+                JSONObject obj = new JSONObject(trimmed);
+                return obj.toString(4);
+            }
+        } catch (Exception e) {
+            return json;
+        }
+    }
+    
+    private static Object parseJsonResponse(String resp) {
+        resp = resp.trim();
+        if (resp.startsWith("[")) return new JSONArray(resp);
+        if (resp.startsWith("{")) return new JSONObject(resp);
+        return null;
+    }
+
+
+    // Keep same disable SSL method as your provided code
+    private static void disableSSLCertification() {
+        TrustManager[] trustAllCerts = new TrustManager[] { new X509TrustManager() {
+            public X509Certificate[] getAcceptedIssuers() { return null; }
+            public void checkClientTrusted(X509Certificate[] chain, String authType) {}
+            public void checkServerTrusted(X509Certificate[] chain, String authType) {}
+        } };
+
+        try {
+            SSLContext sc = SSLContext.getInstance("TLS");
+            sc.init(null, trustAllCerts, new SecureRandom());
+            HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
+        } catch (Exception e) {
+            // ignore
+        }
+
+        HostnameVerifier allHostsValid = new HostnameVerifier() {
+            public boolean verify(String hostname, SSLSession session) { return true; }
+        };
+
+        HttpsURLConnection.setDefaultHostnameVerifier(allHostsValid);
+    }
+}

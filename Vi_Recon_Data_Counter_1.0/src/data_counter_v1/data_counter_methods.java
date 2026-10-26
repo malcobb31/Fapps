@@ -1,0 +1,487 @@
+package data_counter_v1;
+
+import java.sql.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+
+public class data_counter_methods {
+
+    private Connection conn;
+    private String tableName;
+    private String date;
+
+    private String dbUrl, dbUser, dbPass;
+
+    // Source table/column identifiers (per supplied SNO mapping).
+    // Explicitly schema-qualified with "vi_sdk." because the JDBC connection's
+    // default database is confirmed to be "pview".
+    private static final String AMR_TABLE = "vi_sdk.agent_modification_requests";
+    private static final String AMR_ID_COL = "id";
+
+    private static final String MSG_TABLE = "vi_sdk.msg_history_all";
+    private static final String MSG_ID_COL = "id";
+
+    private static final String USER_TABLE = "vi_sdk.user_details";
+    private static final String USER_SNO_COL = "sno";
+
+    private static final String DEVICE_TABLE = "vi_sdk.device_details_default";
+
+    private static final String VOLTE_TABLE = "pview.Vi_volte_call_details";
+    private static final String VOLTE_SNO_COL = "sno";
+
+    // SNO ranges
+    private int[] amrRange;
+    private int[] msgRange;
+    private int[] userRange;
+    private int[] volteRange;
+
+    private boolean debugEnabled = true;
+    private String processName = "DAILY_SUMMARY";
+    private String processVersion = "1.0";
+
+    private DateTimeFormatter logFormat =
+            DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss SSS");
+
+    public data_counter_methods(Connection conn, String tableName, String date,
+                                  String dbUrl, String dbUser, String dbPass) {
+        this.conn = conn;
+        this.tableName = tableName;
+        this.date = date;
+        this.dbUrl = dbUrl;
+        this.dbUser = dbUser;
+        this.dbPass = dbPass;
+    }
+
+    public void process() throws Exception {
+
+        log("DEBUG", "START processing date: " + date, "", "START");
+
+        SNORangeFinder finder = new SNORangeFinder();
+
+        // ============================================================
+        // 1. agent_modification_requests
+        // Used by Metrics 1, 9, 10, 11, 12
+        // ============================================================
+
+        int[] amrMinMax = finder.getStartEndIdOfTable(
+                AMR_TABLE,
+                AMR_ID_COL,
+                dbUrl,
+                dbUser,
+                dbPass
+        );
+
+        if (amrMinMax == null) {
+            throw new Exception("SNO RANGE FETCH FAILED for " + AMR_TABLE);
+        }
+
+        amrRange = finder.getStartAndEndId(
+                date,
+                amrMinMax[0],
+                amrMinMax[1],
+                AMR_TABLE,
+                "upload_time",
+                "daily",
+                "120",
+                false,
+                AMR_ID_COL,
+                dbUrl,
+                dbUser,
+                dbPass,
+                "%Y-%m-%d"
+        );
+
+        // ============================================================
+        // 2. msg_history_all
+        // Used by Metrics 2 and 3
+        // ============================================================
+
+        int[] msgMinMax = finder.getStartEndIdOfTable(
+                MSG_TABLE,
+                MSG_ID_COL,
+                dbUrl,
+                dbUser,
+                dbPass
+        );
+
+        if (msgMinMax == null) {
+            throw new Exception("SNO RANGE FETCH FAILED for " + MSG_TABLE);
+        }
+
+        msgRange = finder.getStartAndEndId(
+                date,
+                msgMinMax[0],
+                msgMinMax[1],
+                MSG_TABLE,
+                "time",
+                "daily",
+                "120",
+                false,
+                MSG_ID_COL,
+                dbUrl,
+                dbUser,
+                dbPass,
+                "%Y-%m-%d"
+        );
+
+        // ============================================================
+        // 3. user_details
+        // Used by Metric 8
+        // ============================================================
+
+        int[] userMinMax = finder.getStartEndIdOfTable(
+                USER_TABLE,
+                USER_SNO_COL,
+                dbUrl,
+                dbUser,
+                dbPass
+        );
+
+        if (userMinMax == null) {
+            throw new Exception("SNO RANGE FETCH FAILED for " + USER_TABLE);
+        }
+
+        userRange = finder.getStartAndEndId(
+                date,
+                userMinMax[0],
+                userMinMax[1],
+                USER_TABLE,
+                "user_reg_date",
+                "daily",
+                "120",
+                false,
+                USER_SNO_COL,
+                dbUrl,
+                dbUser,
+                dbPass,
+                "%Y-%m-%d"
+        );
+
+        // ============================================================
+        // 4. pview.Vi_volte_call_details
+        // Used by Metric 7
+        // ============================================================
+
+        int[] volteMinMax = finder.getStartEndIdOfTable(
+                VOLTE_TABLE,
+                VOLTE_SNO_COL,
+                dbUrl,
+                dbUser,
+                dbPass
+        );
+
+        if (volteMinMax == null) {
+            throw new Exception("SNO RANGE FETCH FAILED for " + VOLTE_TABLE);
+        }
+
+        volteRange = finder.getStartAndEndId(
+                date,
+                volteMinMax[0],
+                volteMinMax[1],
+                VOLTE_TABLE,
+                "sourceTimeStamp",
+                "daily",
+                "120",
+                false,
+                VOLTE_SNO_COL,
+                dbUrl,
+                dbUser,
+                dbPass,
+                "%Y-%m-%d"
+        );
+
+        // ============================================================
+        // RANGE LOG
+        // ============================================================
+
+        log("DEBUG",
+                "Ranges AMR:" + amrRange[0] + "-" + amrRange[1] +
+                " MSG:" + msgRange[0] + "-" + msgRange[1] +
+                " USER:" + userRange[0] + "-" + userRange[1] +
+                " VOLTE:" + volteRange[0] + "-" + volteRange[1],
+                "",
+                "SNO");
+
+        // ============================================================
+        // METRIC QUERIES
+        // ============================================================
+
+        // ------------------------------------------------------------
+        // Metric 1 — Total tests conducted per day
+        // Binary Search: YES
+        // ------------------------------------------------------------
+
+        long totalTestsConducted = getCountLong(
+                "select count(distinct scan_id) from " + AMR_TABLE +
+                " where " + AMR_ID_COL + " between " +
+                amrRange[0] + " and " + amrRange[1] +
+                " and date(upload_time) = '" + date + "'"
+        );
+
+        // ------------------------------------------------------------
+        // Metric 2 — Total message inserted in evt table per day
+        // Binary Search: YES
+        // ------------------------------------------------------------
+
+        long totalMsgInserted = getCountLong(
+                "select count(*) from " + MSG_TABLE +
+                " where " + MSG_ID_COL + " between " +
+                msgRange[0] + " and " + msgRange[1] +
+                " and date(time) = '" + date + "'"
+        );
+
+        // ------------------------------------------------------------
+        // Metric 3 — Total EVTs inserted in evt table
+        // Binary Search: YES
+        // Original condition date(time) >= date preserved
+        // ------------------------------------------------------------
+
+        long totalEvtInserted = getCountLong(
+                "select count(*) from " + MSG_TABLE +
+                " where " + MSG_ID_COL + " between " + msgRange[0] + " and " + msgRange[1] +
+                " and msg='evt'" +
+                " and date(time) = '" + date + "'"
+        );
+
+        // ------------------------------------------------------------
+        // Metric 4 — Total registered users
+        // Binary Search: NO
+        // ------------------------------------------------------------
+
+        long totalRegisteredUsers = getCountLong(
+                "select count(*) from " + USER_TABLE
+        );
+
+        // ------------------------------------------------------------
+        // Metric 5 — Total active users
+        // Binary Search: NO
+        // ------------------------------------------------------------
+
+        long totalActiveUsers = getCountLong(
+                "select count(*) from " + USER_TABLE +
+                " where msg_history_minute_status='Active'"
+        );
+
+        // ------------------------------------------------------------
+        // Metric 6 — Total active Agents
+        // Binary Search: NO
+        // ------------------------------------------------------------
+
+        long totalActiveAgents = getCountLong(
+                "select count(*) from " + DEVICE_TABLE +
+                " where status_config='Active'"
+        );
+
+        // ------------------------------------------------------------
+        // Metric 7 — Total VoLTE call reports processed per day
+        // Binary Search: YES
+        // ------------------------------------------------------------
+
+        long totalVolteReports = getCountLong(
+                "select count(*) from " + VOLTE_TABLE +
+                " where " + VOLTE_SNO_COL + " between " +
+                volteRange[0] + " and " + volteRange[1] +
+                " and date(sourceTimeStamp) = '" + date + "'"
+        );
+
+        // ------------------------------------------------------------
+        // Metric 8 — New Registered Users of the day
+        // Binary Search: YES
+        // ------------------------------------------------------------
+
+        long newRegisteredUsers = getCountLong(
+                "select count(*) from " + USER_TABLE +
+                " where " + USER_SNO_COL + " between " +
+                userRange[0] + " and " + userRange[1] +
+                " and date(user_reg_date) = '" + date + "'"
+        );
+
+        // ------------------------------------------------------------
+        // Metric 9 — Total tests conducted per day by App
+        // Binary Search: YES
+        // ------------------------------------------------------------
+
+        long totalTestsByApp = getCountLong(
+                "select count(distinct scan_id) from " + AMR_TABLE +
+                " where " + AMR_ID_COL + " between " +
+                amrRange[0] + " and " + amrRange[1] +
+                " and date(upload_time) = '" + date + "'" +
+                " and schedule_type='app'"
+        );
+
+        // ------------------------------------------------------------
+        // Metric 10 — Total tests conducted per day by UI
+        // Binary Search: YES
+        // ------------------------------------------------------------
+
+        long totalTestsByUi = getCountLong(
+                "select count(distinct scan_id) from " + AMR_TABLE +
+                " where " + AMR_ID_COL + " between " +
+                amrRange[0] + " and " + amrRange[1] +
+                " and date(upload_time) = '" + date + "'" +
+                " and schedule_type='ui'"
+        );
+
+        // ------------------------------------------------------------
+        // Metric 11 — Total tests conducted per day by Scheduler
+        // Binary Search: YES
+        // ------------------------------------------------------------
+
+        long totalTestsByScheduler = getCountLong(
+                "select count(distinct scan_id) from " + AMR_TABLE +
+                " where " + AMR_ID_COL + " between " +
+                amrRange[0] + " and " + amrRange[1] +
+                " and date(upload_time) = '" + date + "'" +
+                " and schedule_type='schedule_process'"
+        );
+
+        // ------------------------------------------------------------
+        // Metric 12 — Total tests conducted per day by API
+        // Binary Search: YES
+        // ------------------------------------------------------------
+
+        long totalTestsByApi = getCountLong(
+                "select count(distinct scan_id) from " + AMR_TABLE +
+                " where " + AMR_ID_COL + " between " +
+                amrRange[0] + " and " + amrRange[1] +
+                " and date(upload_time) = '" + date + "'" +
+                " and schedule_type='api'"
+        );
+
+        // ============================================================
+        // SUMMARY
+        // ============================================================
+
+        log("DEBUG",
+                "Summary TotalTests:" + totalTestsConducted +
+                " MsgInserted:" + totalMsgInserted +
+                " EvtInserted:" + totalEvtInserted +
+                " RegisteredUsers:" + totalRegisteredUsers +
+                " ActiveUsers:" + totalActiveUsers +
+                " ActiveAgents:" + totalActiveAgents +
+                " VolteReports:" + totalVolteReports +
+                " NewRegisteredUsers:" + newRegisteredUsers +
+                " TestsByApp:" + totalTestsByApp +
+                " TestsByUi:" + totalTestsByUi +
+                " TestsByScheduler:" + totalTestsByScheduler +
+                " TestsByApi:" + totalTestsByApi,
+                "",
+                "SUMMARY");
+
+        // ============================================================
+        // INSERT
+        // ============================================================
+
+        insertRow(
+                totalTestsConducted,
+                totalMsgInserted,
+                totalEvtInserted,
+                totalRegisteredUsers,
+                totalActiveUsers,
+                totalActiveAgents,
+                totalVolteReports,
+                newRegisteredUsers,
+                totalTestsByApp,
+                totalTestsByUi,
+                totalTestsByScheduler,
+                totalTestsByApi
+        );
+
+        log("DEBUG", "END processing", "", "END");
+    }
+
+    // ================================================================
+    // COUNT
+    // ================================================================
+
+    private long getCountLong(String query) throws Exception {
+
+        log("DEBUG", query, "", "QUERY");
+
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(query)) {
+
+            if (rs.next()) {
+                return rs.getLong(1);
+            }
+        }
+
+        return 0L;
+    }
+
+    // ================================================================
+    // INSERT
+    // ================================================================
+
+    private void insertRow(
+            long totalTestsConducted,
+            long totalMsgInserted,
+            long totalEvtInserted,
+            long totalRegisteredUsers,
+            long totalActiveUsers,
+            long totalActiveAgents,
+            long totalVolteReports,
+            long newRegisteredUsers,
+            long totalTestsByApp,
+            long totalTestsByUi,
+            long totalTestsByScheduler,
+            long totalTestsByApi
+    ) throws Exception {
+
+        String sql = "INSERT INTO " + tableName +
+                " (report_date, total_tests_conducted, total_msg_inserted, total_evt_inserted," +
+                " total_registered_users, total_active_users, total_active_agents," +
+                " total_volte_reports, new_registered_users," +
+                " total_tests_by_app, total_tests_by_ui, total_tests_by_scheduler, total_tests_by_api)" +
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
+
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+
+            int i = 1;
+
+            ps.setString(i++, date);
+            ps.setLong(i++, totalTestsConducted);
+            ps.setLong(i++, totalMsgInserted);
+            ps.setLong(i++, totalEvtInserted);
+            ps.setLong(i++, totalRegisteredUsers);
+            ps.setLong(i++, totalActiveUsers);
+            ps.setLong(i++, totalActiveAgents);
+            ps.setLong(i++, totalVolteReports);
+            ps.setLong(i++, newRegisteredUsers);
+            ps.setLong(i++, totalTestsByApp);
+            ps.setLong(i++, totalTestsByUi);
+            ps.setLong(i++, totalTestsByScheduler);
+            ps.setLong(i++, totalTestsByApi);
+
+            ps.executeUpdate();
+
+            log("DEBUG",
+                    "Insert successful for date: " + date,
+                    "",
+                    "INSERT");
+        }
+    }
+
+    // ================================================================
+    // LOG
+    // ================================================================
+
+    private void log(String level, String message, String serverIP, String evtType) {
+
+        if ("DEBUG".equalsIgnoreCase(level) && !debugEnabled) {
+            return;
+        }
+
+        String timestamp =
+                LocalDateTime.now().format(logFormat);
+
+        System.out.println(
+                "Time:" + timestamp +
+                " [" + level + "]" +
+                " Process_Name:" + processName +
+                " Process_Version:" + processVersion +
+                " EVT_Type:" + evtType +
+                " Description:" + message
+        );
+    }
+}

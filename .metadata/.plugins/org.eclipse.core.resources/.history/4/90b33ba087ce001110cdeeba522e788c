@@ -1,0 +1,4155 @@
+package ntp12_process_upd_v2;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Savepoint;
+import java.sql.Types;
+import java.text.SimpleDateFormat;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+public class ntp12_process_methods {
+
+	private static final String PROCESS_NAME = "NTP12";
+	private static final String PROCESS_VERSION = "2.0";
+	// Target re_user table. Override at run time with -Dntp12.table=re_mgmt.<table> (no code change needed).
+	private static final String TARGET_TABLE = System.getProperty("ntp12.table", "re_mgmt.re_user_pview_bkp_1810_v2");
+
+	// Transaction chunk size: SOURCE EVENTS per COMMIT (not statements). See rule #4/#25.
+	private static final int BATCH_SIZE = 500;
+	private static final int MAX_WARN_SAMPLES = 5;
+
+	private static final DateTimeFormatter LOG_FMT = DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss SSS");
+
+	// Supported user modes and per-mode limits (V3 source of truth - DO NOT CHANGE)
+	private static final List<String> USER_MODE_PRIORITY_ORDER = Collections
+			.unmodifiableList(Arrays.asList("IA", "IU", "IRA", "IRU", "IBU"));
+
+	private static final Map<String, Integer> USER_MODE_MAX_COUNT;
+	static {
+		Map<String, Integer> m = new LinkedHashMap<String, Integer>();
+		m.put("IA", Integer.valueOf(2));
+		m.put("IU", Integer.valueOf(3));
+		m.put("IRA", Integer.valueOf(2));
+		m.put("IRU", Integer.valueOf(3));
+		m.put("IBU", Integer.valueOf(3));
+		USER_MODE_MAX_COUNT = Collections.unmodifiableMap(m);
+	}
+
+	private static final Set<String> RANKED_STATUSES = Collections
+			.unmodifiableSet(new HashSet<String>(Arrays.asList("1", "2", "4", "6", "7", "12", "20")));
+
+	private static final String STATUS_TESTBED = "TESTBED";
+	private static final String STATUS_MIGRATION_IN_ACTIVE = "MIGRATION_IN_ACTIVE";
+	private static final String STATUS_DEACTIVATED = "DEACTIVATED";
+
+	// Statuses that must be collapsed to DEACTIVATED in the final status transform (rule #5 / POST-MIGRATION STATUS UPDATE STEP)
+	private static final Set<String> STATUSES_TO_DEACTIVATE = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
+			"DELETED", "REJECTED", "ACTIVATION_PENDING", "ACTIVATION_REJECTED", "DELETION_PENDING", "IN_ACTIVE",
+			STATUS_MIGRATION_IN_ACTIVE)));
+
+	// ------------------------------------------------------------------------------------------
+	// re_flag ELIGIBILITY RULE (mandatory business rule)
+	//
+	//   re_flag IS NULL            -> reporting entity is ELIGIBLE for normal processing.
+	//   re_flag = 'false'          -> FLAGGED: no user of that entity may be updated by ANY write path.
+	//   any other non-NULL value   -> NOT eligible (unexpected): fail closed.
+	//   unresolved / ambiguous FI  -> NOT eligible: fail closed.
+	//
+	// Java-side checks use the sentinels/flags below; every SQL UPDATE/SELECT that touches
+	// re_user_bkp_1710 additionally carries this database-side guard (RE_FLAG_ELIGIBLE_GUARD).
+	// ------------------------------------------------------------------------------------------
+	private static final String RE_FLAG_UNKNOWN = "__NTP12_RE_FLAG_UNKNOWN__";
+	private static final String RE_FLAG_AMBIGUOUS = "__NTP12_RE_FLAG_AMBIGUOUS__";
+
+	/**
+	 * Database-side eligibility guard. {@code u} must be the alias of re_mgmt.re_user_bkp_1710.
+	 * A user with NULL/dangling reporting_entity_id has no matching reporting entity row, so the
+	 * EXISTS fails and the row is protected (fail closed).
+	 */
+	// The target ROW's own re_flag (re_user.re_flag) must be NULL, and so must its reporting entity's.
+	private static final String RE_FLAG_ELIGIBLE_GUARD = "u.re_flag IS NULL AND EXISTS (SELECT 1 FROM re_mgmt.reporting_entity_pview_bkp_1610 re "
+			+ "WHERE re.id = u.reporting_entity_id AND re.re_flag IS NULL)";
+	private static final String USER_MUTATION_GUARD = "(u.dsc_id IS NULL OR u.key_cloak_user_id IS NULL) "
+			+ "AND UPPER(COALESCE(u.status, '')) NOT IN ('ACTIVE', 'SUSPENDED_BY_SYSTEM')";
+
+	// Ranking is used ONLY for a NEW bc_organisation (fi_code) - one that has no row at all in
+	// re_user at the start of the run. Its users are ranked by login_time exactly as before
+	// (IA 2 -> IAU_1/IAU_2, IU 3, IRA 2, IRU 3, IBU 3, overflow -> DEACTIVATED).
+	// For every other (existing) bc_organisation nobody is ranked: a user that is already TESTBED keeps
+	// it, and a user that wants a seat gets it only if a seat is free (see buildSeatDecision),
+	// otherwise it is DEACTIVATED. Other users are never re-ranked or touched.
+
+	// Only these user types are handled by this job. NO / HOI (and anything else) are never touched.
+	// IAU_1 / IAU_2 are the IA users that already hold a seat.
+	private static final Set<String> IN_SCOPE_USER_TYPES = Collections.unmodifiableSet(
+			new HashSet<String>(Arrays.asList("IA", "IU", "IRA", "IRU", "IBU", "IAU_1", "IAU_2")));
+	private static final String USER_TYPE_SCOPE_GUARD = "u.user_type IN ('IA','IU','IRA','IRU','IBU','IAU_1','IAU_2')";
+
+	enum SqlType {
+		BOOLEAN, DATE, TIMESTAMP, BIGINT, UUID, JSONB, VARCHAR, TEXT
+	}
+
+	static final class ColumnMeta {
+		final String name;
+		final SqlType sqlType;
+		final boolean nullable;
+		final String dbDefault;
+		final boolean primaryKey;
+		final boolean uniqueKey;
+		final int varcharLimit;
+
+		ColumnMeta(String name, SqlType sqlType, boolean nullable, String dbDefault, boolean pk, boolean uk,
+				int limit) {
+			this.name = name;
+			this.sqlType = sqlType;
+			this.nullable = nullable;
+			this.dbDefault = dbDefault;
+			this.primaryKey = pk;
+			this.uniqueKey = uk;
+			this.varcharLimit = limit;
+		}
+	}
+
+	static final List<String> INSERT_COLUMNS;
+	static final Map<String, ColumnMeta> COLUMN_REGISTRY;
+
+	static {
+		Map<String, ColumnMeta> r = new LinkedHashMap<>();
+		r.put("active", c("active", SqlType.BOOLEAN, true, null, false, false, -1));
+		r.put("dob", c("dob", SqlType.DATE, true, null, false, false, -1));
+		r.put("same_registration_correspondence_address",
+				c("same_registration_correspondence_address", SqlType.BOOLEAN, true, null, false, false, -1));
+		r.put("created_at", c("created_at", SqlType.TIMESTAMP, true, null, false, false, -1));
+		r.put("updated_at", c("updated_at", SqlType.TIMESTAMP, true, null, false, false, -1));
+		r.put("version", c("version", SqlType.BIGINT, true, null, false, false, -1));
+		r.put("country_code", c("country_code", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("gender", c("gender", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("title", c("title", SqlType.VARCHAR, true, null, false, false, 10));
+		r.put("dsc_id", c("dsc_id", SqlType.UUID, true, null, false, true, -1));
+		r.put("reporting_entity_id", c("reporting_entity_id", SqlType.UUID, true, null, false, false, -1));
+		r.put("landline_number", c("landline_number", SqlType.VARCHAR, true, null, false, false, 20));
+		r.put("mobile", c("mobile", SqlType.VARCHAR, true, null, false, false, 20));
+		r.put("mobile_number", c("mobile_number", SqlType.TEXT, true, null, false, false, -1));
+		r.put("user_type", c("user_type", SqlType.VARCHAR, true, null, false, false, 20));
+		r.put("citizenship", c("citizenship", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("ckyc_no", c("ckyc_no", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("created_by", c("created_by", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("designation", c("designation", SqlType.VARCHAR, true, null, false, false, 100));
+		r.put("employee_id", c("employee_id", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("proof_of_identity_number", c("proof_of_identity_number", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("updated_by", c("updated_by", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("email", c("email", SqlType.VARCHAR, true, null, false, false, 100));
+		r.put("first_name", c("first_name", SqlType.VARCHAR, true, null, false, false, 100));
+		r.put("last_name", c("last_name", SqlType.VARCHAR, true, null, false, false, 100));
+		r.put("middle_name", c("middle_name", SqlType.VARCHAR, true, null, false, false, 100));
+		r.put("key_cloak_user_id", c("key_cloak_user_id", SqlType.VARCHAR, true, null, false, false, 255));
+		r.put("user_id", c("user_id", SqlType.VARCHAR, true, null, false, true, 255));
+		r.put("ckyc_number", c("ckyc_number", SqlType.TEXT, true, null, false, false, -1));
+		r.put("employ_code", c("employ_code", SqlType.TEXT, true, null, false, false, -1));
+		r.put("office_address", c("office_address", SqlType.TEXT, true, null, false, false, -1));
+		r.put("board_resoluation_date", c("board_resoluation_date", SqlType.TEXT, true, null, false, false, -1));
+		r.put("authorization_letter", c("authorization_letter", SqlType.TEXT, true, null, false, false, -1));
+		r.put("date_of_authorization", c("date_of_authorization", SqlType.TEXT, true, null, false, false, -1));
+		r.put("status", c("status", SqlType.VARCHAR, true, null, false, false, 255));
+		r.put("workflow_status", c("workflow_status", SqlType.VARCHAR, true, null, false, false, 255));
+		r.put("operation", c("operation", SqlType.VARCHAR, true, null, false, false, -1));
+		r.put("requester_reason", c("requester_reason", SqlType.VARCHAR, true, null, false, false, 512));
+		r.put("approver_reason", c("approver_reason", SqlType.VARCHAR, true, null, false, false, 512));
+		r.put("date_of_authorizarion", c("date_of_authorizarion", SqlType.TIMESTAMP, true, null, false, false, -1));
+		r.put("phone_number", c("phone_number", SqlType.TEXT, true, null, false, false, -1));
+		r.put("pending_actions", c("pending_actions", SqlType.JSONB, true, "'{}'::jsonb", false, false, -1));
+		r.put("proof_of_identity", c("proof_of_identity", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("landline", c("landline", SqlType.TEXT, true, null, false, false, -1));
+		r.put("board_resolution_date", c("board_resolution_date", SqlType.TIMESTAMP, true, null, false, false, -1));
+		r.put("metadata", c("metadata", SqlType.JSONB, true, null, false, false, -1));
+		r.put("mobile_country_code", c("mobile_country_code", SqlType.VARCHAR, true, null, false, false, 20));
+		r.put("poi_type", c("poi_type", SqlType.VARCHAR, true, null, false, false, 255));
+		r.put("poi_no", c("poi_no", SqlType.VARCHAR, true, null, false, false, 255));
+		r.put("mobile_no", c("mobile_no", SqlType.VARCHAR, true, null, false, false, 20));
+
+		COLUMN_REGISTRY = Collections.unmodifiableMap(r);
+		INSERT_COLUMNS = Collections.unmodifiableList(new ArrayList<>(r.keySet()));
+	}
+
+	private static ColumnMeta c(String name, SqlType type, boolean nullable, String dbDefault, boolean pk, boolean uk,
+			int limit) {
+		return new ColumnMeta(name, type, nullable, dbDefault, pk, uk, limit);
+	}
+
+	static final class TypeBinder {
+
+		private static final String[] TS_PATTERNS = { "yyyy-MM-dd HH:mm:ss.SSS", "yyyy-MM-dd HH:mm:ss",
+				"yyyy/MM/dd HH:mm:ss", "dd-MM-yyyy HH:mm:ss", "yyyy-MM-dd" };
+
+		private static final String[] DATE_PATTERNS = { "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd", "dd-MM-yyyy",
+				"yyyy/MM/dd" };
+
+		static void bind(PreparedStatement ps, int idx, ColumnMeta meta, String resolvedValue,
+				DatatypeWarnAccumulator warns) throws SQLException {
+
+			if (isBlank(resolvedValue)) {
+				bindNull(ps, idx, meta.sqlType);
+				return;
+			}
+			String v = resolvedValue.trim();
+			switch (meta.sqlType) {
+			case BOOLEAN:
+				bindBoolean(ps, idx, meta, v, warns);
+				break;
+			case DATE:
+				bindDate(ps, idx, meta, v, warns);
+				break;
+			case TIMESTAMP:
+				bindTimestamp(ps, idx, meta, v, warns);
+				break;
+			case BIGINT:
+				bindBigint(ps, idx, meta, v, warns);
+				break;
+			case UUID:
+				bindUuid(ps, idx, meta, v, warns);
+				break;
+			case JSONB:
+				bindJsonb(ps, idx, v);
+				break;
+			case VARCHAR:
+			case TEXT:
+				bindString(ps, idx, meta, v, warns);
+				break;
+			default:
+				bindNull(ps, idx, meta.sqlType);
+			}
+		}
+
+		private static void bindBoolean(PreparedStatement ps, int idx, ColumnMeta meta, String v,
+				DatatypeWarnAccumulator warns) throws SQLException {
+			String lv = v.toLowerCase();
+			if ("true".equals(lv) || "1".equals(lv) || "y".equals(lv) || "yes".equals(lv) || "t".equals(lv)) {
+				ps.setBoolean(idx, true);
+			} else if ("false".equals(lv) || "0".equals(lv) || "n".equals(lv) || "no".equals(lv) || "f".equals(lv)) {
+				ps.setBoolean(idx, false);
+			} else {
+				warns.record(meta.name, v);
+				bindNull(ps, idx, SqlType.BOOLEAN);
+			}
+		}
+
+		private static void bindDate(PreparedStatement ps, int idx, ColumnMeta meta, String v,
+				DatatypeWarnAccumulator warns) throws SQLException {
+			String norm = v.replace('T', ' ');
+			for (String pattern : DATE_PATTERNS) {
+				try {
+					SimpleDateFormat sdf = new SimpleDateFormat(pattern);
+					sdf.setLenient(false);
+					java.util.Date d = sdf.parse(norm);
+					ps.setDate(idx, new java.sql.Date(d.getTime()));
+					return;
+				} catch (Exception ignored) {
+				}
+			}
+			warns.record(meta.name, v);
+			bindNull(ps, idx, SqlType.DATE);
+		}
+
+		private static void bindTimestamp(PreparedStatement ps, int idx, ColumnMeta meta, String v,
+				DatatypeWarnAccumulator warns) throws SQLException {
+			String norm = v.replace('T', ' ').replaceAll("\\s*[+\\-]\\d{2}:\\d{2}$", "").replaceAll("Z$", "").trim();
+			for (String pattern : TS_PATTERNS) {
+				try {
+					SimpleDateFormat sdf = new SimpleDateFormat(pattern);
+					sdf.setLenient(false);
+					java.util.Date d = sdf.parse(norm);
+					ps.setTimestamp(idx, new java.sql.Timestamp(d.getTime()));
+					return;
+				} catch (Exception ignored) {
+				}
+			}
+			warns.record(meta.name, v);
+			bindNull(ps, idx, SqlType.TIMESTAMP);
+		}
+
+		private static void bindBigint(PreparedStatement ps, int idx, ColumnMeta meta, String v,
+				DatatypeWarnAccumulator warns) throws SQLException {
+			try {
+				ps.setLong(idx, Long.parseLong(v));
+			} catch (NumberFormatException e) {
+				warns.record(meta.name, v);
+				bindNull(ps, idx, SqlType.BIGINT);
+			}
+		}
+
+		private static void bindUuid(PreparedStatement ps, int idx, ColumnMeta meta, String v,
+				DatatypeWarnAccumulator warns) throws SQLException {
+			try {
+				java.util.UUID.fromString(v);
+				ps.setString(idx, v);
+			} catch (IllegalArgumentException e) {
+				warns.record(meta.name, v);
+				ps.setNull(idx, Types.OTHER);
+			}
+		}
+
+		private static void bindJsonb(PreparedStatement ps, int idx, String v) throws SQLException {
+			String t = v.trim();
+			ps.setString(idx, (t.startsWith("{") || t.startsWith("[")) ? t : "{}");
+		}
+
+		private static void bindString(PreparedStatement ps, int idx, ColumnMeta meta, String v,
+				DatatypeWarnAccumulator warns) throws SQLException {
+			if (meta.varcharLimit > 0 && v.length() > meta.varcharLimit) {
+				warns.record(meta.name + "[TRUNCATED]", v.substring(0, Math.min(v.length(), 50)) + "...");
+				ps.setString(idx, v.substring(0, meta.varcharLimit));
+			} else {
+				ps.setString(idx, v);
+			}
+		}
+
+		static void bindNull(PreparedStatement ps, int idx, SqlType type) throws SQLException {
+			switch (type) {
+			case BOOLEAN:
+				ps.setNull(idx, Types.BOOLEAN);
+				break;
+			case DATE:
+				ps.setNull(idx, Types.DATE);
+				break;
+			case TIMESTAMP:
+				ps.setNull(idx, Types.TIMESTAMP);
+				break;
+			case BIGINT:
+				ps.setNull(idx, Types.BIGINT);
+				break;
+			case UUID:
+				ps.setNull(idx, Types.OTHER);
+				break;
+			case JSONB:
+				ps.setString(idx, "{}");
+				break;
+			case VARCHAR:
+			case TEXT:
+				ps.setNull(idx, Types.VARCHAR);
+				break;
+			default:
+				ps.setNull(idx, Types.NULL);
+			}
+		}
+
+		static boolean isBlank(String s) {
+			return s == null || s.trim().isEmpty();
+		}
+	}
+
+	static final class DatatypeWarnAccumulator {
+		private final Map<String, Integer> counts = new LinkedHashMap<>();
+		private final Map<String, List<String>> samples = new LinkedHashMap<>();
+
+		void record(String columnKey, String badValue) {
+			counts.merge(columnKey, 1, Integer::sum);
+			List<String> s = samples.computeIfAbsent(columnKey, k -> new ArrayList<>());
+			if (s.size() < MAX_WARN_SAMPLES) {
+				String safe = badValue == null ? "<null>"
+						: (badValue.length() > 50 ? badValue.substring(0, 50) + "" : badValue);
+				s.add(safe);
+			}
+		}
+
+		boolean isEmpty() {
+			return counts.isEmpty();
+		}
+
+		Map<String, Integer> counts() {
+			return counts;
+		}
+
+		Map<String, List<String>> samples() {
+			return samples;
+		}
+	}
+
+	static final class SkipAccumulator {
+		private final Map<String, Integer> counts = new LinkedHashMap<>();
+
+		void record(String reason) {
+			counts.merge(reason, 1, Integer::sum);
+		}
+
+		void record(String reason, int delta) {
+			counts.merge(reason, delta, Integer::sum);
+		}
+
+		int total() {
+			int t = 0;
+			for (int v : counts.values())
+				t += v;
+			return t;
+		}
+
+		Map<String, Integer> counts() {
+			return counts;
+		}
+	}
+
+	/**
+	 * ETL counters. Renamed/added per rule #14 to reflect the event-oriented architecture, while
+	 * keeping every previously-reported metric (totalRows, inserted, rankPropagatedUpdates,
+	 * conflictSkipped, batchesExecuted, batchesFailed) intact so existing log scrapers/dashboards
+	 * do not break.
+	 */
+	static final class EtlReport {
+		int totalRows;
+		int inserted; // direct incoming-row UPDATEs that actually matched a row (rowsAffected > 0)
+		int rankPropagatedUpdates; // ranking-propagated UPDATEs that actually matched a row
+		int conflictSkipped; // direct UPDATEs that hit 0 matching rows (no such user_id / DB re_flag guard)
+
+		// Legacy batch-oriented names, now repurposed to mean "transaction chunks" (rule #14 allows
+		// renaming, but the old names are kept so downstream report parsers keep working).
+		int batchesExecuted; // == transactionsCommitted
+		int batchesFailed; // == transactionsRolledBack (chunk-level rollbacks that required replay)
+
+		// New event-oriented counters (rule #14).
+		int eventsProcessed;
+		int eventsFailed;
+		int transactionsCommitted;
+		int transactionsRolledBack;
+		int directUpdateSuccess;
+		int directUpdateNoMatch;
+		int rankUpdateSuccess;
+		int rankUpdateFailed;
+		int newUsersInserted; // users that were not in re_user and were inserted by this run
+
+		// re_flag enforcement counters: whole source events skipped because the user's reporting
+		// entity is flagged / unexpected / unresolved / ambiguous. Never counted as processed.
+		int eventsSkippedReFlag;
+
+		long startMs;
+		long endMs;
+
+		final SkipAccumulator skipAcc = new SkipAccumulator();
+		final DatatypeWarnAccumulator dtWarn = new DatatypeWarnAccumulator();
+
+		long elapsedSeconds() {
+			return (endMs - startMs) / 1000L;
+		}
+	}
+
+	static final class CsvTable {
+		final Path file;
+		final List<String> headers;
+		final List<Map<String, String>> rows;
+
+		CsvTable(Path file, List<String> headers, List<Map<String, String>> rows) {
+			this.file = file;
+			this.headers = headers;
+			this.rows = rows;
+		}
+
+		boolean hasHeader(String h) {
+			String needle = h.trim().toLowerCase();
+			for (String header : headers) {
+				if (needle.equals(header))
+					return true;
+			}
+			return false;
+		}
+	}
+
+	// Holds the derived user_type / status override for a single source row.
+	// (Reused unchanged from V3 - the decision object shape a ranking calculation produces.)
+	static final class RankDecision {
+		final String userType;
+		final String statusOverride; // null => no override, keep normal mapping
+		final String reason; // why a seat was NOT given (audit only), null when not applicable
+
+		RankDecision(String userType, String statusOverride) {
+			this(userType, statusOverride, null);
+		}
+
+		RankDecision(String userType, String statusOverride, String reason) {
+			this.userType = userType;
+			this.statusOverride = statusOverride;
+			this.reason = reason;
+		}
+	}
+
+	/**
+	 * In-memory representation of the "lapview known state" of one user, for ranking purposes only.
+	 * This is the per-event state buffer required by rules #3/#9/#12/#13: it is seeded from the DB
+	 * (via metadata, since re_user_bkp_1710_v3_copy has no top-level bc_organisation/region_code/
+	 * user_branch_id/login_time columns) and is overwritten as each incremental CSV row is
+	 * processed, so that later events in the same run see earlier events' results.
+	 *
+	 * This buffer is used ONLY to decide ranking scope membership/ordering. All non-ranking
+	 * field resolution (address enrichment, name splitting, etc.) continues to use resolveRow()
+	 * exactly as before, driven by the actual incoming source row.
+	 *
+	 * IMPORTANT (rule #10/#13): currentUserType/currentStatus/currentActive represent the
+	 * COMMITTED baseline - state actually believed to be durable in the database. They are
+	 * advanced ONLY through TransactionContext.commitPending(), which is invoked after a chunk's
+	 * COMMIT has physically succeeded. They are never touched directly while an event's writes are
+	 * still pending inside an open transaction; see TransactionContext below.
+	 */
+	static final class UserState {
+		String userId;
+		String userMode; // normalized upper-case mode, e.g. IA/IU/IRA/IRU/IBU, or null if not rank-eligible
+		String userStatus; // raw source user_status code (e.g. "1"), used against RANKED_STATUSES
+		String bcOrganisation;
+		String regionCode;
+		String userBranchId;
+		String loginTime;
+		String reFlag; // null means explicitly eligible; non-null values are never ranked
+		// re_flag of the reporting entity the user's DB row CURRENTLY belongs to (seeded from the DB
+		// via reporting_entity_id). Unlike reFlag it is never overwritten by an incoming CSV row, so
+		// an incoming row pointing at an eligible FI cannot unlock a user whose stored row sits under
+		// a flagged / unresolved reporting entity. null means eligible.
+		String dbReFlag;
+		// re_flag of the re_user ROW itself (re_user.re_flag). Any non-null value freezes the row:
+		// no update, no ranking write. It still occupies its seat. Null = row is writable.
+		String userRowFlag;
+		// normalized reporting_entity_id of the stored row (null for users not in the table)
+		String reId;
+		// Committed baseline: the ranking-derived outcome actually durable in the DB (or believed to
+		// be, pending an in-flight transaction's commit). Never mutated for a not-yet-committed
+		// event; see TransactionContext.
+		String currentUserType;
+		String currentStatus;
+		String currentActive;
+		boolean protectedRecord;
+		boolean hasDsc; // dsc_id configured -> occupies a seat even when protected
+
+		String scopeKey(String modeKey) {
+			return ntp12_process_methods.buildScopeKeyStatic(modeKey, bcOrganisation, regionCode, userBranchId);
+		}
+	}
+
+	/**
+	 * Transaction-chunk-scoped view of "committed-equivalent" user state (rule #11).
+	 *
+	 * WHY THIS EXISTS: within one open transaction, event N's ranking calculation must be able to
+	 * see the effects of event N-1's successful writes even though neither has actually been
+	 * COMMITted yet (COMMIT only happens once per BATCH_SIZE events). At the same time, UserState's
+	 * currentUserType/currentStatus/currentActive fields must continue to mean "durably committed"
+	 * (rule #10) - they must NOT be advanced just because a statement executed; the transaction
+	 * could still roll back.
+	 *
+	 * SOLUTION: this class holds a small overlay of pending (userId -> {userType,status,active})
+	 * changes recorded only after a given event's own JDBC statements succeeded (executeUpdate()
+	 * returned without exception) within the CURRENT open transaction. Ranking recalculation reads
+	 * through this overlay first, falling back to UserState's committed baseline. Only when the
+	 * chunk's COMMIT physically succeeds does commitPending() copy the overlay into the real
+	 * UserState.current* fields. If the chunk rolls back, discard() drops the overlay entirely and
+	 * the committed baseline (from before the chunk started) remains authoritative.
+	 */
+	static final class TransactionContext {
+		private final Map<String, String> pendingUserType = new HashMap<String, String>();
+		private final Map<String, String> pendingStatus = new HashMap<String, String>();
+		private final Map<String, String> pendingActive = new HashMap<String, String>();
+
+		/**
+		 * Event-scoped snapshot of whatever this overlay contained for a set of userIds
+		 * immediately BEFORE the current event's statements started running. Used to restore the
+		 * overlay to its exact pre-event contents if the event fails partway through - without
+		 * touching entries belonging to any other (earlier, already-succeeded) event in the same
+		 * transaction chunk.
+		 *
+		 * "no previous pending value" is represented by NOT putting a key into the snapshot maps
+		 * at all - restoreEvent() removes any such key from the live overlay rather than putting
+		 * back a null, since HashMap can't distinguish "absent" from "mapped to null" otherwise.
+		 */
+		static final class EventStateSnapshot {
+			private final Map<String, String> priorUserType = new HashMap<String, String>();
+			private final Map<String, String> priorStatus = new HashMap<String, String>();
+			private final Map<String, String> priorActive = new HashMap<String, String>();
+			private final Set<String> hadEntry = new HashSet<String>();
+			private final Set<String> touchedKeys = new HashSet<String>();
+		}
+
+		/**
+		 * Call once, before an event's statements begin executing. Returns a snapshot handle that
+		 * must later be passed to either discardEventSnapshot() (event succeeded - keep the
+		 * pending changes) or restoreEvent() (event failed - undo just this event's overlay
+		 * writes). The event itself is responsible for telling the snapshot, via noteTouched(),
+		 * which userIds it may write to recordSuccess() for - beginEvent() takes no arguments
+		 * because the set of affected users (the incoming user plus every ranking-propagated
+		 * target) is not fully known until ranking is recalculated inside the event.
+		 */
+		EventStateSnapshot beginEvent() {
+			return new EventStateSnapshot();
+		}
+
+		/**
+		 * Captures this key's current overlay value (or "no entry") into the snapshot the first
+		 * time the current event is about to write to it. Safe to call more than once per key per
+		 * event - only the first call for a given key actually captures anything, so a key's
+		 * pre-event value is never overwritten by an intermediate in-event value.
+		 */
+		private void captureIfFirstTouch(EventStateSnapshot snap, String normalizedUserId) {
+			if (!snap.touchedKeys.add(normalizedUserId))
+				return; // already captured this key for this event
+			if (pendingUserType.containsKey(normalizedUserId)) {
+				snap.hadEntry.add(normalizedUserId);
+				snap.priorUserType.put(normalizedUserId, pendingUserType.get(normalizedUserId));
+				snap.priorStatus.put(normalizedUserId, pendingStatus.get(normalizedUserId));
+				snap.priorActive.put(normalizedUserId, pendingActive.get(normalizedUserId));
+			}
+			// else: no prior entry - leave hadEntry/priorXxx untouched; restoreEvent() will remove
+			// the key entirely for this normalizedUserId, matching "no pending value" (see class doc).
+		}
+
+		/**
+		 * Records a successful statement's effect for one user within the CURRENT event, snapshotting
+		 * that key's pre-event overlay value first (if this is the first write to that key during
+		 * this event). This is the only way the pending overlay is ever mutated.
+		 */
+		void recordSuccess(EventStateSnapshot snap, String normalizedUserId, String userType, String status,
+				String active) {
+			captureIfFirstTouch(snap, normalizedUserId);
+			pendingUserType.put(normalizedUserId, userType);
+			pendingStatus.put(normalizedUserId, status);
+			pendingActive.put(normalizedUserId, active);
+		}
+
+		/** Event succeeded: keep every pending change it made. Nothing to do but drop the snapshot. */
+		void discardEventSnapshot(EventStateSnapshot snap) {
+			// Intentionally a no-op beyond letting the snapshot become garbage: the live overlay
+			// already holds the event's writes, which is exactly what should survive.
+		}
+
+		/**
+		 * Event failed: undo ONLY this event's overlay writes, restoring each touched key to
+		 * exactly what it held before this event started (rule: "restore TransactionContext to
+		 * exactly the state it had before this event"). Keys touched by earlier, already-succeeded
+		 * events in the same transaction chunk are untouched because they are not in
+		 * snap.touchedKeys.
+		 */
+		void restoreEvent(EventStateSnapshot snap) {
+			for (String key : snap.touchedKeys) {
+				if (snap.hadEntry.contains(key)) {
+					pendingUserType.put(key, snap.priorUserType.get(key));
+					pendingStatus.put(key, snap.priorStatus.get(key));
+					pendingActive.put(key, snap.priorActive.get(key));
+				} else {
+					pendingUserType.remove(key);
+					pendingStatus.remove(key);
+					pendingActive.remove(key);
+				}
+			}
+		}
+
+		String effectiveUserType(UserState st) {
+			String p = pendingUserType.get(normalizeKeyStatic(st.userId));
+			return p != null ? p : st.currentUserType;
+		}
+
+		String effectiveStatus(UserState st) {
+			String p = pendingStatus.get(normalizeKeyStatic(st.userId));
+			return p != null ? p : st.currentStatus;
+		}
+
+		String effectiveActive(UserState st) {
+			String p = pendingActive.get(normalizeKeyStatic(st.userId));
+			return p != null ? p : st.currentActive;
+		}
+
+		/** Copies every pending change into the real committed baseline. Call ONLY after COMMIT succeeds. */
+		void commitPending(Map<String, UserState> stateBuffer) {
+			for (Map.Entry<String, String> e : pendingUserType.entrySet()) {
+				UserState st = stateBuffer.get(e.getKey());
+				if (st == null)
+					continue;
+				st.currentUserType = e.getValue();
+				st.currentStatus = pendingStatus.get(e.getKey());
+				st.currentActive = pendingActive.get(e.getKey());
+			}
+			clear();
+		}
+
+		/** Drops every pending change. Call after a whole-chunk ROLLBACK - committed baseline is left untouched. */
+		void discard() {
+			clear();
+		}
+
+		private void clear() {
+			pendingUserType.clear();
+			pendingStatus.clear();
+			pendingActive.clear();
+		}
+
+		boolean isEmpty() {
+			return pendingUserType.isEmpty();
+		}
+	}
+
+	private static final Set<String> EXPECTED_SOURCE_COLS = Collections
+			.unmodifiableSet(new HashSet<>(Arrays.asList("user_id", "user_mode", "user_status", "bc_organisation",
+					"first_name", "last_name", "middle_name", "title", "gender", "date_of_birth", "user_created_date",
+					"last_updated_date", "user_created_by", "last_updated_by", "version_no", "pstn_phone_no",
+					"gsm_phone_no", "identification_type", "identification_number", "session_id", "user_pass_gen_by")));
+
+	private final String pgUrl;
+	private final String pgUser;
+	private final String pgPass;
+	private final Map<String, Integer> iaCounterByBcOrganisation = new HashMap<String, Integer>();
+	// Lookup keyed by normalized fi_code. A present key with null value means re_flag IS NULL.
+	private final Map<String, String> reFlagByFiCode = new HashMap<String, String>();
+	// fi_codes that map to more than one reporting entity row: unresolvable => fail closed.
+	private final Set<String> ambiguousFiCodes = new HashSet<String>();
+
+	// ---- Ranking state buffer (rules #3, #9, #12, #13) ----
+	// normalizedUserId -> UserState. Seeded from DB metadata at startup, then kept in sync as each
+	// incremental row is processed and as ranking recalculation updates other users. Persists across
+	// files, transaction chunks and the whole CSV directory (rule #9) - never reset mid-run.
+	private final Map<String, UserState> stateBuffer = new HashMap<String, UserState>();
+	// scopeKey|modeKey -> set of normalizedUserIds currently believed to belong to that scope/mode.
+	// Maintained incrementally alongside stateBuffer so re-ranking never needs a full DB rescan.
+	private final Map<String, Set<String>> scopeMembership = new HashMap<String, Set<String>>();
+
+	// Reusable scratch collections for the hot per-event loop (rule #20.A): cleared and refilled
+	// rather than reallocated every event.
+	private final Map<String, RankDecision> decisionScratch = new HashMap<String, RankDecision>();
+	// normalized (lower-case) user_ids whose update was committed in this run
+	private final Set<String> touchedUserIds = new HashSet<String>();
+	// normalized reporting_entity_id of every row in re_user at the start of the run (any user type).
+	// A bc_organisation whose reporting entity is NOT in here is "new" for the whole run.
+	private final Set<String> orgIdsInTable = new HashSet<String>();
+	// Final ranking decisions for users of a NEW bc_organisation, computed once over the whole CSV.
+	private final Map<String, RankDecision> newOrgDecisionByUserId = new HashMap<String, RankDecision>();
+	private static final boolean INCREMENTAL_RERANK = false;
+	// IA seat bookkeeping per normalized fi_code, built from EVERY stored row (any flag / protection):
+	//  - iauTypesTakenByFi: IAU_1 / IAU_2 slots that are really occupied (never handed out again)
+	//  - iaSeatsUsedByFi:   IA seats used (occupied IAU slot, or IA row that is TESTBED / has a DSC)
+	private final Map<String, Set<String>> iauTypesTakenByFi = new HashMap<String, Set<String>>();
+	private final Map<String, Integer> iaSeatsUsedByFi = new HashMap<String, Integer>();
+	// Decisions for IA users competing for the free IAU slots of an EXISTING org (login_time desc).
+	private final Map<String, RankDecision> existingOrgIaDecisionByUserId = new HashMap<String, RankDecision>();
+	// FROZEN reporting entities (normalized reporting_entity_id): at least one stored re_user row of the RE has
+	// re_flag set. Nothing stored in a frozen RE is touched; a NEW user of a frozen RE is inserted DEACTIVATED.
+	private final Set<String> frozenReIds = new HashSet<String>();
+	// Seat plan of this run (see SeatPlanner): user_id -> type/status decision for every competitor.
+	private Map<String, SeatPlanner.Decision> seatPlan = new HashMap<String, SeatPlanner.Decision>();
+	// normalized fi_code -> normalized user_ids of every stored IA / IAU_1 / IAU_2 row of that RE
+	private final Map<String, List<String>> iaFamilyByFi = new HashMap<String, List<String>>();
+	// Final IA decision (IAU_1 / IAU_2 / IA + status) for every IA user of the CSV in a non-frozen RE.
+	private final Map<String, RankDecision> iaDecisionByUserId = new HashMap<String, RankDecision>();
+	// normalized reporting_entity_id -> normalized fi_code (to place stored rows without metadata in a scope)
+	private final Map<String, String> fiCodeByReId = new HashMap<String, String>();
+	// INSERT for users that are not in re_user yet (set in run()).
+	private PreparedStatement insertPsRef;
+	private final List<UserState> rankMembersScratch = new ArrayList<UserState>();
+
+	/**
+	 * Compact run audit. The log shows one line per group (inserted, updated, each skip reason, final
+	 * TESTBED / each deactivation reason, mapping source per column) with the count and the first ids;
+	 * the complete per-user list is written to a TSV file so the console never turns into a wall of rows.
+	 */
+	static final class RunAudit {
+		static final int IDS_IN_LOG = 20;
+		static final String[] MAPPED_COLS = { "email", "mobile", "landline", "designation", "employee_code",
+				"citizenship" };
+		// columns of a per-user row: user_id, action, user_type, status, reason, previous_status, <sources...>
+		final Map<String, List<String>> groups = new LinkedHashMap<String, List<String>>();
+		final Map<String, String[]> rows = new LinkedHashMap<String, String[]>();
+		final Map<String, Map<String, Integer>> sources = new LinkedHashMap<String, Map<String, Integer>>();
+		final Map<String, List<String>> missing = new LinkedHashMap<String, List<String>>();
+		private int seq = 0;
+
+		RunAudit() {
+			for (String c : MAPPED_COLS) {
+				sources.put(c, new LinkedHashMap<String, Integer>());
+				missing.put(c, new ArrayList<String>());
+			}
+		}
+
+		void group(String group, String userId) {
+			List<String> ids = groups.get(group);
+			if (ids == null) {
+				ids = new ArrayList<String>();
+				groups.put(group, ids);
+			}
+			String id = userId == null || userId.trim().isEmpty() ? "(blank)" : userId.trim();
+			if (ids.isEmpty() || !ids.get(ids.size() - 1).equals(id) || "(blank)".equals(id))
+				if (!ids.contains(id) || "(blank)".equals(id) || group.startsWith("SKIPPED"))
+					ids.add(id);
+		}
+
+		/** A user row really written to the DB (action = INSERTED / UPDATED). */
+		void written(String action, String userId, Map<String, String> resolved) {
+			group(action, userId);
+			String[] r = new String[6 + MAPPED_COLS.length];
+			r[0] = userId;
+			r[1] = action;
+			r[2] = nz(resolved.get("user_type"));
+			r[3] = nz(resolved.get("status"));
+			r[4] = nz(resolved.get("__deact_reason"));
+			r[5] = nz(resolved.get("__prev_status"));
+			for (int i = 0; i < MAPPED_COLS.length; i++) {
+				String c = MAPPED_COLS[i];
+				String src = resolved.get("__src_" + c);
+				if (src == null) {
+					missing.get(c).add(userId);
+					src = "missing";
+				}
+				Map<String, Integer> m = sources.get(c);
+				Integer n = m.get(src);
+				m.put(src, Integer.valueOf(n == null ? 1 : n.intValue() + 1));
+				r[6 + i] = src;
+			}
+			rows.put(key(userId), r);
+		}
+
+		/** A later decision changed an already written user (ranking inside a new org). */
+		void restatus(String userId, String userType, String status, String reason) {
+			String[] r = rows.get(key(userId));
+			if (r == null)
+				return;
+			r[2] = nz(userType);
+			r[3] = nz(status);
+			r[4] = "DEACTIVATED".equals(status) ? nz(reason) : "";
+		}
+
+		/** A source row the business rules did not write. */
+		void skipped(String reason, String userId) {
+			group("SKIPPED - " + reason, userId);
+			String[] r = new String[6 + MAPPED_COLS.length];
+			java.util.Arrays.fill(r, "");
+			r[0] = userId == null ? "" : userId;
+			r[1] = "SKIPPED";
+			r[4] = reason;
+			String k = key(userId);
+			rows.put(rows.containsKey(k) ? k + "#" + (++seq) : k, r);
+		}
+
+		/** Final TESTBED / DEACTIVATED groups, built from each user's LAST known state. */
+		Map<String, List<String>> finalStatusGroups() {
+			Map<String, List<String>> out = new LinkedHashMap<String, List<String>>();
+			for (String[] r : rows.values()) {
+				if ("SKIPPED".equals(r[1]))
+					continue;
+				String g = "TESTBED".equals(r[3]) ? "FINAL TESTBED"
+						: "DEACTIVATED".equals(r[3])
+								? "FINAL DEACTIVATED - " + (r[4].isEmpty() ? "inactive source status" : r[4])
+								: "FINAL status " + (r[3].isEmpty() ? "(unchanged)" : r[3]);
+				List<String> ids = out.get(g);
+				if (ids == null) {
+					ids = new ArrayList<String>();
+					out.put(g, ids);
+				}
+				ids.add(r[0]);
+			}
+			return out;
+		}
+
+		private static String key(String userId) {
+			return userId == null ? "" : userId.trim().toLowerCase();
+		}
+
+		static String nz(String s) {
+			return s == null ? "" : s;
+		}
+
+		static String preview(List<String> ids) {
+			if (ids == null || ids.isEmpty())
+				return "";
+			int n = Math.min(IDS_IN_LOG, ids.size());
+			StringBuilder sb = new StringBuilder("[");
+			for (int i = 0; i < n; i++) {
+				if (i > 0)
+					sb.append(", ");
+				sb.append(ids.get(i));
+			}
+			sb.append(']');
+			if (ids.size() > n)
+				sb.append(" +").append(ids.size() - n).append(" more");
+			return sb.toString();
+		}
+	}
+
+	private final RunAudit audit = new RunAudit();
+
+	/** Prints the compact audit and writes the full per-user TSV into the working directory. */
+	private void printRunAudit(String filePrefix) {
+		log("INFO", "---------------- RUN AUDIT ----------------", null, "RUN_AUDIT");
+		if (audit.groups.isEmpty())
+			log("INFO", "No source row produced any action", null, "RUN_AUDIT");
+		for (Map.Entry<String, List<String>> e : audit.groups.entrySet()) {
+			log("INFO", String.format("%-58s : %6d  %s", e.getKey(), e.getValue().size(),
+					RunAudit.preview(e.getValue())), null, "RUN_AUDIT");
+		}
+		for (Map.Entry<String, List<String>> e : audit.finalStatusGroups().entrySet()) {
+			log("INFO", String.format("%-58s : %6d  %s", e.getKey(), e.getValue().size(),
+					RunAudit.preview(e.getValue())), null, "RUN_AUDIT");
+		}
+		log("INFO", "---------------- MAPPING (written rows) ----------------", null, "RUN_AUDIT");
+		for (String c : RunAudit.MAPPED_COLS) {
+			StringBuilder sb = new StringBuilder();
+			for (Map.Entry<String, Integer> s : audit.sources.get(c).entrySet()) {
+				if (sb.length() > 0)
+					sb.append(", ");
+				sb.append(s.getKey()).append('=').append(s.getValue());
+			}
+			List<String> miss = audit.missing.get(c);
+			log("INFO", String.format("%-14s : %s%s", c, sb.length() == 0 ? "-" : sb.toString(),
+					miss.isEmpty() ? "" : "  | missing for " + RunAudit.preview(miss)), null, "RUN_AUDIT");
+		}
+
+		String ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+		Path out = Paths.get(filePrefix + "_audit_" + ts + ".tsv").toAbsolutePath();
+		try (java.io.BufferedWriter w = Files.newBufferedWriter(out, StandardCharsets.UTF_8)) {
+			w.write("user_id\taction\tuser_type\tstatus\treason\tprevious_status");
+			for (String c : RunAudit.MAPPED_COLS)
+				w.write("\t" + c + "_source");
+			w.newLine();
+			for (String[] r : audit.rows.values()) {
+				StringBuilder sb = new StringBuilder();
+				for (int i = 0; i < r.length; i++) {
+					if (i > 0)
+						sb.append('\t');
+					sb.append(r[i] == null ? "" : r[i]);
+				}
+				w.write(sb.toString());
+				w.newLine();
+			}
+			log("INFO", "Full per-user audit written: " + out + " | Rows=" + audit.rows.size(), null, "RUN_AUDIT");
+		} catch (Exception ex) {
+			log("WARN", "Audit file could not be written (" + out + "): " + ex.getMessage(), null, "RUN_AUDIT");
+		}
+		log("INFO", "--------------------------------------------", null, "RUN_AUDIT");
+	}
+
+	/** First non-blank value; records which source it came from as resolved-transient "__src_<col>". */
+	private String pick(Map<String, String> srcOut, String col, String[] names, String... values) {
+		for (int i = 0; i < values.length; i++) {
+			if (!isBlank(values[i])) {
+				srcOut.put("__src_" + col, names[i]);
+				return values[i].trim();
+			}
+		}
+		return null;
+	}
+
+	public ntp12_process_methods(String pgUrl, String pgUser, String pgPass) {
+		this.pgUrl = pgUrl;
+		this.pgUser = pgUser;
+		this.pgPass = pgPass;
+	}
+
+	public static void main(String[] args) {
+		if (args == null || args.length < 4) {
+			System.out.println("Usage: Ntp12Process <csvFolder> <pgUrl> <pgUser> <pgPass>");
+			return;
+		}
+		boolean ok = new ntp12_process_methods(args[1], args[2], args[3]).run(args[0]);
+		System.exit(ok ? 0 : 1);
+	}
+
+	public boolean run(String csvFolderPath) {
+		EtlReport report = new EtlReport();
+		report.startMs = System.currentTimeMillis();
+
+		log("INFO", "========================================", null, "APP_START");
+		log("INFO", "USER MIGRATION STARTING", null, "APP_START");
+		log("INFO", "Process=" + PROCESS_NAME + "  Version=" + PROCESS_VERSION, null, "APP_START");
+		log("INFO", "========================================", null, "APP_START");
+
+		try {
+			Path inputDir = Paths.get(csvFolderPath);
+			if (!Files.exists(inputDir) || !Files.isDirectory(inputDir)) {
+				log("ERROR", "CSV folder not found or not a directory: " + csvFolderPath, null, "CONFIG_LOAD");
+				return false;
+			}
+
+			List<Path> csvFiles = findCsvFiles(inputDir);
+			if (csvFiles.isEmpty()) {
+				log("WARN", "No CSV files found in: " + csvFolderPath, null, "CSV_LOAD");
+				return false;
+			}
+
+			// Address, region, branch and reporting-entity lookups come from the DB (re_mgmt schema).
+			Map<String, Map<String, String>> addressLookup = loadAddressLookup();
+			log("INFO", "Address lookup loaded from re_mgmt.address_pview_bkp_1610 | Entries=" + addressLookup.size(), null,
+					"LOOKUP_LOAD");
+
+			Map<String, String> regionLookup = loadRegionLookup();
+			log("INFO", "Region lookup loaded from re_mgmt.region_pview_bkp_1610 | Entries=" + regionLookup.size(), null,
+					"LOOKUP_LOAD");
+
+			Map<String, String> branchLookup = loadBranchLookup();
+			log("INFO", "Branch lookup loaded from re_mgmt.branch_pview_bkp_1610 | Entries=" + branchLookup.size(), null,
+					"LOOKUP_LOAD");
+
+			Map<String, String> reLookup = loadReportingEntityLookup();
+			log("INFO", "Reporting-entity lookup loaded | Entries=" + reLookup.size(), null, "LOOKUP_LOAD");
+
+			// Seed the ranking state buffer from the DB's currently-persisted rows (rule #13: "current
+			// DB state"). This lets ranking recalculation see users that never appear in the incoming
+			// CSVs at all (e.g. User B/C in the spec's examples).
+			seedStateBufferFromDb(report);
+			for (Map.Entry<String, String> fe : reFlagByFiCode.entrySet()) {
+				if (fe.getValue() != null && isExplicitFalseReFlag(fe.getValue()) && reLookup.get(fe.getKey()) != null)
+					frozenReIds.add(normalizeKey(reLookup.get(fe.getKey())));
+			}
+			log("INFO", "Frozen REs (re_flag on a user row or on the RE): " + frozenReIds.size(), null, "CONFIG_LOAD");
+			log("INFO", "Ranking state buffer seeded | Entries=" + stateBuffer.size(), null, "CONFIG_LOAD");
+
+			String updateSql = buildUpdateSql();
+			// re_flag guard: only rows whose reporting entity has re_flag IS NULL can be modified.
+			// metadata.previous_status is added only when the user is demoted (? #4/#5 = previous status).
+			String rankOnlySql = "UPDATE " + TARGET_TABLE + " u SET user_type = ?, status = ?, active = ?, "
+					+ "same_registration_correspondence_address = CASE WHEN u.user_type LIKE 'IAU%' OR "
+					+ "CAST(? AS text) LIKE 'IAU%' THEN (CASE WHEN CAST(? AS text) LIKE 'IAU%' THEN true ELSE NULL END) "
+					+ "ELSE u.same_registration_correspondence_address END, "
+					+ "metadata = CASE WHEN CAST(? AS text) IS NULL THEN u.metadata ELSE "
+					+ "COALESCE(u.metadata, '{}'::jsonb) || jsonb_build_object('previous_status', CAST(? AS text)) END "
+					+ "WHERE u.user_id = ? AND " + RE_FLAG_ELIGIBLE_GUARD + " AND " + USER_MUTATION_GUARD
+					+ " AND " + USER_TYPE_SCOPE_GUARD;
+
+			try (Connection conn = DriverManager.getConnection(pgUrl, pgUser, pgPass)) {
+				conn.setAutoCommit(false);
+
+				try (PreparedStatement ps = conn.prepareStatement(updateSql);
+						PreparedStatement rankPs = conn.prepareStatement(rankOnlySql);
+						PreparedStatement insertPs = conn.prepareStatement(buildInsertSql())) {
+					insertPsRef = insertPs;
+
+					iaCounterByBcOrganisation.clear();
+
+					// ---- Master-event engine (rules #2, #3, #22) ----
+					//
+					// Exactly one JDBC Connection, one PreparedStatement per statement type (reused,
+					// never re-prepared per event - rule #6), and one open transaction per chunk of
+					// BATCH_SIZE SOURCE EVENTS (not statements - rule #4/#25).
+					//
+					// Every statement caused by event N (its own direct UPDATE, then every
+					// ranking-propagated UPDATE it triggers, in that order) is executed with
+					// executeUpdate() IMMEDIATELY, before event N+1 is even looked at. There is no
+					// batch queue of any kind for these two statement types; the ordering guarantee
+					// (rule #3) comes directly from Java call order, not from any queuing structure.
+					//
+					// A SAVEPOINT is taken before each event's writes (rule #12, Option A) so a single
+					// bad event can be rolled back to its own savepoint without discarding every
+					// earlier-in-chunk event that already succeeded and without requiring a full
+					// chunk replay. This is preferred over Option B (whole-chunk rollback + replay)
+					// because per-event SAVEPOINTs are cheap on PostgreSQL and keep the rest of the
+					// chunk's already-executed statements intact and in the same transaction.
+					TransactionContext txCtx = new TransactionContext();
+					int eventsInChunk = 0;
+
+					// Pass 1: load every CSV first. The two mapping CSVs (user_address / user_details) must
+					// be complete BEFORE any master row is resolved - file names sort as ..._48 (address),
+					// ..._50 (master), ..._57 (details), so streaming in name order would miss details.
+					List<CsvTable> masterTables = new ArrayList<CsvTable>();
+					for (Path f : csvFiles) {
+						CsvTable t = loadCsv(f);
+						if (t == null || t.rows.isEmpty())
+							continue;
+						if (isUserMaster(t)) {
+							masterTables.add(t);
+							report.totalRows += t.rows.size();
+						} else if (isUserAddressCsv(t)) {
+							mergeLookupByUserId(userAddressCsvLookupRef, t);
+						} else if (isUserDetails(t)) {
+							mergeLookupByUserId(userDetailsLookupRef, t);
+						} else {
+							log("WARN", "CSV not recognised (not master / address / details), ignored | file="
+									+ f.getFileName(), null, "CSV_LOAD");
+						}
+					}
+					log("INFO", "CSV loaded | master rows=" + report.totalRows + " | address users="
+							+ userAddressCsvLookupRef.size() + " | details users=" + userDetailsLookupRef.size(), null,
+							"CSV_LOAD");
+					if (masterTables.isEmpty())
+						log("WARN", "No user_master CSV found (needs user_id, user_mode, user_status, bc_organisation, "
+								+ "first_name, title)", null, "CSV_LOAD");
+
+					// Ranking for NEW bc_organisations: once, over the complete CSV population (login_time desc).
+					// Seats: one rule for every scope (SeatPlanner). The older new-org / IA-slot precomputations
+					// are kept in the class but no longer called.
+					seatPlan = planSeats(latestMasterTables(masterTables).get(0).rows, reLookup, regionLookup, branchLookup);
+
+					// Pass 2: process the master rows.
+					for (CsvTable t : masterTables) {
+						eventsInChunk = processMasterTableSequentially(t, conn, ps, rankPs, txCtx, eventsInChunk,
+								reLookup, addressLookup, regionLookup, branchLookup, report);
+					}
+
+					// Commit whatever remains below BATCH_SIZE at the very end of the run.
+					if (eventsInChunk > 0) {
+						commitChunk(conn, txCtx, report);
+					}
+					// Users already in the table but not in today's CSV that lost (or moved) their seat.
+					applySeatPlanToStoredOnlyUsers(seatPlan);
+				}
+			}
+
+			if (!report.dtWarn.isEmpty()) {
+				log("INFO", "-- Aggregated Datatype Warnings --", null, "DATATYPE_WARN");
+				for (Map.Entry<String, Integer> e : report.dtWarn.counts().entrySet()) {
+					log("WARN", "DATATYPE_WARN Column=" + e.getKey() + " Expected=" + typeForColumn(e.getKey())
+							+ " Failures=" + e.getValue() + " SampleValues=" + report.dtWarn.samples().get(e.getKey()),
+							null, "DATATYPE_WARN");
+				}
+			}
+
+			report.endMs = System.currentTimeMillis();
+			printEtlReport(report);
+
+			// Post-migration steps run automatically after the update phase completes.
+			boolean statusUpdateOk = applyPostMigrationStatusUpdate();
+			boolean dedupOk = correctDuplicateEmailMobile();
+
+			printRunAudit("ntp12_update");
+			return statusUpdateOk && dedupOk;
+
+		} catch (Exception e) {
+			log("ERROR", "Fatal ETL error: " + e.getMessage(), null, "ETL_ERROR");
+			return false;
+		}
+	}
+
+	// Lookups that must persist across the whole directory (not per-file); kept as instance state
+	// so processMasterTableSequentially can see details/addresses loaded from files processed so far.
+	// NOTE: because master, address and details CSVs may appear in any file-order within the
+	// directory, this UPDATE parser resolves each master row using whatever address/details rows
+	// have been loaded up to that point, exactly like the previous implementation did (it also
+	// loaded all lookups before processing rows) - the only behavioral difference here is that
+	// files are streamed in order rather than fully pre-scanned, per rule "0". If address/details
+	// CSVs are guaranteed to sort before the master CSV files (as the deterministic filename sort
+	// generally ensures for this feed), enrichment is unaffected.
+	private final Map<String, Map<String, String>> userDetailsLookupRef = new HashMap<String, Map<String, String>>();
+	private final Map<String, Map<String, String>> userAddressCsvLookupRef = new HashMap<String, Map<String, String>>();
+
+	/**
+	 * Processes every row of one master CSV table, in file order, executing each event's DB writes
+	 * immediately (direct UPDATE, then that event's ranking-propagated UPDATEs) inside the current
+	 * open chunk transaction, and committing every BATCH_SIZE events (rules #2, #3, #4, #22).
+	 *
+	 * Returns the updated eventsInChunk counter (how many events have executed since the last
+	 * COMMIT), so the caller can keep the chunk-boundary count correct across multiple CSV files.
+	 */
+	private int processMasterTableSequentially(CsvTable masterTable, Connection conn, PreparedStatement ps,
+			PreparedStatement rankPs, TransactionContext txCtx, int eventsInChunk, Map<String, String> reLookup,
+			Map<String, Map<String, String>> addressLookup, Map<String, String> regionLookup,
+			Map<String, String> branchLookup, EtlReport report) throws SQLException {
+
+		for (Map<String, String> row : masterTable.rows) {
+
+			String userId = get(row, "user_id");
+			String userMode = get(row, "user_mode");
+			String modeKey = isBlank(userMode) ? "" : userMode.trim().toUpperCase();
+
+			if (isBlank(userId)) {
+				report.skipAcc.record("BLANK_USER_ID");
+				audit.skipped("blank user_id", userId);
+				continue;
+			}
+
+			// ---- re_flag EVENT GATE (mandatory business rule) ----
+			// Evaluated BEFORE any in-memory state (stateBuffer, scopeMembership, counters used for
+			// ranking), ranking calculation, field resolution, savepoint or JDBC write for this event.
+			// A skipped event is rejected in full: no direct UPDATE, no ranking-propagated UPDATE,
+			// and no influence on later ranking decisions or other users.
+			// Eligible means re_flag IS NULL for BOTH (a) the FI named in the incoming row and
+			// (b) the reporting entity the user's stored DB row currently belongs to.
+			// 'false', any other non-NULL value, unresolved and ambiguous FI codes all fail closed.
+			String incomingFiCode = get(row, "bc_organisation");
+			String incomingFlag = lookupReFlag(incomingFiCode);
+			UserState priorState = stateBuffer.get(normalizeKey(userId));
+			if (priorState != null && priorState.protectedRecord) {
+				String pType = priorState.currentUserType == null ? "" : priorState.currentUserType.trim().toUpperCase();
+				if (pType.startsWith("IAU") && !RANKED_STATUSES.contains(get(row, "user_status")))
+					audit.group("REVIEW - protected " + pType + " kept although inactive in source (rule 3)", userId);
+				report.skipAcc.record("PROTECTED_EXISTING_USER");
+				audit.skipped(isProtectedStatus(priorState.currentStatus)
+						? "protected status " + priorState.currentStatus.trim().toUpperCase()
+						: "protected (dsc_id + key_cloak_user_id set)", userId);
+				continue;
+			}
+			// Only IA / IU / IRA / IRU / IBU (and the IAU_1 / IAU_2 seat holders) are handled here.
+			// NO, HOI and any other stored user type are never touched.
+			if (priorState != null && !isBlank(priorState.currentUserType)
+					&& !IN_SCOPE_USER_TYPES.contains(priorState.currentUserType.trim().toUpperCase())) {
+				report.skipAcc.record("OUT_OF_SCOPE_USER_TYPE");
+				audit.skipped("user_type " + priorState.currentUserType.trim().toUpperCase() + " not handled", userId);
+				continue;
+			}
+			if (priorState != null && priorState.userRowFlag != null) {
+				report.skipAcc.record("USER_ROW_RE_FLAG_SKIP");
+				report.eventsSkippedReFlag++;
+				audit.skipped("re_flag " + describeFlag(priorState.userRowFlag) + " (user row re_user.re_flag)", userId);
+				continue;
+			}
+			// ---- FROZEN RE GATE ----
+			// An RE is frozen when any stored user row of it has re_flag set (or the RE row itself has
+			// re_flag 'false'). Existing users of a frozen RE are never touched; a NEW user of a frozen RE is
+			// inserted DEACTIVATED (no seat, no IAU slot).
+			String incomingReId = resolveReportingEntityId(incomingFiCode, reLookup);
+			boolean incomingFrozen = !isBlank(incomingReId) && frozenReIds.contains(normalizeKey(incomingReId));
+			boolean storedFrozen = priorState != null && priorState.reId != null && frozenReIds.contains(priorState.reId);
+			// Only the row's OWN re_flag freezes it (checked above). Other users of an RE that has a re_flag
+			// user still take part: the re_flag user just keeps its seat (SeatPlanner).
+			boolean frozenNewUser = priorState == null && incomingFrozen;
+
+			String storedFlag = priorState == null ? null : priorState.dbReFlag;
+			String flagSkipReason = frozenNewUser ? null : reFlagSkipReason(incomingFlag);
+			String flagSource = "incoming_bc_organisation";
+			String offendingFlag = incomingFlag;
+			if (flagSkipReason == null) {
+				flagSkipReason = reFlagSkipReason(storedFlag);
+				flagSource = "stored_reporting_entity";
+				offendingFlag = storedFlag;
+			}
+			if (flagSkipReason != null) {
+				report.skipAcc.record(flagSkipReason);
+				report.eventsSkippedReFlag++;
+				audit.skipped("re_flag " + describeFlag(offendingFlag) + " (" + flagSource + ")", userId);
+				continue;
+			}
+
+			if (!USER_MODE_MAX_COUNT.containsKey(modeKey)) {
+				report.skipAcc.record("USER_MODE_NOT_SUPPORTED_" + modeKey);
+				audit.skipped("user_mode " + (isBlank(modeKey) ? "(blank)" : modeKey) + " not handled", userId);
+				continue;
+			}
+
+			// IRA / IRU need a valid region_code, IBU a valid region_code AND user_branch_id. An invalid
+			// row is NOT skipped any more: it is still migrated, but as DEACTIVATED (no seat taken).
+			boolean forceDeactivate = !passesRegionBranchValidation(modeKey, row, regionLookup, branchLookup);
+			if (forceDeactivate) {
+				report.skipAcc.record("INVALID_REGION_OR_BRANCH_" + modeKey + "_MIGRATED_DEACTIVATED");
+			}
+
+			// ---- One SOURCE EVENT starts here. Everything below executes against the DB
+			// IMMEDIATELY and in this exact order before the loop moves to the next row. ----
+
+			Savepoint eventSavepoint = conn.setSavepoint();
+			// Snapshot of the transaction-local overlay taken before this event writes anything to
+			// it. On success the overlay's new entries are kept as-is (discardEventSnapshot). On
+			// failure, restoreEvent() undoes exactly this event's overlay writes - restoring each
+			// touched key to what it held immediately before this event, and removing keys that had
+			// no prior entry - without disturbing any other user's overlay entry left behind by an
+			// earlier, already-succeeded event in the same 500-event transaction chunk.
+			TransactionContext.EventStateSnapshot txSnapshot = txCtx.beginEvent();
+
+			try {
+				// Step 1/2: fold this event into the state buffer (lapview known state for this user).
+				// Only reached for re_flag IS NULL events (see gate above), so incomingFlag is null here.
+				String previousScopeKeyIfAny = null;
+				UserState existing = stateBuffer.get(normalizeKey(userId));
+				if (existing != null && existing.userMode != null) {
+					previousScopeKeyIfAny = existing.userMode + "::" + existing.scopeKey(existing.userMode);
+				}
+				UserState updatedState = updateStateBufferFromRow(row, userId, modeKey,
+						frozenNewUser ? "__NTP12_FROZEN_RE__" : incomingFlag);
+
+				// Step 3: determine whether this event can affect ranking (rule #3.3, Case H).
+				String userStatus = get(row, "user_status");
+				boolean newRowIsRankRelevant = RANKED_STATUSES.contains(userStatus);
+				boolean rankingScopeChanged = previousScopeKeyIfAny != null
+						&& !previousScopeKeyIfAny.equals(modeKey + "::" + updatedState.scopeKey(modeKey));
+
+				decisionScratch.clear();
+
+				// Ranking only for a NEW bc_organisation (no row in re_user at run start), and never for a
+				// row that is migrated as DEACTIVATED because of an invalid region / branch.
+				String incomingReUuid = resolveReportingEntityId(incomingFiCode, reLookup);
+				boolean newOrg = !isBlank(incomingReUuid) && !orgIdsInTable.contains(normalizeKey(incomingReUuid));
+				if (forceDeactivate && updatedState.userMode != null) {
+					// A deactivated row must not take a seat in anybody's ranking.
+					Set<String> members = scopeMembership.get(updatedState.userMode + "|" + updatedState.scopeKey(updatedState.userMode));
+					if (members != null)
+						members.remove(normalizeKey(userId));
+					updatedState.userMode = null;
+				}
+				// New org users are ranked ONCE up front over the whole CSV (precomputeNewOrgRanking), so the
+				// incremental per-event re-rank below is no longer needed (kept dormant for reference).
+				if (INCREMENTAL_RERANK && newOrg && !forceDeactivate
+						&& (newRowIsRankRelevant || previousScopeKeyIfAny != null || rankingScopeChanged)) {
+					// Step 4/5/6: reconstruct the complete affected population and re-rank it with the
+					// exact same V3 rules, then diff+update every changed user (rules #4, #7, #8, #9).
+					if (previousScopeKeyIfAny != null && rankingScopeChanged) {
+						// User moved scope/mode: re-rank the OLD scope too (it lost a member).
+						String[] oldParts = splitScopeMode(previousScopeKeyIfAny);
+						reRankScopeAndCollectDecisions(oldParts[0], oldParts[1], decisionScratch, txCtx);
+					}
+					reRankScopeAndCollectDecisions(modeKey, updatedState.scopeKey(modeKey), decisionScratch, txCtx);
+				}
+
+				// Resolve the incoming row's own non-ranking fields (address enrichment, names, etc.)
+				// exactly as before, applying this event's RankDecision if one was computed.
+				RankDecision ownDecision = decisionScratch.get(normalizeKey(userId));
+				SeatPlanner.Decision seat = seatPlan.get(normalizeKey(userId));
+				if (seat != null) {
+					// Seat plan (re_flag / DSC / ACTIVE users keep their seats, the rest ranked by login_time).
+					ownDecision = new RankDecision(seat.userType, seat.status, seat.reason);
+				} else if (frozenNewUser) {
+					ownDecision = new RankDecision(modeKey, STATUS_MIGRATION_IN_ACTIVE, "RE frozen - new user comes in DEACTIVATED");
+				}
+				if (ownDecision == null) {
+					// Not in the seat plan (e.g. a DSC-configured user): plain seat check, nobody else touched.
+					ownDecision = buildSeatDecision(modeKey, updatedState, userStatus, forceDeactivate, txCtx);
+				}
+				Map<String, String> resolved = resolveRow(row, reLookup, addressLookup, userAddressCsvLookupRef,
+						userDetailsLookupRef, report.dtWarn, ownDecision);
+
+				// ---- Event N direct UPDATE - executed immediately (rules #3, #5, #22) ----
+				// The statement itself also carries the database-side re_flag guard (see buildUpdateSql).
+				// A user that is not in the table goes straight to INSERT (saves a useless UPDATE round trip).
+				String auditAction = null; // recorded only once the whole event succeeded
+				int directAffected = 0;
+				if (existing != null) {
+					bindResolvedUpdateRow(ps, resolved, report.dtWarn);
+					directAffected = ps.executeUpdate();
+				}
+				if (directAffected > 0) {
+					report.inserted++;
+					report.directUpdateSuccess++;
+					recordAppliedState(userId, resolved, txCtx, txSnapshot);
+					auditAction = "UPDATED";
+				} else if (existing == null && insertPsRef != null && !isBlank(resolved.get("reporting_entity_id"))
+						&& !isBlank(resolved.get("user_type"))) {
+					// The user is not in re_user at all: migrate it as a NEW user (TESTBED or DEACTIVATED as
+					// decided above). The event gate already proved re_flag IS NULL for its bc_organisation.
+					bindResolvedUpdateRow(insertPsRef, resolved, report.dtWarn);
+					int insertedRows = insertPsRef.executeUpdate();
+					if (insertedRows > 0) {
+						report.newUsersInserted++;
+						recordAppliedState(userId, resolved, txCtx, txSnapshot);
+						auditAction = "INSERTED (new user_id)";
+					} else {
+						report.conflictSkipped++;
+						report.directUpdateNoMatch++;
+						audit.skipped("insert conflict (user_id already exists)", userId);
+					}
+				} else {
+					// 0 rows: no such user_id, or the DB-side re_flag guard refused the write.
+					report.conflictSkipped++;
+					report.directUpdateNoMatch++;
+					audit.skipped(existing == null ? "new user_id but fi_code / reporting entity not resolved"
+							: "DB guard refused (re_flag / protected / user_type)", userId);
+				}
+
+				// ---- Event N ranking-propagated UPDATE(s) - executed immediately, in decision
+				// order, still inside this same event, before the next source event is processed
+				// (rules #3, #6, #22, #23). This deliberately excludes the incoming user_id itself
+				// (already handled above with the full resolveRow enrichment) to avoid a duplicate,
+				// weaker update overwriting the rich one. ----
+				for (Map.Entry<String, RankDecision> e : decisionScratch.entrySet()) {
+					String affectedUserId = e.getKey();
+					if (affectedUserId.equals(normalizeKey(userId)))
+						continue;
+
+					UserState affectedState = stateBuffer.get(affectedUserId);
+					if (affectedState == null)
+						continue;
+					// re_flag: a ranking-propagated target must itself be eligible (both its effective
+					// and its stored reporting-entity flag). Ineligible users are never written.
+					String affectedSkip = affectedState.userRowFlag != null ? "USER_ROW_RE_FLAG_SKIP" : reFlagSkipReason(affectedState.reFlag);
+					if (affectedSkip == null)
+						affectedSkip = reFlagSkipReason(affectedState.dbReFlag);
+					if (affectedSkip != null) {
+						report.skipAcc.record(affectedSkip + "_RANK_PROPAGATED");
+						continue;
+					}
+
+					RankDecision decision = e.getValue();
+					String baselineStatus = txCtx.effectiveStatus(affectedState);
+					String newStatus = decision.statusOverride == null ? baselineStatus : decision.statusOverride;
+					String finalStatus = mapFinalStatus(newStatus);
+					String baselineUserType = txCtx.effectiveUserType(affectedState);
+					boolean changed = !safeEquals(baselineUserType, decision.userType)
+							|| !safeEquals(mapFinalStatus(baselineStatus), finalStatus);
+
+					if (!changed)
+						continue;
+
+					boolean active = STATUS_TESTBED.equals(finalStatus);
+					rankPs.setString(1, decision.userType);
+					// Final status is written directly. A demoted user (DEACTIVATED) also gets
+					// metadata.previous_status = the status its source code mapped to (e.g. LOCKED).
+					rankPs.setString(2, finalStatus);
+					rankPs.setBoolean(3, active);
+					String prevForDemoted = STATUS_DEACTIVATED.equals(finalStatus)
+							? mapOperationalStatus(affectedState.userStatus) : null;
+					rankPs.setString(4, decision.userType);
+					rankPs.setString(5, decision.userType);
+					rankPs.setString(6, prevForDemoted);
+					rankPs.setString(7, prevForDemoted);
+					rankPs.setString(8, affectedState.userId);
+					int rankAffected = rankPs.executeUpdate();
+
+					// Logging/counting only reflects an outcome we actually observed (rule #15):
+					// count and log a ranking-propagated update as successful ONLY when its own SQL
+					// execution actually affected the target row.
+					if (rankAffected > 0) {
+						report.rankPropagatedUpdates++;
+						report.rankUpdateSuccess++;
+						txCtx.recordSuccess(txSnapshot, affectedUserId, decision.userType, finalStatus,
+								Boolean.toString(active));
+						audit.group("RE-RANKED in new org by login_time (earlier row changed)", affectedState.userId);
+						audit.restatus(affectedState.userId, decision.userType, finalStatus,
+								"ranked out by login_time (new org)");
+					} else {
+						report.rankUpdateFailed++;
+						report.skipAcc.record("RANK_PROPAGATED_NO_MATCH");
+					}
+				}
+
+				report.eventsProcessed++;
+				if (auditAction != null) {
+					audit.written(auditAction, userId, resolved);
+					String oldType = existing == null || existing.currentUserType == null ? ""
+							: existing.currentUserType.trim().toUpperCase();
+					String newType = resolved.get("user_type") == null ? "" : resolved.get("user_type").trim().toUpperCase();
+					if ("IA".equals(modeKey) && existing != null && !oldType.equals(newType)
+							&& (oldType.startsWith("IAU") || newType.startsWith("IAU")))
+						audit.group("IAU slot changed: " + (oldType.isEmpty() ? "(none)" : oldType) + " -> " + newType, userId);
+				}
+				// Event succeeded end-to-end: keep every transaction-local overlay write it made.
+				txCtx.discardEventSnapshot(txSnapshot);
+
+			} catch (SQLException rowEx) {
+				// ---- FAILURE HANDLING (rule #12, Option A: SAVEPOINT per event) ----
+				//
+				// Roll back ONLY this event's statements. Every earlier event in this chunk that
+				// already executed successfully remains intact in the transaction, in its original
+				// physical order, because a SAVEPOINT rollback in PostgreSQL undoes work performed
+				// since that savepoint without touching anything committed/executed before it.
+				//
+				// IMPORTANT STATE RULE (rule #13): a failed DB write must NOT be represented as a
+				// successful committed change. restoreEvent() undoes exactly this event's
+				// transaction-local overlay writes (see TransactionContext.EventStateSnapshot),
+				// putting back whatever each touched key held immediately before this event started
+				// (or removing the key if it had no prior entry) - WITHOUT clearing the whole
+				// overlay, so earlier, already-succeeded events in this same 500-event transaction
+				// chunk keep their pending state intact. The in-memory ranking source-state
+				// (userMode/userStatus/bcOrganisation/etc. in stateBuffer, updated by
+				// updateStateBufferFromRow above) intentionally is NOT rolled back - the parser's
+				// existing semantics require later events to keep seeing this row's source fields
+				// for ranking-scope reconstruction (rule #13), even though its DB write did not
+				// succeed. This mirrors the original implementation's separation between "source
+				// event state" and "committed DB state". (Only re_flag-eligible events ever reach
+				// this point; re_flag-skipped events never mutate stateBuffer at all.)
+				try {
+					conn.rollback(eventSavepoint);
+				} catch (SQLException spEx) {
+					log("ERROR", "Savepoint rollback failed | user_id=" + userId + " | " + spEx.getMessage(), null,
+							"SAVEPOINT_ERROR");
+				}
+				txCtx.restoreEvent(txSnapshot);
+				String sqlState = rowEx.getSQLState() == null ? "UNKNOWN" : rowEx.getSQLState();
+				String reason = sqlState.startsWith("23") ? "INTEGRITY_CONSTRAINT_" + sqlState : "ROW_ERROR_" + sqlState;
+				report.skipAcc.record(reason);
+				report.eventsFailed++;
+				audit.skipped("DB error " + reason, userId);
+				log("WARN", "Event failed and rolled back to its savepoint | user_id=" + userId + " | Reason="
+						+ reason + " | SQLState=" + sqlState + " | Detail=" + rowEx.getMessage(), null,
+						"EVENT_ERROR");
+			} finally {
+				try {
+					conn.releaseSavepoint(eventSavepoint);
+				} catch (SQLException ignored) {
+					// Some drivers no-op or disallow release after rollback; safe to ignore.
+				}
+			}
+
+			eventsInChunk++;
+
+			// ---- Chunk boundary: COMMIT every BATCH_SIZE SOURCE EVENTS (rules #2, #4, #25) ----
+			// This is a count of EVENTS, not of direct+ranking statements - an event that produced
+			// five ranking-propagated UPDATEs still counts as one event toward this threshold.
+			if (eventsInChunk >= BATCH_SIZE) {
+				commitChunk(conn, txCtx, report);
+				eventsInChunk = 0;
+			}
+		}
+
+		return eventsInChunk;
+	}
+
+	/**
+	 * Commits the current chunk transaction and, only once that COMMIT has physically succeeded,
+	 * promotes every transaction-local pending state change into the real committed UserState
+	 * baseline (rule #10/#11). If COMMIT itself throws, the chunk is rolled back instead and the
+	 * pending overlay is discarded - the committed baseline from before this chunk remains
+	 * authoritative, and every event in the failed chunk is reported as failed since none of its
+	 * writes survived.
+	 */
+	private void commitChunk(Connection conn, TransactionContext txCtx, EtlReport report) throws SQLException {
+		try {
+			conn.commit();
+			report.batchesExecuted++;
+			report.transactionsCommitted++;
+			// Remember exactly which users this run really updated (committed). The post-migration
+			// step is limited to these user_ids so it never touches the rest of the table.
+			touchedUserIds.addAll(txCtx.pendingUserType.keySet());
+			touchedUserIds.addAll(txCtx.pendingStatus.keySet());
+			txCtx.commitPending(stateBuffer);
+		} catch (SQLException commitEx) {
+			report.batchesFailed++;
+			report.transactionsRolledBack++;
+			try {
+				conn.rollback();
+			} catch (SQLException ignored) {
+			}
+			txCtx.discard();
+			log("ERROR", "Chunk COMMIT failed; chunk rolled back | " + commitEx.getMessage(), null,
+					"TRANSACTION_ERROR");
+			throw commitEx;
+		}
+	}
+
+	private String[] splitScopeMode(String modeAndScope) {
+		int idx = modeAndScope.indexOf("::");
+		return new String[] { modeAndScope.substring(0, idx), modeAndScope.substring(idx + 2) };
+	}
+
+	private boolean safeEquals(String a, String b) {
+		if (a == null)
+			return b == null;
+		return a.equals(b);
+	}
+
+	/**
+	 * Folds one incoming CSV row into the state buffer as the user's lapview known state for
+	 * ranking purposes (rule #13). Returns the resulting UserState.
+	 *
+	 * Callers MUST have already established re_flag eligibility for the event (see the event gate in
+	 * processMasterTableSequentially); this method is never invoked for a skipped event, so a skipped
+	 * event cannot create or mutate buffer state or scope membership.
+	 */
+	private UserState updateStateBufferFromRow(Map<String, String> row, String userId, String modeKey, String reFlag) {
+		String key = normalizeKey(userId);
+		UserState st = stateBuffer.get(key);
+		if (st == null) {
+			st = new UserState();
+			st.userId = userId;
+			// Not seeded from the DB (no stored row): there is no stored reporting entity to protect.
+			st.dbReFlag = reFlag;
+			stateBuffer.put(key, st);
+		}
+
+		String userStatus = get(row, "user_status");
+		boolean rankEligibleMode = USER_MODE_MAX_COUNT.containsKey(modeKey);
+		boolean rankEligibleStatus = RANKED_STATUSES.contains(userStatus);
+
+		// Remove from any previous scope membership set before updating (Case C: became ineligible,
+		// or moved scope) - membership sets are re-derived by reRankScopeAndCollectDecisions anyway,
+		// but keeping this tidy avoids stale scope entries.
+		if (st.userMode != null) {
+			String oldMemberKey = st.userMode + "|" + st.scopeKey(st.userMode);
+			Set<String> oldMembers = scopeMembership.get(oldMemberKey);
+			if (oldMembers != null)
+				oldMembers.remove(key);
+		}
+
+		st.userMode = (rankEligibleMode && rankEligibleStatus) ? modeKey : null;
+		st.userStatus = userStatus;
+		st.bcOrganisation = get(row, "bc_organisation");
+		st.regionCode = get(row, "region_code");
+		st.userBranchId = get(row, "user_branch_id");
+		st.loginTime = get(row, "login_time");
+		st.reFlag = reFlag;
+		if (st.reFlag != null) st.userMode = null;
+
+		if (st.userMode != null) {
+			String newMemberKey = st.userMode + "|" + st.scopeKey(st.userMode);
+			Set<String> newMembers = scopeMembership.get(newMemberKey);
+			if (newMembers == null) {
+				newMembers = new HashSet<String>();
+				scopeMembership.put(newMemberKey, newMembers);
+			}
+			newMembers.add(key);
+		}
+
+		return st;
+	}
+
+	/**
+	 * The master CSV is an EVENT stream: one user can appear many times (status 1, 7, 20, 3, 6 ...). Files are
+	 * processed in name order and the LAST event of a user is its final state, so slot / seat decisions must be
+	 * made from that last row - not from the first one. Returns a single table holding the last row per user.
+	 */
+	private List<CsvTable> latestMasterTables(List<CsvTable> masterTables) {
+		Map<String, Map<String, String>> last = new LinkedHashMap<String, Map<String, String>>();
+		for (CsvTable t : masterTables)
+			for (Map<String, String> row : t.rows) {
+				String uid = get(row, "user_id");
+				if (!isBlank(uid))
+					last.put(normalizeKey(uid), row);
+			}
+		List<CsvTable> out = new ArrayList<CsvTable>(1);
+		out.add(new CsvTable(null, new ArrayList<String>(), new ArrayList<Map<String, String>>(last.values())));
+		return out;
+	}
+
+	/**
+	 * Ranks the CSV users of every NEW bc_organisation (no row in the table at run start, re_flag NULL)
+	 * once, over the whole file: per mode + scope, login_time descending (user_id ascending on ties).
+	 * IA: 1st -> IAU_1, 2nd -> IAU_2, rest IA DEACTIVATED; IU 3, IRA 2, IRU 3, IBU 3 seats, rest DEACTIVATED.
+	 * Only users not yet in the table, with a testbed status (1,2,4,6,7,12,20) and a valid region/branch
+	 * take part. Decisions are final, so no earlier row ever has to be re-written.
+	 */
+	private void precomputeNewOrgRanking(List<CsvTable> masterTables, Map<String, String> reLookup,
+			Map<String, String> regionLookup, Map<String, String> branchLookup) {
+		masterTables = latestMasterTables(masterTables);
+		newOrgDecisionByUserId.clear();
+		Map<String, List<Map<String, String>>> byScope = new LinkedHashMap<String, List<Map<String, String>>>();
+		Set<String> seen = new HashSet<String>();
+		for (CsvTable t : masterTables) {
+			for (Map<String, String> row : t.rows) {
+				String userId = get(row, "user_id");
+				if (isBlank(userId) || !seen.add(normalizeKey(userId)) || stateBuffer.containsKey(normalizeKey(userId)))
+					continue;
+				String modeKey = get(row, "user_mode").toUpperCase();
+				if ("IA".equals(modeKey))
+					continue; // IA (IAU_1 / IAU_2) is decided by precomputeIaSlots for every RE
+				if (!USER_MODE_MAX_COUNT.containsKey(modeKey) || !RANKED_STATUSES.contains(get(row, "user_status")))
+					continue;
+				String fi = get(row, "bc_organisation");
+				if (reFlagSkipReason(lookupReFlag(fi)) != null)
+					continue;
+				String reId = resolveReportingEntityId(fi, reLookup);
+				if (isBlank(reId) || orgIdsInTable.contains(normalizeKey(reId)))
+					continue;
+				if (!passesRegionBranchValidation(modeKey, row, regionLookup, branchLookup))
+					continue;
+				String key = modeKey + "|" + buildScopeKey(modeKey, row);
+				List<Map<String, String>> list = byScope.get(key);
+				if (list == null) {
+					list = new ArrayList<Map<String, String>>();
+					byScope.put(key, list);
+				}
+				list.add(row);
+			}
+		}
+		for (Map.Entry<String, List<Map<String, String>>> e : byScope.entrySet()) {
+			String modeKey = e.getKey().substring(0, e.getKey().indexOf('|'));
+			List<Map<String, String>> rows = e.getValue();
+			Collections.sort(rows, new Comparator<Map<String, String>>() {
+				@Override
+				public int compare(Map<String, String> a, Map<String, String> b) {
+					String la = get(a, "login_time");
+					String lb = get(b, "login_time");
+					if (isBlank(la) && isBlank(lb))
+						return get(a, "user_id").compareTo(get(b, "user_id"));
+					if (isBlank(la))
+						return 1;
+					if (isBlank(lb))
+						return -1;
+					int cmp = lb.compareTo(la);
+					return cmp != 0 ? cmp : get(a, "user_id").compareTo(get(b, "user_id"));
+				}
+			});
+			int max = USER_MODE_MAX_COUNT.get(modeKey).intValue();
+			for (int i = 0; i < rows.size(); i++) {
+				RankDecision d;
+				if ("IA".equals(modeKey))
+					d = i == 0 ? new RankDecision("IAU_1", STATUS_TESTBED)
+							: i == 1 ? new RankDecision("IAU_2", STATUS_TESTBED)
+									: new RankDecision("IA", STATUS_MIGRATION_IN_ACTIVE, "ranked out by login_time (new org)");
+				else
+					d = i < max ? new RankDecision(modeKey, STATUS_TESTBED)
+							: new RankDecision(modeKey, STATUS_MIGRATION_IN_ACTIVE, "ranked out by login_time (new org)");
+				newOrgDecisionByUserId.put(normalizeKey(get(rows.get(i), "user_id")), d);
+			}
+		}
+		log("INFO", "New-org ranking precomputed | scopes=" + byScope.size() + " | users=" + newOrgDecisionByUserId.size(),
+				null, "RANKING");
+	}
+
+	/**
+	 * IAU_1 / IAU_2 for every RE (new, existing or frozen - in a frozen RE only NEW users are ranked), decided ONCE over the whole CSV.
+	 *
+	 * Only a user that is ACTIVE in the source (user_status 1,2,4,6,7,12,20) can hold an IAU slot:
+	 *   - fixed holders keep what they have and are never moved: stored rows that this run does not
+	 *     touch (not in the CSV, ACTIVE / SUSPENDED_BY_SYSTEM, dsc_id + key_cloak_user_id), and DSC users
+	 *     that are still active in the source. Their IAU_1 / IAU_2 stays taken.
+	 *   - every other active IA user of the CSV competes for the remaining slots, newest login_time
+	 *     first: 1st -> first free slot (IAU_1 before IAU_2), 2nd -> next free slot, rest -> IA DEACTIVATED.
+	 *   - an IA / IAU user that is inactive in the source becomes IA DEACTIVATED: it never keeps a slot,
+	 *     so a slot with no active user is left empty.
+	 * IA max 2 seats in total per RE.
+	 */
+	private void precomputeIaSlots(List<CsvTable> masterTables, Map<String, String> reLookup) {
+		masterTables = latestMasterTables(masterTables);
+		iaDecisionByUserId.clear();
+		Map<String, List<Map<String, String>>> byFi = new LinkedHashMap<String, List<Map<String, String>>>();
+		Map<String, Boolean> newOrgByFi = new HashMap<String, Boolean>();
+		Set<String> iaCsvIds = new HashSet<String>(); // IA users decided by this method
+		Set<String> seen = new HashSet<String>();
+		for (CsvTable t : masterTables) {
+			for (Map<String, String> row : t.rows) {
+				String userId = get(row, "user_id");
+				if (isBlank(userId) || !seen.add(normalizeKey(userId)))
+					continue;
+				if (!"IA".equalsIgnoreCase(get(row, "user_mode")))
+					continue;
+				String fi = get(row, "bc_organisation");
+				String reId = resolveReportingEntityId(fi, reLookup);
+				boolean frozenRe = !isBlank(reId) && frozenReIds.contains(normalizeKey(reId));
+				if (!frozenRe && reFlagSkipReason(lookupReFlag(fi)) != null)
+					continue; // flagged / unknown RE: handled by the event gate
+				if (isBlank(reId))
+					continue;
+				UserState prior = stateBuffer.get(normalizeKey(userId));
+				// FROZEN RE: existing users are never touched (they stay fixed holders); only NEW users
+				// compete for the slots the frozen holders leave free.
+				if (frozenRe && prior != null)
+					continue;
+				if (prior != null) {
+					if (prior.protectedRecord || prior.userRowFlag != null || prior.dbReFlag != null
+							|| (prior.reId != null && frozenReIds.contains(prior.reId)))
+						continue; // never touched -> counted as a fixed holder below
+					String type = prior.currentUserType == null ? "" : prior.currentUserType.trim().toUpperCase();
+					if (!type.isEmpty() && !"IA".equals(type) && !"IAU_1".equals(type) && !"IAU_2".equals(type))
+						continue; // not an IA-family row (gate decides)
+				}
+				String k = normalizeKey(fi);
+				List<Map<String, String>> list = byFi.get(k);
+				if (list == null) {
+					list = new ArrayList<Map<String, String>>();
+					byFi.put(k, list);
+					newOrgByFi.put(k, Boolean.valueOf(!orgIdsInTable.contains(normalizeKey(reId))));
+				}
+				list.add(row);
+				iaCsvIds.add(normalizeKey(userId));
+			}
+		}
+
+		int given = 0, rankedOut = 0, inactive = 0, kept = 0;
+		for (Map.Entry<String, List<Map<String, String>>> e : byFi.entrySet()) {
+			String fk = e.getKey();
+			boolean newOrg = newOrgByFi.get(fk).booleanValue();
+			Set<String> taken = new HashSet<String>();
+			int seatsUsed = 0;
+
+			// 1) fixed holders: stored IA-family rows this run will not move
+			List<String> fam = iaFamilyByFi.get(fk);
+			if (fam != null) {
+				for (String sid : fam) {
+					if (iaCsvIds.contains(sid))
+						continue; // a CSV user that is decided below
+					UserState st = stateBuffer.get(sid);
+					if (st == null)
+						continue;
+					String type = st.currentUserType == null ? "" : st.currentUserType.trim().toUpperCase();
+					String stat = st.currentStatus == null ? "" : st.currentStatus.trim().toUpperCase();
+					boolean holding = !("DEACTIVATED".equals(stat) || "MIGRATION_IN_ACTIVE".equals(stat)
+							|| "IN_ACTIVE".equals(stat));
+					if (type.startsWith("IAU") && holding) {
+						taken.add(type);
+						seatsUsed++;
+					} else if ("IA".equals(type) && (STATUS_TESTBED.equals(stat) || st.hasDsc)) {
+						seatsUsed++;
+					}
+				}
+			}
+
+			// 2) CSV users: active DSC holders keep their slot; inactive -> IA DEACTIVATED; rest compete
+			List<Map<String, String>> candidates = new ArrayList<Map<String, String>>();
+			for (Map<String, String> row : e.getValue()) {
+				String uid = normalizeKey(get(row, "user_id"));
+				UserState prior = stateBuffer.get(uid);
+				boolean active = RANKED_STATUSES.contains(get(row, "user_status"));
+				if (!active) {
+					iaDecisionByUserId.put(uid, new RankDecision("IA", STATUS_MIGRATION_IN_ACTIVE));
+					inactive++;
+					continue;
+				}
+				String type = prior == null || prior.currentUserType == null ? "" : prior.currentUserType.trim().toUpperCase();
+				if (prior != null && prior.hasDsc && (type.startsWith("IAU") ? !taken.contains(type) : true)) {
+					// DSC already configured: keeps its role, never ranked out
+					iaDecisionByUserId.put(uid, new RankDecision(type.isEmpty() ? "IA" : type, STATUS_TESTBED));
+					if (type.startsWith("IAU"))
+						taken.add(type);
+					seatsUsed++;
+					kept++;
+					continue;
+				}
+				candidates.add(row);
+			}
+			Collections.sort(candidates, new Comparator<Map<String, String>>() {
+				@Override
+				public int compare(Map<String, String> a, Map<String, String> b) {
+					String la = get(a, "login_time");
+					String lb = get(b, "login_time");
+					if (isBlank(la) && isBlank(lb))
+						return get(a, "user_id").compareTo(get(b, "user_id"));
+					if (isBlank(la))
+						return 1;
+					if (isBlank(lb))
+						return -1;
+					int cmp = lb.compareTo(la);
+					return cmp != 0 ? cmp : get(a, "user_id").compareTo(get(b, "user_id"));
+				}
+			});
+			List<String> freeTypes = new ArrayList<String>();
+			for (String ty : new String[] { "IAU_1", "IAU_2" })
+				if (!taken.contains(ty))
+					freeTypes.add(ty);
+			int assignable = Math.min(Math.max(0, USER_MODE_MAX_COUNT.get("IA").intValue() - seatsUsed), freeTypes.size());
+			for (int i = 0; i < candidates.size(); i++) {
+				String uid = normalizeKey(get(candidates.get(i), "user_id"));
+				if (i < assignable) {
+					iaDecisionByUserId.put(uid, new RankDecision(freeTypes.get(i), STATUS_TESTBED));
+					given++;
+				} else {
+					iaDecisionByUserId.put(uid, new RankDecision("IA", STATUS_MIGRATION_IN_ACTIVE,
+							newOrg ? "ranked out by login_time (new org)" : "IAU slots full - ranked out by login_time"));
+					rankedOut++;
+				}
+			}
+		}
+		log("INFO", "IA slots decided | REs=" + byFi.size() + " | IAU given=" + given + " | DSC kept=" + kept
+				+ " | ranked out=" + rankedOut + " | inactive -> IA DEACTIVATED=" + inactive, null, "RANKING");
+	}
+
+	/**
+	 * Replacement for ranking: decides ONLY the incoming user, nobody else is re-ranked or touched.
+	 *   - status not in 1,2,4,6,7,12,20          -> no seat needed (resolveRow deactivates it)
+	 *   - invalid region / branch                -> DEACTIVATED (MIGRATION_IN_ACTIVE collapses to it)
+	 *   - user already holds TESTBED             -> keeps its seat
+	 *   - seats of this mode + scope already full (IA 2, IU 3, IRA 2, IRU 3, IBU 3, counted over OTHER
+	 *     users that are currently TESTBED and re_flag IS NULL) -> DEACTIVATED, no re-ranking
+	 *   - otherwise                              -> TESTBED
+	 * The stored user_type is kept as is (falls back to the mode for a user without one).
+	 */
+	private RankDecision buildSeatDecision(String modeKey, UserState st, String rawStatus, boolean forceDeactivate,
+			TransactionContext txCtx) {
+		String keptType = txCtx.effectiveUserType(st);
+		if (isBlank(keptType))
+			keptType = modeKey;
+
+		if (forceDeactivate)
+			return new RankDecision(keptType, STATUS_MIGRATION_IN_ACTIVE, "invalid region/branch");
+		if (!RANKED_STATUSES.contains(rawStatus == null ? "" : rawStatus.trim()))
+			return new RankDecision(keptType, null);
+		if (STATUS_TESTBED.equals(txCtx.effectiveStatus(st)))
+			return new RankDecision(keptType, STATUS_TESTBED);
+
+		if ("IA".equals(modeKey)) {
+			RankDecision pre = existingOrgIaDecisionByUserId.get(normalizeKey(st.userId));
+			if (pre != null)
+				return pre;
+		}
+
+		Integer max = USER_MODE_MAX_COUNT.get(modeKey);
+		Set<String> members = scopeMembership.get(modeKey + "|" + st.scopeKey(modeKey));
+		int taken = 0;
+		if (members != null) {
+			String self = normalizeKey(st.userId);
+			for (String id : members) {
+				if (id.equals(self))
+					continue;
+				UserState other = stateBuffer.get(id);
+				if (other != null && other.reFlag == null && other.dbReFlag == null
+						&& (STATUS_TESTBED.equals(txCtx.effectiveStatus(other)) || other.hasDsc))
+					taken++;
+			}
+		}
+		if (max != null && taken >= max.intValue())
+			return new RankDecision(keptType, STATUS_MIGRATION_IN_ACTIVE,
+					"seats full (" + modeKey + " max " + max + ") in existing org");
+
+		// A free IA seat is an IAU seat: IAU_1 unless another member already holds it, else IAU_2.
+		if ("IA".equals(modeKey) && !(keptType.startsWith("IAU"))) {
+			boolean iau1Taken = false;
+			if (members != null) {
+				String self = normalizeKey(st.userId);
+				for (String id : members) {
+					if (id.equals(self))
+						continue;
+					UserState other = stateBuffer.get(id);
+					if (other != null && "IAU_1".equals(txCtx.effectiveUserType(other)))
+						iau1Taken = true;
+				}
+			}
+			Set<String> takenSlots = iauTypesTakenByFi.get(normalizeKey(st.bcOrganisation));
+			if (takenSlots != null && takenSlots.contains("IAU_1"))
+				iau1Taken = true;
+			keptType = iau1Taken ? "IAU_2" : "IAU_1";
+			if (takenSlots != null && takenSlots.contains("IAU_1") && takenSlots.contains("IAU_2"))
+				return new RankDecision("IA", STATUS_MIGRATION_IN_ACTIVE, "seats full (IA max 2) in existing org");
+		}
+		return new RankDecision(keptType, STATUS_TESTBED);
+	}
+
+	/**
+	 * Rebuilds the COMPLETE current ranking population for (modeKey, scopeKey) from the state
+	 * buffer (which already reflects DB seed state + all earlier incremental events + this event),
+	 * runs the exact same V3 ranking rules (same comparator, same cutoffs), and records a
+	 * RankDecision for every member - regardless of whether that member changed - into
+	 * decisionsOut, keyed by normalized user_id. Callers diff against the transaction-local
+	 * effective baseline (txCtx.effectiveUserType/effectiveStatus, falling back to
+	 * currentUserType/currentStatus) to decide which members actually need a DB write (rule #14).
+	 *
+	 * Reuses the instance-level rankMembersScratch list (cleared, not reallocated) per rule #20.A.
+	 */
+	private void reRankScopeAndCollectDecisions(String modeKey, String scopeKey,
+			Map<String, RankDecision> decisionsOut, TransactionContext txCtx) {
+		String memberKey = modeKey + "|" + scopeKey;
+		Set<String> memberIds = scopeMembership.get(memberKey);
+		if (memberIds == null || memberIds.isEmpty())
+			return;
+
+		rankMembersScratch.clear();
+		for (String id : memberIds) {
+			UserState st = stateBuffer.get(id);
+			// re_flag: only users with re_flag IS NULL (effective and stored) may take part in ranking,
+			// so flagged / unexpected / unresolved users never influence others' ranks.
+			if (st != null && st.reFlag == null && st.dbReFlag == null && st.userRowFlag == null && modeKey.equals(st.userMode))
+				rankMembersScratch.add(st);
+		}
+		if (rankMembersScratch.isEmpty())
+			return;
+
+		// Same comparator as V3/buildRankDecisions: login_time descending, user_id ascending tie-break.
+		Collections.sort(rankMembersScratch, new Comparator<UserState>() {
+			@Override
+			public int compare(UserState a, UserState b) {
+				String la = a.loginTime;
+				String lb = b.loginTime;
+				if (isBlank(la) && isBlank(lb))
+					return a.userId.compareTo(b.userId);
+				if (isBlank(la))
+					return 1;
+				if (isBlank(lb))
+					return -1;
+				int cmp = lb.compareTo(la);
+				if (cmp != 0)
+					return cmp;
+				return a.userId.compareTo(b.userId);
+			}
+		});
+
+		int maxCount = USER_MODE_MAX_COUNT.get(modeKey).intValue();
+
+		for (int i = 0; i < rankMembersScratch.size(); i++) {
+			UserState st = rankMembersScratch.get(i);
+			RankDecision decision;
+			if ("IA".equals(modeKey)) {
+				if (i == 0) {
+					decision = new RankDecision("IAU_1", STATUS_TESTBED);
+				} else if (i == 1) {
+					decision = new RankDecision("IAU_2", STATUS_TESTBED);
+				} else {
+					decision = new RankDecision("IA", STATUS_MIGRATION_IN_ACTIVE);
+				}
+			} else {
+				if (i < maxCount) {
+					decision = new RankDecision(modeKey, STATUS_TESTBED);
+				} else {
+					decision = new RankDecision(modeKey, STATUS_MIGRATION_IN_ACTIVE);
+				}
+			}
+			decisionsOut.put(normalizeKey(st.userId), decision);
+		}
+	}
+
+	/**
+	 * Seeds the ranking state buffer from re_user_bkp_1710_v3_copy's current rows (rule #13: "current DB
+	 * state"). Because this table has no top-level bc_organisation/region_code/user_branch_id/
+	 * login_time columns, those fields are read back out of the row's metadata jsonb - the same
+	 * flat key/value structure buildMetadataJson()/addAllMetadata() populate from the original
+	 * source row. user_mode is likewise read from metadata (it is the raw source field; V3/UPDATE
+	 * never persist a separate "user_mode" column, only the derived user_type).
+	 *
+	 * AMBIGUITY (flagged per rule #21.6): any existing DB row whose metadata is missing user_mode,
+	 * bc_organisation, or login_time cannot be placed into a ranking scope at all and is excluded
+	 * from ranking population reconstruction - logged as a warning. There is no other source for
+	 * these fields in the supplied schema.
+	 *
+	 * re_flag: each stored user's flag comes from its actual reporting_entity_id relationship. A user
+	 * with NULL / dangling reporting_entity_id gets RE_FLAG_UNKNOWN (fail closed).
+	 */
+	private void seedStateBufferFromDb(EtlReport report) {
+		String sql = "SELECT u.user_id, u.user_type, u.status, u.active, u.metadata, u.reporting_entity_id, "
+				+ "u.dsc_id, u.key_cloak_user_id, u.re_flag AS user_re_flag, re.id AS matched_re_id, re.re_flag "
+				+ "FROM " + TARGET_TABLE + " u LEFT JOIN re_mgmt.reporting_entity_pview_bkp_1610 re ON re.id = u.reporting_entity_id";
+		Connection conn = null;
+		PreparedStatement ps = null;
+		ResultSet rs = null;
+		int skippedNoScope = 0;
+
+		try {
+			conn = DriverManager.getConnection(pgUrl, pgUser, pgPass);
+			conn.setAutoCommit(false); // lets the driver stream the whole table in chunks (fetch size)
+			ps = conn.prepareStatement(sql);
+			ps.setFetchSize(5000);
+			rs = ps.executeQuery();
+
+			while (rs.next()) {
+				String userId = rs.getString("user_id");
+				if (isBlank(userId))
+					continue;
+
+				Map<String, String> meta = new LinkedHashMap<String, String>();
+				String metaJson = rs.getString("metadata");
+				if (!isBlank(metaJson))
+					parseFlatJsonObject(metaJson.trim(), meta);
+
+				String seededReId = rs.getString("reporting_entity_id");
+				if (!isBlank(seededReId))
+					orgIdsInTable.add(normalizeKey(seededReId));
+
+				UserState st = new UserState();
+				st.userId = userId;
+				st.currentUserType = rs.getString("user_type");
+				st.currentStatus = rs.getString("status");
+				st.protectedRecord = (rs.getString("dsc_id") != null && rs.getString("key_cloak_user_id") != null)
+						|| isProtectedStatus(st.currentStatus);
+				st.reFlag = rs.getString("matched_re_id") == null ? RE_FLAG_UNKNOWN : rs.getString("re_flag");
+				st.dbReFlag = st.reFlag;
+				st.userRowFlag = rs.getString("user_re_flag");
+				boolean activeVal = rs.getBoolean("active");
+				st.currentActive = rs.wasNull() ? null : Boolean.toString(activeVal);
+
+				String userMode = meta.get("user_mode");
+				String bcOrg = meta.get("bc_organisation");
+				String userStatus = meta.get("user_status");
+				String loginTime = meta.get("login_time");
+
+				String storedType = st.currentUserType == null ? "" : st.currentUserType.trim().toUpperCase();
+				String modeKey = isBlank(userMode) ? null : userMode.trim().toUpperCase();
+				// Rows without ranking metadata: derive mode from user_type and fi_code from reporting_entity_id
+				if (modeKey == null && IN_SCOPE_USER_TYPES.contains(storedType))
+					modeKey = storedType.startsWith("IAU") ? "IA" : storedType;
+				if (isBlank(bcOrg) && !isBlank(rs.getString("reporting_entity_id")))
+					bcOrg = fiCodeByReId.get(normalizeKey(rs.getString("reporting_entity_id")));
+				st.hasDsc = rs.getString("dsc_id") != null;
+				st.reId = isBlank(seededReId) ? null : normalizeKey(seededReId);
+				if (st.userRowFlag != null && st.reId != null)
+					frozenReIds.add(st.reId);
+				if ("IA".equals(storedType) || "IAU_1".equals(storedType) || "IAU_2".equals(storedType)) {
+					String famFi = isBlank(seededReId) ? null : fiCodeByReId.get(normalizeKey(seededReId));
+					if (isBlank(famFi))
+						famFi = bcOrg;
+					if (!isBlank(famFi)) {
+						List<String> fam = iaFamilyByFi.get(normalizeKey(famFi));
+						if (fam == null) {
+							fam = new ArrayList<String>();
+							iaFamilyByFi.put(normalizeKey(famFi), fam);
+						}
+						fam.add(normalizeKey(userId));
+					}
+				}
+				{
+					String seatFi = fiCodeByReId.get(normalizeKey(rs.getString("reporting_entity_id")));
+					if (isBlank(seatFi))
+						seatFi = bcOrg;
+					boolean isIau = "IAU_1".equals(storedType) || "IAU_2".equals(storedType);
+					if (!isBlank(seatFi) && (isIau || "IA".equals(storedType))) {
+						String stat = st.currentStatus == null ? "" : st.currentStatus.trim().toUpperCase();
+						boolean inactive = "DEACTIVATED".equals(stat) || "MIGRATION_IN_ACTIVE".equals(stat)
+								|| "IN_ACTIVE".equals(stat);
+						boolean frozen = st.hasDsc || st.userRowFlag != null || st.reFlag != null || st.protectedRecord;
+						boolean slotOccupied = isIau && (!inactive || frozen);
+						boolean seatUsed = slotOccupied || STATUS_TESTBED.equals(stat) || st.hasDsc;
+						String fk = normalizeKey(seatFi);
+						if (slotOccupied) {
+							Set<String> taken = iauTypesTakenByFi.get(fk);
+							if (taken == null) {
+								taken = new HashSet<String>();
+								iauTypesTakenByFi.put(fk, taken);
+							}
+							taken.add(storedType);
+						}
+						if (seatUsed) {
+							Integer n = iaSeatsUsedByFi.get(fk);
+							iaSeatsUsedByFi.put(fk, Integer.valueOf(n == null ? 1 : n.intValue() + 1));
+						}
+					}
+				}
+				// A stored TESTBED / DSC-configured row of a handled type occupies a seat of its scope.
+				boolean seatHolder = IN_SCOPE_USER_TYPES.contains(storedType)
+						&& (STATUS_TESTBED.equalsIgnoreCase(st.currentStatus == null ? "" : st.currentStatus.trim()) || st.hasDsc);
+				boolean rankEligibleMode = modeKey != null && USER_MODE_MAX_COUNT.containsKey(modeKey);
+				boolean rankEligibleStatus = seatHolder
+						|| (!isBlank(userStatus) && RANKED_STATUSES.contains(userStatus.trim()));
+
+				if ((st.protectedRecord && !seatHolder) || st.reFlag != null || !rankEligibleMode || !rankEligibleStatus
+						|| isBlank(bcOrg)) {
+					// Not currently rank-eligible (or insufficient metadata to place it in a scope, or its
+					// reporting entity is flagged/unresolved) - still buffer its known current state so a
+					// future event that touches this user_id starts from the right baseline (and so the
+					// event gate can see its stored re_flag), but do not add it to any scope membership set.
+					st.userMode = null;
+					stateBuffer.put(normalizeKey(userId), st);
+					if (st.reFlag == null && rankEligibleMode && rankEligibleStatus && isBlank(bcOrg))
+						skippedNoScope++;
+					continue;
+				}
+
+				st.userMode = modeKey;
+				st.userStatus = isBlank(userStatus) ? "" : userStatus.trim();
+				st.bcOrganisation = bcOrg;
+				st.regionCode = meta.get("region_code");
+				st.userBranchId = meta.get("user_branch_id");
+				st.loginTime = loginTime;
+
+				stateBuffer.put(normalizeKey(userId), st);
+
+				String memberKey = modeKey + "|" + st.scopeKey(modeKey);
+				Set<String> members = scopeMembership.get(memberKey);
+				if (members == null) {
+					members = new HashSet<String>();
+					scopeMembership.put(memberKey, members);
+				}
+				members.add(normalizeKey(userId));
+			}
+		} catch (Exception e) {
+			log("WARN", "Ranking state buffer seed failed: " + e.getMessage(), null, "LOOKUP_LOAD");
+		} finally {
+			closeQuietly(rs);
+			closeQuietly(ps);
+			closeQuietly(conn);
+		}
+
+		if (skippedNoScope > 0) {
+			log("WARN", "DB rows rank-eligible by status but missing bc_organisation/user_mode/login_time in "
+					+ "metadata (cannot reconstruct ranking scope) | Count=" + skippedNoScope, null,
+					"RANK_SEED_INCOMPLETE");
+		}
+	}
+
+	/**
+	 * After a successful direct row UPDATE, records this user's just-applied user_type/status/
+	 * active into the TRANSACTION-LOCAL overlay (NOT directly into UserState.current*), per rule
+	 * #10/#11: the write has executed but the enclosing chunk has not yet COMMITted, so it is not
+	 * yet safe to call it "committed". commitChunk() promotes this into the real committed baseline
+	 * once COMMIT actually succeeds. The passed-in snapshot lets this write be undone in isolation
+	 * (via TransactionContext.restoreEvent()) if a later statement within the SAME event fails.
+	 */
+	private void recordAppliedState(String userId, Map<String, String> resolved, TransactionContext txCtx,
+			TransactionContext.EventStateSnapshot txSnapshot) {
+		UserState st = stateBuffer.get(normalizeKey(userId));
+		if (st == null)
+			return;
+		String userType = resolved.containsKey("user_type") ? resolved.get("user_type") : st.currentUserType;
+		String status = resolved.get("status");
+		if (status == null)
+			status = txCtx.effectiveStatus(st);
+		String active = resolved.get("active");
+		if (active == null)
+			active = txCtx.effectiveActive(st);
+		txCtx.recordSuccess(txSnapshot, normalizeKey(userId), userType, status, active);
+	}
+
+	/**
+	 * POST-MIGRATION STATUS UPDATE STEP.
+	 *
+	 * Runs after the full migration/update phase completes. For every ELIGIBLE row whose
+	 * user_type is IA / IU / IRA / IRU / IBU (re_flag IS NULL and the user-mutation guard are
+	 * re-checked in the UPDATE itself):
+	 *   - metadata.previous_status = current (raw) status
+	 *   - status = DEACTIVATED
+	 * but only for rows still holding a status in STATUSES_TO_DEACTIVATE (DELETED, REJECTED,
+	 * ACTIVATION_PENDING, ACTIVATION_REJECTED, DELETION_PENDING, IN_ACTIVE, MIGRATION_IN_ACTIVE).
+	 * TESTBED and DEACTIVATED rows are untouched, so previous_status is never overwritten twice.
+	 */
+	private boolean applyPostMigrationStatusUpdate() {
+		log("INFO", "========================================", null, "STATUS_UPDATE_START");
+		log("INFO", "POST-MIGRATION STATUS UPDATE STARTING", null, "STATUS_UPDATE_START");
+		log("INFO", "========================================", null, "STATUS_UPDATE_START");
+
+		StringBuilder inList = new StringBuilder();
+		for (String s : STATUSES_TO_DEACTIVATE) {
+			if (inList.length() > 0)
+				inList.append(",");
+			inList.append("'").append(s).append("'");
+		}
+
+		// re_user_bkp_1710 has no previous_status column: the old status goes into metadata first
+		// (key previous_status; a V3 'previousStatus' value is reused when present), then status is
+		// collapsed to DEACTIVATED. Rows that already carry metadata.previous_status (set by the
+		// event path) are left alone so the value is never overwritten.
+		String sql = "UPDATE " + TARGET_TABLE + " u SET metadata = COALESCE(u.metadata, '{}'::jsonb) "
+				+ "|| jsonb_build_object('previous_status', COALESCE(u.metadata->>'previousStatus', u.status)), "
+				+ "status = '" + STATUS_DEACTIVATED + "' "
+				+ "WHERE u.user_type IN ('IA','IU','IRA','IRU','IBU') AND u.status IN (" + inList + ") AND "
+				+ "(u.metadata IS NULL OR u.metadata->>'previous_status' IS NULL) AND "
+				+ "lower(u.user_id) = ANY (?) AND "
+				+ RE_FLAG_ELIGIBLE_GUARD + " AND " + USER_MUTATION_GUARD;
+
+		// Only the users this run actually updated - never the whole table (other users exist).
+		if (touchedUserIds.isEmpty()) {
+			log("INFO", "Rows status-updated: 0 (no user was updated in this run)", null, "STATUS_UPDATE_SUMMARY");
+			return true;
+		}
+
+		int updated = 0;
+		try (Connection conn = DriverManager.getConnection(pgUrl, pgUser, pgPass);
+				PreparedStatement ps = conn.prepareStatement(sql)) {
+			conn.setAutoCommit(false);
+			List<String> ids = new ArrayList<String>(touchedUserIds);
+			for (int from = 0; from < ids.size(); from += 5000) {
+				List<String> part = ids.subList(from, Math.min(ids.size(), from + 5000));
+				ps.setArray(1, conn.createArrayOf("varchar", part.toArray(new String[0])));
+				updated += ps.executeUpdate();
+			}
+			conn.commit();
+		} catch (Exception e) {
+			log("ERROR", "Post-migration status update failed: " + e.getMessage(), null, "STATUS_UPDATE_ERROR");
+			return false;
+		}
+
+		log("INFO", "Rows status-updated: " + updated, null, "STATUS_UPDATE_SUMMARY");
+		log("INFO", "========================================", null, "STATUS_UPDATE_END");
+		log("INFO", "POST-MIGRATION STATUS UPDATE COMPLETED", null, "STATUS_UPDATE_END");
+		log("INFO", "========================================", null, "STATUS_UPDATE_END");
+		return true;
+	}
+
+	/**
+	 * Splits executeBatch() results into {applied, blocked}. SUCCESS_NO_INFO is treated as applied
+	 * (the driver cannot tell); 0 means the WHERE / re_flag guard matched nothing.
+	 */
+	private int[] countBatchResults(int[] results) {
+		int applied = 0;
+		int blocked = 0;
+		if (results == null)
+			return new int[] { 0, 0 };
+		for (int r : results) {
+			if (r == 0)
+				blocked++;
+			else
+				applied++;
+		}
+		return new int[] { applied, blocked };
+	}
+
+	/**
+	 * Post-migration duplicate email/mobile correction, per reporting entity, NO user = the only reference.
+	 *   - IAU_1 / IAU_2 email equal to the NO email (case-insensitive) -> "<user_type>.<email>"
+	 *   - e-mail: IAU_1 / IAU_2 are NOT compared with each other (NO only)
+	 *   - mobile: IAU_2 equal to the IAU_1 mobile also gets a new number (IAU_1 keeps its own)
+	 *   - idempotent / self-repairing: the comparison uses the email WITHOUT any old "IAU_x." prefix, so a
+	 *     prefix that no longer matches the NO email (or the wrong slot's prefix) is removed / corrected
+	 *   - IAU mobile (mobile / mobile_number / mobile_no) equal to any NO mobile -> new number from the
+	 *     sequence (continues after the highest number already handed out, starting at 6000001111)
+	 *   - frozen REs (re_flag on any user row, or on the RE) and protected rows (ACTIVE /
+	 *     SUSPENDED_BY_SYSTEM, dsc_id + key_cloak_user_id) are never changed; NO / HOI never change.
+	 */
+	public boolean correctDuplicateEmailMobile() {
+		log("INFO", "---------------- DUPLICATE EMAIL/MOBILE CORRECTION (NO user only) ----------------", null,
+				"DEDUP_START");
+
+		String selectSql = "SELECT u.user_id, u.user_type, u.reporting_entity_id, u.email, u.mobile, u.mobile_number, "
+				+ "u.mobile_no, u.status, u.re_flag, u.dsc_id, u.key_cloak_user_id FROM " + TARGET_TABLE + " u "
+				+ "WHERE u.user_type IN ('NO','IAU_1','IAU_2')";
+		String frozenSql = "SELECT DISTINCT u.reporting_entity_id FROM " + TARGET_TABLE + " u WHERE u.re_flag IS NOT NULL "
+				+ "AND u.reporting_entity_id IS NOT NULL UNION SELECT re.id FROM re_mgmt.reporting_entity_pview_bkp_1610 re "
+				+ "WHERE re.re_flag IS NOT NULL";
+		String maxSeqSql = "SELECT max(m) FROM (SELECT mobile AS m FROM " + TARGET_TABLE + " UNION ALL SELECT mobile_no FROM "
+				+ TARGET_TABLE + ") x WHERE m ~ '^60000[0-9]{5}$'";
+
+		Map<String, List<Map<String, String>>> reGroups = new LinkedHashMap<String, List<Map<String, String>>>();
+		Set<String> frozen = new HashSet<String>();
+		long nextMobile = 6000001111L;
+
+		try (Connection conn = DriverManager.getConnection(pgUrl, pgUser, pgPass)) {
+			try (PreparedStatement ps = conn.prepareStatement(frozenSql); ResultSet rs = ps.executeQuery()) {
+				while (rs.next())
+					if (rs.getString(1) != null)
+						frozen.add(normalizeKey(rs.getString(1)));
+			}
+			try (PreparedStatement ps = conn.prepareStatement(maxSeqSql); ResultSet rs = ps.executeQuery()) {
+				if (rs.next() && rs.getString(1) != null)
+					nextMobile = Math.max(nextMobile, Long.parseLong(rs.getString(1).trim()) + 1);
+			}
+			try (PreparedStatement ps = conn.prepareStatement(selectSql); ResultSet rs = ps.executeQuery()) {
+				while (rs.next()) {
+					String reId = rs.getString("reporting_entity_id");
+					if (isBlank(reId))
+						continue;
+					Map<String, String> record = new HashMap<String, String>();
+					for (String c : new String[] { "user_id", "user_type", "email", "mobile", "mobile_number", "mobile_no",
+							"status", "re_flag", "dsc_id", "key_cloak_user_id" })
+						record.put(c, rs.getString(c));
+					String key = normalizeKey(reId);
+					List<Map<String, String>> list = reGroups.get(key);
+					if (list == null) {
+						list = new ArrayList<Map<String, String>>();
+						reGroups.put(key, list);
+					}
+					list.add(record);
+				}
+			}
+		} catch (Exception e) {
+			log("ERROR", "Failed to load users for duplicate correction: " + e.getMessage(), null, "DEDUP_ERROR");
+			return false;
+		}
+
+		String updateSql = "UPDATE " + TARGET_TABLE + " u SET email = ?, mobile = COALESCE(?, u.mobile), "
+				+ "mobile_number = COALESCE(?, u.mobile_number), mobile_no = COALESCE(?, u.mobile_no) WHERE u.user_id = ? AND "
+				+ RE_FLAG_ELIGIBLE_GUARD + " AND " + USER_MUTATION_GUARD;
+
+		int prefixed = 0, prefixFixed = 0, mobileCorrected = 0, frozenSkipped = 0, guardBlockedCount = 0;
+		try (Connection conn = DriverManager.getConnection(pgUrl, pgUser, pgPass)) {
+			conn.setAutoCommit(false);
+			try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
+				for (Map.Entry<String, List<Map<String, String>>> reEntry : reGroups.entrySet()) {
+					Set<String> noEmails = new HashSet<String>();
+					Set<String> noMobiles = new HashSet<String>();
+					List<Map<String, String>> iauUsers = new ArrayList<Map<String, String>>();
+					for (Map<String, String> m : reEntry.getValue()) {
+						String type = m.get("user_type") == null ? "" : m.get("user_type").trim().toUpperCase();
+						if ("NO".equals(type)) {
+							if (!isBlank(m.get("email")))
+								noEmails.add(effectiveEmail(stripIauPrefix(m.get("email"))));
+							for (String c : new String[] { "mobile", "mobile_number", "mobile_no" })
+								if (!isBlank(m.get(c)))
+									noMobiles.add(m.get(c).trim());
+						} else {
+							iauUsers.add(m);
+						}
+					}
+					if (iauUsers.isEmpty())
+						continue;
+					if (frozen.contains(reEntry.getKey())) {
+						frozenSkipped += iauUsers.size();
+						continue;
+					}
+					// IAU_1 first, so IAU_2 can be compared with the (final) IAU_1 mobile.
+					Collections.sort(iauUsers, new Comparator<Map<String, String>>() {
+						@Override
+						public int compare(Map<String, String> a, Map<String, String> b) {
+							return String.valueOf(a.get("user_type")).compareToIgnoreCase(String.valueOf(b.get("user_type")));
+						}
+					});
+					Set<String> iau1Mobiles = new HashSet<String>();
+					for (Map<String, String> iau : iauUsers) {
+						String status = iau.get("status") == null ? "" : iau.get("status").trim().toUpperCase();
+						boolean editable = iau.get("re_flag") == null && !"ACTIVE".equals(status)
+								&& !"SUSPENDED_BY_SYSTEM".equals(status)
+								&& !(iau.get("dsc_id") != null && iau.get("key_cloak_user_id") != null);
+						if (!editable) {
+								addIau1Mobiles(iau1Mobiles, iau);
+								continue;
+						}
+						String userType = iau.get("user_type").trim().toUpperCase();
+						String cur = iau.get("email");
+						String base = stripIauPrefix(cur);
+						boolean clash = !isBlank(base) && noEmails.contains(effectiveEmail(base));
+						boolean hasPrefix = cur != null && !cur.trim().equals(base);
+						String desired;
+						if (isBlank(base))
+							desired = cur;
+						else if (clash)
+							desired = userType + "." + base.trim().toLowerCase(); // canonical: upper prefix, lower address
+						else if (hasPrefix)
+							desired = base.trim().toLowerCase(); // prefix no longer needed -> plain address
+						else
+							desired = cur; // no clash, no prefix: leave the email exactly as it is
+						boolean emailChanged = !safeEquals(desired, cur);
+
+						boolean mobileClash = false;
+						for (String c : new String[] { "mobile", "mobile_number", "mobile_no" })
+							if (!isBlank(iau.get(c)) && noMobiles.contains(iau.get(c).trim()))
+								mobileClash = true;
+						// IAU_2 whose mobile equals the IAU_1 mobile gets a new number too (IAU_1 keeps its own).
+							if ("IAU_2".equals(userType))
+								for (String c : new String[] { "mobile", "mobile_number", "mobile_no" })
+									if (!isBlank(iau.get(c)) && iau1Mobiles.contains(iau.get(c).trim()))
+										mobileClash = true;
+							String newMobile = mobileClash ? String.valueOf(nextMobile++) : null;
+							if ("IAU_1".equals(userType) && isLiveIauStatus(status)) {
+								if (newMobile != null)
+									iau1Mobiles.add(newMobile);
+								else
+									addIau1Mobiles(iau1Mobiles, iau);
+							}
+
+						if (!emailChanged && newMobile == null)
+							continue;
+						ps.setString(1, desired);
+						ps.setString(2, newMobile);
+						ps.setString(3, newMobile);
+						ps.setString(4, newMobile);
+						ps.setString(5, iau.get("user_id"));
+						ps.addBatch();
+						if (emailChanged && clash) {
+							prefixed++;
+							audit.group("DEDUP - IAU email prefixed (same as NO email)", iau.get("user_id"));
+						} else if (emailChanged) {
+							prefixFixed++;
+							audit.group("DEDUP - wrong IAU email prefix removed / corrected", iau.get("user_id"));
+						}
+						if (newMobile != null) {
+							mobileCorrected++;
+							audit.group("DEDUP - IAU mobile renumbered (same as NO or IAU_1 mobile)", iau.get("user_id"));
+						}
+					}
+				}
+				int[] res = ps.executeBatch();
+				conn.commit();
+				guardBlockedCount += countBatchResults(res)[1];
+			}
+		} catch (Exception e) {
+			log("ERROR", "Failed to apply duplicate correction: " + e.getMessage(), null, "DEDUP_ERROR");
+			return false;
+		}
+
+		if (guardBlockedCount > 0)
+			log("WARN", "Duplicate-correction rows refused by the DB guard: " + guardBlockedCount, null, "RE_FLAG_GUARD_BLOCKED");
+		log("INFO", "Emails prefixed: " + prefixed + " | wrong prefixes fixed: " + prefixFixed + " | mobiles renumbered: "
+				+ mobileCorrected + " | IAU rows in frozen REs left alone: " + frozenSkipped, null, "DEDUP_SUMMARY");
+		return true;
+	}
+
+	private boolean isLiveIauStatus(String status) {
+		String s = status == null ? "" : status.trim().toUpperCase();
+		return !("DEACTIVATED".equals(s) || "MIGRATION_IN_ACTIVE".equals(s) || "IN_ACTIVE".equals(s));
+	}
+
+	/** Adds the mobile values of a live IAU_1 row to the set IAU_2 is compared with. */
+	private void addIau1Mobiles(Set<String> target, Map<String, String> iau) {
+		String type = iau.get("user_type") == null ? "" : iau.get("user_type").trim().toUpperCase();
+		if (!"IAU_1".equals(type) || !isLiveIauStatus(iau.get("status")))
+			return;
+		for (String c : new String[] { "mobile", "mobile_number", "mobile_no" })
+			if (!isBlank(iau.get(c)))
+				target.add(iau.get(c).trim());
+	}
+
+	/** "IAU_1.x@y" / "IAU_2.IAU_1.x@y" -> "x@y" (any number of leading IAU_1. / IAU_2. prefixes). */
+	private String stripIauPrefix(String email) {
+		if (email == null)
+			return null;
+		String e = email.trim();
+		while (e.length() > 6 && e.substring(0, 6).equalsIgnoreCase("IAU_1.") || e.length() > 6
+				&& e.substring(0, 6).equalsIgnoreCase("IAU_2."))
+			e = e.substring(6);
+		return e;
+	}
+
+	private String effectiveEmail(String email) {
+		if (isBlank(email))
+			return "";
+		return email.trim().toLowerCase();
+	}
+
+	private String effectiveMobile(Map<String, String> record) {
+		if (record == null)
+			return null;
+		return firstNonBlank(record.get("mobile"), record.get("mobile_number"), record.get("mobile_no"));
+	}
+
+	private String mapFinalStatus(String status) {
+		if (isBlank(status))
+			return status;
+		String s = status.trim();
+		if (STATUSES_TO_DEACTIVATE.contains(s))
+			return STATUS_DEACTIVATED;
+		if (STATUS_TESTBED.equals(s))
+			return STATUS_TESTBED;
+		if (STATUS_DEACTIVATED.equals(s))
+			return STATUS_DEACTIVATED;
+		return s;
+	}
+
+	private boolean isProtectedStatus(String status) {
+		return status != null && ("ACTIVE".equalsIgnoreCase(status.trim())
+				|| "SUSPENDED_BY_SYSTEM".equalsIgnoreCase(status.trim()));
+	}
+
+	private void parseFlatJsonObject(String json, Map<String, String> out) {
+		String body = json.trim();
+		if (body.length() >= 2 && body.charAt(0) == '{' && body.charAt(body.length() - 1) == '}') {
+			body = body.substring(1, body.length() - 1);
+		}
+		int i = 0;
+		int len = body.length();
+		while (i < len) {
+			while (i < len && (body.charAt(i) == ',' || Character.isWhitespace(body.charAt(i))))
+				i++;
+			if (i >= len)
+				break;
+			if (body.charAt(i) != '"')
+				break;
+			StringBuilder key = new StringBuilder();
+			i++;
+			while (i < len && body.charAt(i) != '"') {
+				if (body.charAt(i) == '\\' && i + 1 < len) {
+					key.append(unescapeJsonChar(body.charAt(i + 1)));
+					i += 2;
+				} else {
+					key.append(body.charAt(i));
+					i++;
+				}
+			}
+			i++; // closing quote
+			while (i < len && (body.charAt(i) == ':' || Character.isWhitespace(body.charAt(i))))
+				i++;
+			if (i < len && body.charAt(i) == 'n' && body.startsWith("null", i)) {
+				out.put(key.toString(), null);
+				i += 4;
+				continue;
+			}
+			if (i >= len || body.charAt(i) != '"') {
+				int depth = 0;
+				while (i < len && !(body.charAt(i) == ',' && depth == 0)) {
+					if (body.charAt(i) == '{' || body.charAt(i) == '[')
+						depth++;
+					if (body.charAt(i) == '}' || body.charAt(i) == ']')
+						depth--;
+					i++;
+				}
+				continue;
+			}
+			StringBuilder val = new StringBuilder();
+			i++;
+			while (i < len && body.charAt(i) != '"') {
+				if (body.charAt(i) == '\\' && i + 1 < len) {
+					val.append(unescapeJsonChar(body.charAt(i + 1)));
+					i += 2;
+				} else {
+					val.append(body.charAt(i));
+					i++;
+				}
+			}
+			i++; // closing quote
+			out.put(key.toString(), val.toString());
+		}
+	}
+
+	private char unescapeJsonChar(char escaped) {
+		switch (escaped) {
+		case 'r':
+			return '\r';
+		case 'n':
+			return '\n';
+		case '"':
+			return '"';
+		case '\\':
+			return '\\';
+		default:
+			return escaped;
+		}
+	}
+
+	/**
+	 * Builds the scope key used to group rows for ranking, per role:
+	 *   IA / IAU / IU : fiCode (bc_organisation)
+	 *   IRA / IRU     : fiCode (bc_organisation) + regionCode (region_code)
+	 *   IBU           : fiCode (bc_organisation) + regionCode (region_code) + branchCode (user_branch_id)
+	 * (V3 source-of-truth rule, unchanged.)
+	 */
+	private String buildScopeKey(String modeKey, Map<String, String> row) {
+		return buildScopeKeyStatic(modeKey, get(row, "bc_organisation"), get(row, "region_code"),
+				get(row, "user_branch_id"));
+	}
+
+	static String buildScopeKeyStatic(String modeKey, String bcOrganisation, String regionCode, String userBranchId) {
+		String fiCode = normalizeKeyStatic(bcOrganisation);
+
+		if ("IRA".equals(modeKey) || "IRU".equals(modeKey)) {
+			return fiCode + "|" + normalizeKeyStatic(regionCode);
+		}
+		if ("IBU".equals(modeKey)) {
+			return fiCode + "|" + normalizeKeyStatic(regionCode) + "|" + normalizeKeyStatic(userBranchId);
+		}
+		return fiCode;
+	}
+
+	private static String normalizeKeyStatic(String key) {
+		if (key == null)
+			return "";
+		return key.trim().toLowerCase();
+	}
+
+	/**
+	 * Rule #4 pre-validation: IRA/IRU require a valid region_code in re_mgmt.region_pview_bkp_1610.
+	 * IBU additionally requires a valid user_branch_id in re_mgmt.branch_pview_bkp_1610 (scoped to
+	 * that region). IA/IU are not subject to this check and always pass.
+	 */
+	private boolean passesRegionBranchValidation(String modeKey, Map<String, String> row,
+			Map<String, String> regionLookup, Map<String, String> branchLookup) {
+		if (!"IRA".equals(modeKey) && !"IRU".equals(modeKey) && !"IBU".equals(modeKey)) {
+			return true;
+		}
+
+		String fiCode = get(row, "bc_organisation");
+		String regionCode = get(row, "region_code");
+		if (isBlank(fiCode) || isBlank(regionCode)) {
+			return false;
+		}
+
+		// region_code is only unique WITHIN an FI, not globally, so the lookup key must be
+		// scoped by fiCode (matches buildScopeKey's IRA/IRU/IBU scoping).
+		String regionKey = normalizeKey(fiCode) + "|" + normalizeKey(regionCode);
+		if (regionLookup == null || !regionLookup.containsKey(regionKey)) {
+			return false;
+		}
+
+		if (!"IBU".equals(modeKey)) {
+			return true;
+		}
+
+		String branchCode = get(row, "user_branch_id");
+		if (isBlank(branchCode)) {
+			return false;
+		}
+
+		// branch_code is likewise only unique within a region/FI, so scope by fiCode+regionCode.
+		String branchKey = normalizeKey(fiCode) + "|" + normalizeKey(regionCode) + "|" + normalizeKey(branchCode);
+		if (branchLookup == null || !branchLookup.containsKey(branchKey)) {
+			return false;
+		}
+
+		// Ensure the branch actually belongs to the validated region (region_code match).
+		String branchRegionCode = branchLookup.get(branchKey);
+		return normalizeKey(regionCode).equals(branchRegionCode);
+	}
+
+	private Map<String, String> resolveRow(Map<String, String> row, Map<String, String> reLookup,
+			Map<String, Map<String, String>> addressLookup, Map<String, Map<String, String>> userAddressCsvLookup,
+			Map<String, Map<String, String>> userDetailsLookup, DatatypeWarnAccumulator warns,
+			RankDecision rankDecision) {
+		String userId = get(row, "user_id");
+		String bcOrg = get(row, "bc_organisation");
+		String userMode = get(row, "user_mode");
+		String rawStatus = get(row, "user_status");
+
+		Map<String, String> addressMetadata = lookupRowByUserId(addressLookup, userId);
+		Map<String, String> addressCsvRow = lookupRowByUserId(userAddressCsvLookup, userId);
+		Map<String, String> detailsRow = lookupRowByUserId(userDetailsLookup, userId);
+
+		String mappedType;
+		if (rankDecision != null) {
+			mappedType = rankDecision.userType;
+		} else {
+			mappedType = mapUserType(userMode, bcOrg, rawStatus);
+		}
+
+		// Status (final rules):
+		//   - source codes 1,2,4,6,7,12,20 are the testbed statuses -> TESTBED / active, unless the seats
+		//     are already taken (or region/branch invalid) -> DEACTIVATED (see buildSeatDecision)
+		//   - every other code (0,3,8,13,14,15 ...) -> DEACTIVATED
+		// Before a row is deactivated, the status it came with (code mapped via mapOperationalStatus,
+		// e.g. 4 -> LOCKED) is put into metadata.previous_status. No status is written when the source
+		// code is blank/unknown-empty.
+		String originalStatus = mapOperationalStatus(rawStatus);
+		String finalStatus;
+		String previousStatus = null;
+		if (isBlank(originalStatus)) {
+			finalStatus = null;
+		} else if (RANKED_STATUSES.contains(rawStatus == null ? "" : rawStatus.trim())) {
+			boolean seatLost = rankDecision != null && rankDecision.statusOverride != null
+					&& !STATUS_TESTBED.equals(rankDecision.statusOverride);
+			finalStatus = seatLost ? STATUS_DEACTIVATED : STATUS_TESTBED;
+		} else {
+			finalStatus = STATUS_DEACTIVATED;
+		}
+		if (STATUS_DEACTIVATED.equals(finalStatus)) {
+			previousStatus = originalStatus;
+		}
+		String statusToWrite = finalStatus;
+
+		// active is derived solely from the final status, not raw source status.
+		String activeStr = finalStatus == null ? null : Boolean.toString(STATUS_TESTBED.equals(finalStatus));
+
+		String reUuid = resolveReportingEntityId(bcOrg, reLookup);
+		if (!isBlank(bcOrg) && isBlank(reUuid)) {
+			warns.record("reporting_entity_id[LOOKUP_MISS]", bcOrg);
+		}
+
+		String countryCode = firstNonBlank(get(row, "country_code"), "+91");
+		String gender = mapGender(get(row, "gender"));
+		String title = mapTitle(get(row, "title"));
+
+		// Mapped columns + where each value came from (address DB -> address CSV -> master CSV etc.).
+		Map<String, String> src = new HashMap<String, String>();
+		String landlineNumber = pick(src, "landline",
+				new String[] { "address_db.phone2", "address_csv.phone2", "master.pstn_phone_no" },
+				get(addressMetadata, "phone2"), get(addressCsvRow, "phone2"), get(row, "pstn_phone_no"));
+		String mobileNo = pick(src, "mobile",
+				new String[] { "address_db.phone3", "address_csv.phone3", "master.gsm_phone_no" },
+				get(addressMetadata, "phone3"), get(addressCsvRow, "phone3"), get(row, "gsm_phone_no"));
+		String email = pick(src, "email",
+				new String[] { "address_csv.email_id", "address_db.email_id", "master.email" },
+				get(addressCsvRow, "email_id"), get(addressMetadata, "email_id"), get(row, "email"));
+		if (!isBlank(email))
+			email = email.toLowerCase();
+
+		String rawCitizenship = pick(src, "citizenship", new String[] { "details_csv.citizenship", "master.citizenship" },
+				get(detailsRow, "citizenship"), get(row, "citizenship"));
+		if (rawCitizenship == null)
+			src.put("__src_citizenship", "default(Indian)");
+		String citizenship = normalizeCitizenship(rawCitizenship);
+		// Designation comes ONLY from the details mapping CSV. The old fallback to user_certificate_name filled
+		// the designation with the user's own NAME (the certificate name), so it was removed.
+		String designation = pick(src, "designation", new String[] { "details_csv.designation" },
+				get(detailsRow, "designation"));
+
+		String createdBy = firstNonBlank(get(row, "user_created_by"), get(row, "created_by"), "SYSTEM");
+		String updatedBy = firstNonBlank(get(row, "last_updated_by"), get(row, "updated_by"), "SYSTEM");
+
+		String ckycNo = null;
+		String ckycNumber = firstNonBlank(get(row, "ckyc_number"), get(detailsRow, "ckyc_number"));
+
+		String proofOfIdentityNumber = null;
+		String proofOfIdentity = null;
+
+		String employeeCode = pick(src, "employee_code",
+				new String[] { "details_csv.employee_code", "details_csv.employ_code" },
+				get(detailsRow, "employee_code"), get(detailsRow, "employ_code"));
+		String keyCloakUserId = null;
+
+		String officeAddress = "Same as registered address";
+
+		Boolean sameRegistrationCorrespondenceAddress = null;
+		if (!isBlank(mappedType) && mappedType.startsWith("IAU")) {
+			sameRegistrationCorrespondenceAddress = Boolean.TRUE;
+		}
+
+		String workflowStatus = "APPROVED";
+
+		Map<String, String> nameFields = resolveNameFields(row);
+
+		String metadataJson = buildMetadataJson(row, addressMetadata, detailsRow, mappedType, finalStatus,
+				previousStatus);
+
+		Map<String, String> r = new LinkedHashMap<String, String>();
+
+		r.put("active", activeStr);
+		r.put("dob", get(row, "date_of_birth"));
+		r.put("same_registration_correspondence_address", sameRegistrationCorrespondenceAddress == null ? null
+				: sameRegistrationCorrespondenceAddress.toString());
+		r.put("created_at", get(row, "user_created_date"));
+		r.put("updated_at",
+				firstNonBlank(get(row, "last_updated_date"), get(row, "updated_at"), get(row, "user_created_date")));
+		r.put("version", firstNonBlank(get(row, "version_no"), "0"));
+		r.put("country_code", countryCode);
+		r.put("gender", gender);
+		r.put("title", title);
+		r.put("dsc_id", null);
+		r.put("reporting_entity_id", reUuid);
+		r.put("landline_number", landlineNumber);
+		r.put("mobile", mobileNo);
+		r.put("mobile_number", mobileNo);
+		r.put("user_type", mappedType);
+		r.put("citizenship", citizenship);
+		r.put("ckyc_no", ckycNo);
+		r.put("created_by", createdBy);
+		r.put("designation", designation);
+		r.put("employee_id", null);
+		r.put("proof_of_identity_number", proofOfIdentityNumber);
+		r.put("updated_by", updatedBy);
+		r.put("email", email);
+		r.put("first_name", nameFields.get("first_name"));
+		r.put("last_name", nameFields.get("last_name"));
+		r.put("middle_name", nameFields.get("middle_name"));
+		r.put("key_cloak_user_id", keyCloakUserId);
+		r.put("user_id", userId);
+		r.put("ckyc_number", ckycNumber);
+		r.put("employ_code", employeeCode);
+		r.put("office_address", officeAddress);
+		r.put("board_resoluation_date", null);
+		r.put("authorization_letter", null);
+		r.put("date_of_authorization", null);
+		r.put("status", statusToWrite);
+		r.put("workflow_status", workflowStatus);
+		r.put("operation", "INSERT");
+		r.put("requester_reason", null);
+		r.put("approver_reason", null);
+		r.put("date_of_authorizarion", null);
+		r.put("phone_number", firstNonBlank(mobileNo, landlineNumber));
+		r.put("pending_actions", "{}");
+		r.put("proof_of_identity", proofOfIdentity);
+		r.put("landline", landlineNumber);
+		r.put("board_resolution_date", null);
+		r.put("metadata", metadataJson);
+		r.put("mobile_country_code", countryCode);
+		r.put("poi_type", null);
+		r.put("poi_no", null);
+		r.put("mobile_no", mobileNo);
+		// transient keys (never bound to SQL): audit only
+		r.putAll(src);
+		r.put("__prev_status", previousStatus);
+		if (STATUS_DEACTIVATED.equals(finalStatus)) {
+			if (rankDecision != null && rankDecision.reason != null)
+				r.put("__deact_reason", rankDecision.reason);
+			else if (RANKED_STATUSES.contains(rawStatus == null ? "" : rawStatus.trim()))
+				r.put("__deact_reason", "ranked out by login_time (new org)");
+			else
+				r.put("__deact_reason", "inactive source status " + originalStatus);
+		}
+
+		return r;
+	}
+
+	private Map<String, String> resolveNameFields(Map<String, String> row) {
+
+		Map<String, String> nameMap = new HashMap<String, String>();
+
+		String firstName = get(row, "first_name");
+		String middleName = get(row, "middle_name");
+		String lastName = get(row, "last_name");
+
+		if (!isBlank(lastName) || !isBlank(middleName)) {
+			String cleanedFirst = firstName;
+			if (!isBlank(cleanedFirst)) {
+				if (!isBlank(lastName))
+					cleanedFirst = stripTrailingToken(cleanedFirst, lastName);
+				if (!isBlank(middleName))
+					cleanedFirst = stripTrailingToken(cleanedFirst, middleName);
+			}
+			nameMap.put("first_name", isBlank(cleanedFirst) ? firstName : cleanedFirst);
+			nameMap.put("middle_name", middleName);
+			nameMap.put("last_name", lastName);
+			return nameMap;
+		}
+
+		if (isBlank(firstName)) {
+			nameMap.put("first_name", null);
+			nameMap.put("middle_name", null);
+			nameMap.put("last_name", null);
+			return nameMap;
+		}
+
+		String[] parts = firstName.trim().split("\\s+");
+
+		if (parts.length == 1) {
+			nameMap.put("first_name", parts[0]);
+			nameMap.put("middle_name", null);
+			nameMap.put("last_name", null);
+		} else if (parts.length == 2) {
+			nameMap.put("first_name", parts[0]);
+			nameMap.put("middle_name", null);
+			nameMap.put("last_name", parts[1]);
+		} else {
+			StringBuilder middle = new StringBuilder();
+			for (int i = 1; i < parts.length - 1; i++) {
+				if (middle.length() > 0)
+					middle.append(" ");
+				middle.append(parts[i]);
+			}
+			nameMap.put("first_name", parts[0]);
+			nameMap.put("middle_name", middle.toString());
+			nameMap.put("last_name", parts[parts.length - 1]);
+		}
+
+		return nameMap;
+	}
+
+	private String stripTrailingToken(String source, String token) {
+		if (isBlank(source) || isBlank(token))
+			return source;
+		String trimmedSource = source.trim();
+		String trimmedToken = token.trim();
+		if (trimmedSource.length() < trimmedToken.length())
+			return source;
+
+		String tail = trimmedSource.substring(trimmedSource.length() - trimmedToken.length());
+		if (!tail.equalsIgnoreCase(trimmedToken))
+			return source;
+
+		int boundaryIdx = trimmedSource.length() - trimmedToken.length() - 1;
+		if (boundaryIdx >= 0 && trimmedSource.charAt(boundaryIdx) != ' ')
+			return source;
+
+		return trimmedSource.substring(0, trimmedSource.length() - trimmedToken.length()).trim();
+	}
+
+	/**
+	 * Binds the resolved row for the incoming-row's own UPDATE. user_type IS bound (rule #10/#17
+	 * require ranking-derived user_type to actually reach the DB). user_id remains excluded from
+	 * the SET clause (it is the WHERE key).
+	 */
+	private void bindResolvedUpdateRow(PreparedStatement ps, Map<String, String> resolved, DatatypeWarnAccumulator warns)
+			throws SQLException {
+		int paramIndex = 1;
+		for (int i = 0; i < INSERT_COLUMNS.size(); i++) {
+			String col = INSERT_COLUMNS.get(i);
+			if ("user_id".equalsIgnoreCase(col)) {
+				continue;
+			}
+			ColumnMeta meta = COLUMN_REGISTRY.get(col);
+			TypeBinder.bind(ps, paramIndex++, meta, resolved.get(col), warns);
+		}
+
+		ps.setString(paramIndex, resolved.get("user_id"));
+	}
+
+	private void validateSourceHeaders(List<String> headers) {
+		Set<String> headerSet = new HashSet<>(headers);
+		for (String expected : EXPECTED_SOURCE_COLS) {
+			if (!headerSet.contains(expected)) {
+				log("WARN", "MISSING_SOURCE_COLUMN=" + expected + " | Dependent target columns will receive NULL", null,
+						"MAPPING_WARN");
+			}
+		}
+	}
+
+	private String mapUserType(String userMode, String bcOrganisation, String rawStatus) {
+		if (isBlank(userMode))
+			return null;
+		String mode = userMode.trim().toUpperCase();
+		if ("IBA".equals(mode))
+			return "SKIP";
+		// IA never becomes IAU_1 / IAU_2 here (that used to follow CSV file order). IAU slots are handed out
+		// only by the IA slot decision (active users, newest login_time first).
+		return mode;
+	}
+
+	private String mapOperationalStatus(String userStatus) {
+		if (isBlank(userStatus))
+			return null;
+		switch (userStatus.trim()) {
+		case "0":
+			return "IN_ACTIVE";
+		case "1":
+			return "TESTBED";
+		case "2":
+			return "NOT_LOGGED";
+		case "3":
+			return "DELETED";
+		case "4":
+			return "LOCKED";
+		case "6":
+			return "ALREADY_LOGGED";
+		case "7":
+			return "PENDING_AUTHORIZE";
+		case "8":
+			return "REJECTED";
+		case "12":
+			return "DIGITAL_CERTIFICATE_REGISTRATION";
+		case "13":
+			return "DELETION_PENDING";
+		case "14":
+			return "ACTIVATION_PENDING";
+		case "15":
+			return "ACTIVATION_REJECTED";
+		case "20":
+			return "TERMS_AND_CONDITIONS";
+		default:
+			return userStatus.trim();
+		}
+	}
+
+	private String mapTitle(String rawTitle) {
+		if (isBlank(rawTitle))
+			return null;
+		switch (rawTitle.trim()) {
+		case "01":
+			return "Mr.";
+		case "02":
+			return "Mrs.";
+		case "03":
+			return "Ms.";
+		case "04":
+			return "Ms.";
+		default:
+			return null;
+		}
+	}
+
+	private String mapGender(String rawGender) {
+		if (isBlank(rawGender))
+			return null;
+		switch (rawGender.trim().toUpperCase()) {
+		case "M":
+		case "MALE":
+			return "Male";
+		case "F":
+		case "FEMALE":
+			return "Female";
+		case "T":
+		case "TRANSGENDER":
+			return "Transgender";
+		default:
+			return null; // unknown codes such as 'N' are not a gender: never written
+		}
+	}
+
+	private String normalizeCitizenship(String rawCitizenship) {
+		if (isBlank(rawCitizenship))
+			return "Indian";
+		String c = rawCitizenship.trim().toLowerCase();
+		// details CSV carries country codes ("IN"); V3 maps anything containing "india" to Indian.
+		if (c.contains("india") || "in".equals(c) || "ind".equals(c))
+			return "Indian";
+		return rawCitizenship.trim();
+	}
+
+	private String buildMetadataJson(Map<String, String> row, Map<String, String> addressMetadata,
+			Map<String, String> detailsRow, String mappedType, String finalStatus, String previousStatus) {
+		Map<String, String> meta = new LinkedHashMap<String, String>();
+		addAllMetadata(meta, row);
+		addAllMetadata(meta, addressMetadata);
+		addAllMetadata(meta, detailsRow);
+		meta.put("mapped_user_type", mappedType == null ? "" : mappedType);
+		meta.put("mapped_operational_status", finalStatus == null ? "" : finalStatus);
+		if (!isBlank(previousStatus)) {
+			// Only rows being deactivated carry previous_status (status they had before DEACTIVATED).
+			meta.put("previous_status", previousStatus);
+		}
+		return toJson(meta);
+	}
+
+	private void addAllMetadata(Map<String, String> target, Map<String, String> source) {
+		if (source == null)
+			return;
+		for (Map.Entry<String, String> e : source.entrySet()) {
+			String key = normalizeKey(e.getKey());
+			if (isBlank(key))
+				continue;
+			if (!target.containsKey(key))
+				target.put(key, cleanMetadataValue(e.getValue()));
+		}
+	}
+
+	private String cleanMetadataValue(String value) {
+		if (value == null)
+			return "";
+		String v = value.trim();
+		if (v.isEmpty() || "\\N".equals(v) || "NULL".equalsIgnoreCase(v) || "null".equalsIgnoreCase(v))
+			return "";
+		return v;
+	}
+
+	/**
+	 * user_type is included in the SET clause so ranking-derived type transitions (rule #10/#16/
+	 * #17) actually reach the DB for the incoming row itself. Ranking-propagated updates to OTHER
+	 * users go through the reusable rankPs statement instead, executed immediately per event.
+	 *
+	 * re_flag: the target table is aliased "u" and the WHERE clause carries the database-side
+	 * eligibility guard, so even a Java-side bug cannot update a user whose stored reporting entity
+	 * does not have re_flag IS NULL. SET-clause column references remain unqualified (they refer to
+	 * the target row), which is valid with an alias.
+	 */
+	private String buildUpdateSql() {
+		StringBuilder sb = new StringBuilder("UPDATE " + TARGET_TABLE + " u SET ");
+		boolean first = true;
+
+		for (String col : INSERT_COLUMNS) {
+			if ("user_id".equalsIgnoreCase(col)) {
+				continue;
+			}
+
+			if (!first) {
+				sb.append(", ");
+			}
+			first = false;
+			sb.append(col).append(" = ");
+
+			SqlType t = COLUMN_REGISTRY.get(col).sqlType;
+			if ("gender".equals(col)) {
+				// A new value wins; without one, an old value is kept only if it is a real gender (junk like 'N' is cleared).
+				sb.append("COALESCE(?, CASE WHEN u.gender IN ('Male','Female','Transgender') THEN u.gender END)");
+				continue;
+			}
+			if ("same_registration_correspondence_address".equals(col)) {
+				// true only for IAU users: a user that stops being IAU_1 / IAU_2 loses the flag.
+				sb.append("CASE WHEN CAST(? AS boolean) IS TRUE THEN true WHEN u.user_type LIKE 'IAU%' THEN NULL "
+						+ "ELSE u.same_registration_correspondence_address END");
+				continue;
+			}
+			if (t == SqlType.UUID)
+				sb.append("COALESCE(CAST(? AS uuid), ").append(col).append(")");
+			else if (t == SqlType.JSONB)
+				sb.append("COALESCE(CAST(? AS jsonb), ").append(col).append(")");
+			else
+				sb.append("COALESCE(?, ").append(col).append(")");
+		}
+
+		sb.append(" WHERE u.user_id = ? AND ").append(RE_FLAG_ELIGIBLE_GUARD)
+				.append(" AND ").append(USER_MUTATION_GUARD)
+				.append(" AND ").append(USER_TYPE_SCOPE_GUARD);
+		return sb.toString();
+	}
+
+	/**
+	 * INSERT for a user that is not in re_user yet. Same column order as the UPDATE (all columns except
+	 * user_id, then user_id), so bindResolvedUpdateRow() binds it unchanged. ON CONFLICT keeps it safe.
+	 */
+	private String buildInsertSql() {
+		StringBuilder cols = new StringBuilder();
+		StringBuilder vals = new StringBuilder();
+		for (String col : INSERT_COLUMNS) {
+			if ("user_id".equalsIgnoreCase(col))
+				continue;
+			if (cols.length() > 0) {
+				cols.append(", ");
+				vals.append(", ");
+			}
+			cols.append(col);
+			SqlType t = COLUMN_REGISTRY.get(col).sqlType;
+			if (t == SqlType.UUID)
+				vals.append("CAST(? AS uuid)");
+			else if (t == SqlType.JSONB)
+				vals.append("CAST(? AS jsonb)");
+			else
+				vals.append("?");
+		}
+		cols.append(", user_id");
+		vals.append(", ?");
+		return "INSERT INTO " + TARGET_TABLE + " (" + cols + ") VALUES (" + vals
+				+ ") ON CONFLICT (user_id) DO NOTHING";
+	}
+
+	private Map<String, String> loadReportingEntityLookup() {
+		Map<String, String> map = new HashMap<String, String>();
+		Map<String, Integer> fiCodeCounts = new HashMap<String, Integer>();
+		reFlagByFiCode.clear();
+		ambiguousFiCodes.clear();
+		fiCodeByReId.clear();
+		String sql = "SELECT fi_code, id, re_flag FROM re_mgmt.reporting_entity_pview_bkp_1610";
+		Connection conn = null;
+		PreparedStatement ps = null;
+		ResultSet rs = null;
+
+		try {
+			conn = DriverManager.getConnection(pgUrl, pgUser, pgPass);
+			ps = conn.prepareStatement(sql);
+			rs = ps.executeQuery();
+			while (rs.next()) {
+				String fi = rs.getString("fi_code");
+				String id = rs.getString("id");
+				if (isBlank(fi) || isBlank(id)) continue;
+				String key = normalizeKey(fi);
+				int count = fiCodeCounts.containsKey(key) ? fiCodeCounts.get(key).intValue() + 1 : 1;
+				fiCodeCounts.put(key, Integer.valueOf(count));
+				if (count > 1) {
+					ambiguousFiCodes.add(key);
+					map.remove(key);
+					reFlagByFiCode.remove(key);
+					continue;
+				}
+				try {
+					java.util.UUID.fromString(id.trim());
+					map.put(key, id.trim());
+					fiCodeByReId.put(normalizeKey(id), key);
+					// HashMap supports a null value, preserving the distinction between a known NULL
+					// flag and a missing/ambiguous FI code.
+					reFlagByFiCode.put(key, rs.getString("re_flag"));
+				} catch (IllegalArgumentException ex) {
+					log("WARN", "Invalid reporting-entity UUID; lookup row skipped | fi_code=" + fi, null, "LOOKUP_LOAD");
+				}
+			}
+		} catch (Exception e) {
+			// Fail closed: with an empty/partial flag map every unresolved FI code is RE_FLAG_UNKNOWN.
+			log("WARN", "Reporting-entity lookup failed: " + e.getMessage(), null, "LOOKUP_LOAD");
+		} finally {
+			closeQuietly(rs);
+			closeQuietly(ps);
+			closeQuietly(conn);
+		}
+		for (String key : ambiguousFiCodes) {
+			map.remove(key);
+			reFlagByFiCode.remove(key);
+			log("WARN", "Duplicate fi_code in reporting_entity_pview_bkp_1610; lookup marked ambiguous and its users will not be processed | fi_code=" + key,
+					null, "LOOKUP_AMBIGUOUS_FI_CODE");
+		}
+		for (Map.Entry<String, String> e : reFlagByFiCode.entrySet()) {
+			String flag = e.getValue();
+			if (flag != null && !isExplicitFalseReFlag(flag)) {
+				log("WARN", "Unexpected non-null re_flag; users of this entity will not be processed | fi_code=" + e.getKey()
+						+ " | re_flag=" + flag, null, "RE_FLAG_UNEXPECTED");
+			}
+		}
+		return map;
+	}
+
+	/**
+	 * Returns: null when the FI code resolves to exactly one reporting entity whose re_flag IS NULL
+	 * (the ONLY eligible outcome); the raw non-null re_flag string otherwise; RE_FLAG_AMBIGUOUS for
+	 * duplicate fi_code rows; RE_FLAG_UNKNOWN for blank/unresolved FI codes.
+	 */
+	private String lookupReFlag(String fiCode) {
+		String key = normalizeKey(fiCode);
+		if (isBlank(key)) return RE_FLAG_UNKNOWN;
+		if (ambiguousFiCodes.contains(key)) return RE_FLAG_AMBIGUOUS;
+		if (!reFlagByFiCode.containsKey(key)) return RE_FLAG_UNKNOWN;
+		return reFlagByFiCode.get(key);
+	}
+
+	private boolean isExplicitFalseReFlag(String flag) {
+		return flag != null && "false".equalsIgnoreCase(flag.trim());
+	}
+
+	/**
+	 * Maps a flag value to a skip reason, or null if (and only if) the flag IS NULL (eligible).
+	 * Any non-NULL value that is not an explicit 'false' ('true', 't', 'f', '0', '', unknown text)
+	 * is NOT eligible.
+	 */
+	private String reFlagSkipReason(String flag) {
+		if (flag == null)
+			return null;
+		if (RE_FLAG_AMBIGUOUS.equals(flag))
+			return "RE_FLAG_AMBIGUOUS_SKIP";
+		if (RE_FLAG_UNKNOWN.equals(flag))
+			return "RE_FLAG_UNKNOWN_SKIP";
+		if (isExplicitFalseReFlag(flag))
+			return "RE_FLAG_FALSE_SKIP";
+		return "RE_FLAG_UNEXPECTED_SKIP";
+	}
+
+	private String describeFlag(String flag) {
+		if (flag == null)
+			return "<NULL>";
+		if (RE_FLAG_AMBIGUOUS.equals(flag))
+			return "<AMBIGUOUS_FI_CODE>";
+		if (RE_FLAG_UNKNOWN.equals(flag))
+			return "<UNRESOLVED>";
+		return "'" + flag + "'";
+	}
+
+	private Map<String, String> loadRegionLookup() {
+		Map<String, String> map = new HashMap<String, String>();
+		// region_code is only unique WITHIN an FI, not globally (e.g. code '01' is reused by
+		// hundreds of different reporting entities), so the lookup key must include fi_code.
+		// Joins to reporting_entity_test to get the fi_code for each region.
+		String sql = "SELECT re.fi_code AS fi_code, r.region_code AS region_code, r.id AS id "
+				+ "FROM re_mgmt.region_pview_bkp_1610 r "
+				+ "JOIN re_mgmt.reporting_entity_pview_bkp_1610 re ON re.id = r.reporting_entity_id";
+		Connection conn = null;
+		PreparedStatement ps = null;
+		ResultSet rs = null;
+
+		try {
+			conn = DriverManager.getConnection(pgUrl, pgUser, pgPass);
+			ps = conn.prepareStatement(sql);
+			rs = ps.executeQuery();
+
+			while (rs.next()) {
+				String fiCode = rs.getString("fi_code");
+				String code = rs.getString("region_code");
+				String id = rs.getString("id");
+				if (!isBlank(fiCode) && !isBlank(code) && !isBlank(id)) {
+					map.put(normalizeKey(fiCode) + "|" + normalizeKey(code), id.trim());
+				}
+			}
+		} catch (Exception e) {
+			log("WARN", "Region lookup failed: " + e.getMessage(), null, "LOOKUP_LOAD");
+		} finally {
+			closeQuietly(rs);
+			closeQuietly(ps);
+			closeQuietly(conn);
+		}
+
+		return map;
+	}
+
+	private Map<String, String> loadBranchLookup() {
+		Map<String, String> map = new HashMap<String, String>();
+		String sql = "SELECT re.fi_code AS fi_code, rg.region_code AS region_code, b.branch_code AS branch_code "
+				+ "FROM re_mgmt.branch_pview_bkp_1610 b "
+				+ "JOIN re_mgmt.region_pview_bkp_1610 rg ON rg.id = b.region_id "
+				+ "JOIN re_mgmt.reporting_entity_pview_bkp_1610 re ON re.id = rg.reporting_entity_id";
+		Connection conn = null;
+		PreparedStatement ps = null;
+		ResultSet rs = null;
+
+		try {
+			conn = DriverManager.getConnection(pgUrl, pgUser, pgPass);
+			ps = conn.prepareStatement(sql);
+			rs = ps.executeQuery();
+
+			while (rs.next()) {
+				String fiCode = rs.getString("fi_code");
+				String regionCode = rs.getString("region_code");
+				String branchCode = rs.getString("branch_code");
+				if (!isBlank(fiCode) && !isBlank(regionCode) && !isBlank(branchCode)) {
+					String key = normalizeKey(fiCode) + "|" + normalizeKey(regionCode) + "|" + normalizeKey(branchCode);
+					map.put(key, normalizeKey(regionCode));
+				}
+			}
+		} catch (Exception e) {
+			log("WARN", "Branch lookup failed: " + e.getMessage(), null, "LOOKUP_LOAD");
+		} finally {
+			closeQuietly(rs);
+			closeQuietly(ps);
+			closeQuietly(conn);
+		}
+
+		return map;
+	}
+
+	private Map<String, Map<String, String>> loadAddressLookup() {
+		Map<String, Map<String, String>> map = new HashMap<String, Map<String, String>>();
+		String sql = "SELECT metadata->>'user_id' AS user_id, "
+				+ "metadata->>'phone2' AS phone2, "
+				+ "metadata->>'phone3' AS phone3, "
+				+ "metadata->>'email_id' AS email_id "
+				+ "FROM re_mgmt.address_pview_bkp_1610 "
+				+ "WHERE metadata->>'user_id' IS NOT NULL";
+		Connection conn = null;
+		PreparedStatement ps = null;
+		ResultSet rs = null;
+
+		try {
+			conn = DriverManager.getConnection(pgUrl, pgUser, pgPass);
+			ps = conn.prepareStatement(sql);
+			rs = ps.executeQuery();
+
+			while (rs.next()) {
+				String userId = rs.getString("user_id");
+				if (isBlank(userId))
+					continue;
+
+				Map<String, String> flat = new HashMap<String, String>();
+				flat.put("phone2", cleanValue(rs.getString("phone2")));
+				flat.put("phone3", cleanValue(rs.getString("phone3")));
+				flat.put("email_id", cleanValue(rs.getString("email_id")));
+				map.put(normalizeKey(userId), flat);
+			}
+		} catch (Exception e) {
+			log("WARN", "Address lookup failed: " + e.getMessage(), null, "LOOKUP_LOAD");
+		} finally {
+			closeQuietly(rs);
+			closeQuietly(ps);
+			closeQuietly(conn);
+		}
+
+		return map;
+	}
+
+	private void mergeLookupByUserId(Map<String, Map<String, String>> target, CsvTable table) {
+		if (target == null || table == null || table.rows == null)
+			return;
+		for (Map<String, String> row : table.rows) {
+			String userId = get(row, "user_id");
+			if (isBlank(userId))
+				continue;
+			String key = normalizeKey(userId);
+			Map<String, String> prev = target.get(key);
+			if (prev == null) {
+				target.put(key, new HashMap<String, String>(row));
+				continue;
+			}
+			// Same user_id again (several files / repeated rows). Files are read in file-name (timestamp)
+			// order, so a LATER non-blank value overrides an earlier one (newest wins); a blank never erases.
+			for (Map.Entry<String, String> e : row.entrySet()) {
+				if (!isBlank(cleanValue(e.getValue())))
+					prev.put(e.getKey(), e.getValue());
+			}
+		}
+	}
+
+	private Map<String, String> lookupRowByUserId(Map<String, Map<String, String>> lookup, String userId) {
+		if (lookup == null || isBlank(userId))
+			return null;
+		return lookup.get(normalizeKey(userId));
+	}
+
+	private boolean isUserDetails(CsvTable table) {
+		return table != null && table.hasHeader("user_id")
+				&& (table.hasHeader("citizenship") || table.hasHeader("designation") || table.hasHeader("employee_code")
+						|| table.hasHeader("any_other_info") || table.hasHeader("department")
+						|| table.hasHeader("entered_place") || table.hasHeader("specialisation"));
+	}
+
+	private boolean isUserAddressCsv(CsvTable table) {
+		return table != null && table.hasHeader("user_id")
+				&& (table.hasHeader("email_id") || table.hasHeader("phone2") || table.hasHeader("phone3"));
+	}
+
+	private String resolveReportingEntityId(String bcOrg, Map<String, String> reLookup) {
+		if (isBlank(bcOrg) || reLookup == null || reLookup.isEmpty())
+			return null;
+
+		String key = normalizeKey(bcOrg);
+		String id = reLookup.get(key);
+		if (!isBlank(id))
+			return id;
+
+		for (Map.Entry<String, String> e : reLookup.entrySet()) {
+			if (e.getKey() != null && e.getKey().equalsIgnoreCase(key))
+				return e.getValue();
+		}
+
+		return null;
+	}
+
+	private CsvTable loadCsv(Path file) {
+		try (BufferedReader br = Files.newBufferedReader(file, StandardCharsets.ISO_8859_1)) {
+
+			/*
+			 * Read the header as one logical CSV record.
+			 * A logical record may span multiple physical lines.
+			 */
+			String headerRecord = readCsvRecord(br);
+
+			if (isBlank(headerRecord))
+				return null;
+
+			List<String> rawHeaders = parseDelimitedLine(headerRecord, '|');
+
+			if (rawHeaders.isEmpty())
+				return null;
+
+			List<String> headers = new ArrayList<String>();
+
+			for (String h : rawHeaders)
+				headers.add(normalizeHeader(h));
+
+			List<Map<String, String>> rows = new ArrayList<Map<String, String>>();
+
+			int mismatched = 0;
+			List<String> mismatchIds = new ArrayList<String>();
+
+			String record;
+
+			while ((record = readCsvRecord(br)) != null) {
+
+				if (isBlank(record))
+					continue;
+
+				List<String> vals = parseDelimitedLine(record, '|');
+
+				if (vals.isEmpty())
+					continue;
+
+				/*
+				 * Do NOT shift/drop columns here.
+				 * The source column order is determined strictly by
+				 * the header position.
+				 */
+
+				if (vals.size() != headers.size()) {
+					mismatched++;
+					if (mismatchIds.size() < 5)
+						mismatchIds.add(cleanValue(vals.get(0)));
+				}
+
+				/*
+				 * Pad missing trailing fields with blank values.
+				 */
+				while (vals.size() < headers.size())
+					vals.add("");
+
+				/*
+				 * Ignore anything beyond the header count.
+				 *
+				 * IMPORTANT:
+				 * We do NOT shift the remaining fields.
+				 */
+				if (vals.size() > headers.size())
+					vals = new ArrayList<String>(
+							vals.subList(0, headers.size())
+					);
+
+				Map<String, String> row = new LinkedHashMap<String, String>();
+
+				for (int i = 0; i < headers.size(); i++) {
+
+					String value =
+							i < vals.size()
+									? vals.get(i)
+									: null;
+
+					row.put(
+							headers.get(i),
+							cleanValue(value)
+					);
+				}
+
+				rows.add(row);
+			}
+
+			log("INFO",
+					"Loaded: " + file.getFileName()
+							+ " | Rows=" + rows.size()
+							+ " | Headers=" + headers.size(),
+					null,
+					"CSV_LOAD");
+			if (mismatched > 0)
+				log("WARN", "CSV column-count mismatch | file=" + file.getFileName() + " | rows=" + mismatched
+						+ " | headers=" + headers.size() + " | first user_ids=" + mismatchIds, null,
+						"CSV_SCHEMA_MISMATCH");
+
+			CsvTable table =
+					new CsvTable(file, headers, rows);
+
+			if (isUserMaster(table))
+				validateSourceHeaders(headers);
+
+			return table;
+
+		} catch (Exception e) {
+
+			log("ERROR",
+					"CSV load error: "
+							+ file.getFileName()
+							+ " | " + e.getMessage(),
+					null,
+					"CSV_LOAD");
+
+			return null;
+		}
+	}
+	private String readCsvRecord(BufferedReader br) throws IOException {
+
+		StringBuilder record = new StringBuilder();
+
+		boolean inQuotes = false;
+
+		String line;
+
+		while ((line = br.readLine()) != null) {
+
+			if (record.length() > 0)
+				record.append('\n');
+
+			record.append(line);
+
+			for (int i = 0; i < line.length(); i++) {
+
+				char ch = line.charAt(i);
+
+				/*
+				 * Backslash escaped quote:
+				 *
+				 * \"
+				 */
+				if (ch == '\\'
+						&& i + 1 < line.length()
+						&& line.charAt(i + 1) == '"') {
+
+					i++;
+					continue;
+				}
+
+				/*
+				 * Doubled quote inside quoted value:
+				 *
+				 * ""
+				 */
+				if (ch == '"'
+						&& inQuotes
+						&& i + 1 < line.length()
+						&& line.charAt(i + 1) == '"') {
+
+					i++;
+					continue;
+				}
+
+				if (ch == '"')
+					inQuotes = !inQuotes;
+			}
+
+			/*
+			 * Once quotes are balanced, the complete logical CSV
+			 * record has been read.
+			 */
+			if (!inQuotes)
+				return record.toString();
+		}
+
+		return record.length() == 0
+				? null
+				: record.toString();
+	}
+	
+	private boolean isUserMaster(CsvTable t) {
+		return t.hasHeader("user_id") && t.hasHeader("user_mode") && t.hasHeader("user_status")
+				&& t.hasHeader("bc_organisation") && t.hasHeader("first_name") && t.hasHeader("title");
+	}
+
+	private List<Path> findCsvFiles(Path dir) throws IOException {
+		List<Path> files = new ArrayList<>();
+		try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "*.csv")) {
+			for (Path p : stream)
+				if (Files.isRegularFile(p))
+					files.add(p);
+		}
+		files.sort(Comparator.comparing(p -> p.getFileName().toString().toLowerCase()));
+		return files;
+	}
+
+	private void printEtlReport(EtlReport r) {
+		int totalSkipped = r.skipAcc.total() + r.conflictSkipped;
+		log("INFO", "", null, "ETL_SUMMARY");
+		log("INFO", "ETL SUMMARY REPORT", null, "ETL_SUMMARY");
+		log("INFO", "", null, "ETL_SUMMARY");
+		log("INFO", String.format("Total Source Rows         : %d", r.totalRows), null, "ETL_SUMMARY");
+		log("INFO", String.format("Events Processed           : %d", r.eventsProcessed), null, "ETL_SUMMARY");
+		log("INFO", String.format("Events Failed              : %d", r.eventsFailed), null, "ETL_SUMMARY");
+		log("INFO", String.format("Events Skipped (re_flag)   : %d", r.eventsSkippedReFlag), null, "ETL_SUMMARY");
+		log("INFO", String.format("Updated (direct)           : %d", r.inserted), null, "ETL_SUMMARY");
+		log("INFO", String.format("New users inserted         : %d", r.newUsersInserted), null, "ETL_SUMMARY");
+		log("INFO", String.format("Updated (rank-propagated)  : %d", r.rankPropagatedUpdates), null, "ETL_SUMMARY");
+		log("INFO", String.format("Conflict Skipped           : %d (no matching user_id or re_flag DB guard)", r.conflictSkipped), null,
+				"ETL_SUMMARY");
+		log("INFO", String.format("Other Skipped              : %d", r.skipAcc.total()), null, "ETL_SUMMARY");
+		log("INFO", String.format("Total Skipped              : %d", totalSkipped), null, "ETL_SUMMARY");
+		log("INFO", String.format("Transactions Committed     : %d", r.transactionsCommitted), null, "ETL_SUMMARY");
+		log("INFO", String.format("Transactions Rolled Back   : %d", r.transactionsRolledBack), null, "ETL_SUMMARY");
+		log("INFO", String.format("Batches Executed (legacy)  : %d", r.batchesExecuted), null, "ETL_SUMMARY");
+		log("INFO", String.format("Batches Failed (legacy)    : %d", r.batchesFailed), null, "ETL_SUMMARY");
+		log("INFO", String.format("Execution Time             : %ds", r.elapsedSeconds()), null, "ETL_SUMMARY");
+		if (!r.skipAcc.counts().isEmpty()) {
+			log("INFO", " Skip Reasons ", null, "ETL_SUMMARY");
+			for (Map.Entry<String, Integer> e : r.skipAcc.counts().entrySet())
+				log("INFO", String.format("  %-45s = %d", e.getKey(), e.getValue()), null, "ETL_SUMMARY");
+		}
+		if (!r.dtWarn.isEmpty()) {
+			log("INFO", " Datatype Warnings ", null, "ETL_SUMMARY");
+			for (Map.Entry<String, Integer> e : r.dtWarn.counts().entrySet())
+				log("WARN", String.format("  Column=%-40s Failures=%-8d Samples=%s", e.getKey(), e.getValue(),
+						r.dtWarn.samples().get(e.getKey())), null, "ETL_SUMMARY");
+		}
+		log("INFO", "", null, "ETL_SUMMARY");
+		log("INFO", "USER MIGRATION COMPLETED", null, "APP_END");
+		log("INFO", "", null, "APP_END");
+	}
+
+	private String get(Map<String, String> row, String col) {
+		if (row == null || col == null)
+			return "";
+		return cleanValue(row.get(col.trim().toLowerCase()));
+	}
+
+	private String cleanValue(String v) {
+		if (v == null)
+			return "";
+		v = v.trim();
+		if (v.isEmpty() || "\\N".equals(v) || "\"\"".equals(v) || "NULL".equalsIgnoreCase(v))
+			return "";
+		return v;
+	}
+
+	private String firstNonBlank(String... values) {
+		if (values == null)
+			return null;
+		for (String v : values)
+			if (!isBlank(v))
+				return v.trim();
+		return null;
+	}
+
+	private boolean isBlank(String s) {
+		return s == null || s.trim().isEmpty();
+	}
+
+	private String toJson(Map<String, String> map) {
+		StringBuilder json = new StringBuilder("{");
+		int i = 0;
+		for (Map.Entry<String, String> e : map.entrySet()) {
+			if (i++ > 0)
+				json.append(",");
+			json.append("\"").append(escapeJson(e.getKey())).append("\":");
+			if (e.getValue() == null)
+				json.append("null");
+			else
+				json.append("\"").append(escapeJson(e.getValue())).append("\"");
+		}
+		json.append("}");
+		return json.toString();
+	}
+
+	private String escapeJson(String v) {
+		if (v == null)
+			return "";
+		return v.replace("\\", "\\\\").replace("\"", "\\\"").replace("\r", "\\r").replace("\n", "\\n");
+	}
+
+	private String normalizeHeader(String h) {
+		if (h == null)
+			return "";
+		h = h.trim();
+		if (h.startsWith("\"") && h.endsWith("\"") && h.length() >= 2)
+			h = h.substring(1, h.length() - 1).trim();
+		return h.toLowerCase();
+	}
+
+	private String normalizeKey(String key) {
+		if (key == null)
+			return "";
+		return key.trim().toLowerCase();
+	}
+
+	private void closeQuietly(java.io.Closeable c) {
+		if (c != null) {
+			try {
+				c.close();
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private void closeQuietly(ResultSet rs) {
+		if (rs != null) {
+			try {
+				rs.close();
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private void closeQuietly(PreparedStatement ps) {
+		if (ps != null) {
+			try {
+				ps.close();
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private void closeQuietly(Connection conn) {
+		if (conn != null) {
+			try {
+				conn.close();
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private List<String> parseDelimitedLine(String line, char delimiter) {
+
+		List<String> out = new ArrayList<String>();
+
+		if (line == null)
+			return out;
+
+		StringBuilder cur = new StringBuilder();
+
+		boolean inQuotes = false;
+
+		for (int i = 0; i < line.length(); i++) {
+
+			char ch = line.charAt(i);
+
+			/*
+			 * CSV/source escaping:
+			 *
+			 * \"
+			 */
+			if (ch == '\\'
+					&& i + 1 < line.length()
+					&& line.charAt(i + 1) == '"') {
+
+				cur.append('"');
+				i++;
+				continue;
+			}
+
+			/*
+			 * CSV doubled quote:
+			 *
+			 * ""
+			 */
+			if (ch == '"'
+					&& inQuotes
+					&& i + 1 < line.length()
+					&& line.charAt(i + 1) == '"') {
+
+				cur.append('"');
+				i++;
+				continue;
+			}
+
+			/*
+			 * Opening / closing quote.
+			 *
+			 * The quote itself is not part of the value.
+			 */
+			if (ch == '"') {
+
+				inQuotes = !inQuotes;
+
+				continue;
+			}
+
+			/*
+			 * | is a delimiter ONLY outside a quoted value.
+			 */
+			if (ch == delimiter && !inQuotes) {
+
+				out.add(cur.toString());
+
+				cur.setLength(0);
+
+				continue;
+			}
+
+			cur.append(ch);
+		}
+
+		/*
+		 * Add final field.
+		 */
+		out.add(cur.toString());
+
+		return out;
+	}
+
+	private String typeForColumn(String colKey) {
+		String base = colKey.contains("[") ? colKey.substring(0, colKey.indexOf('[')) : colKey;
+		ColumnMeta meta = COLUMN_REGISTRY.get(base);
+		return meta == null ? "UNKNOWN" : meta.sqlType.name();
+	}
+
+	private void log(String level, String message, String serverIp, String evtType) {
+		String ts = LocalDateTime.now().format(LOG_FMT);
+		StringBuilder sb = new StringBuilder(512);
+		sb.append("Time:").append(ts).append(" [").append(capitalize(level)).append("] ").append("Process_Name: ")
+				.append(PROCESS_NAME).append(" ");
+		if (!isBlank(serverIp))
+			sb.append("Server_IP: ").append(serverIp).append(" ");
+		sb.append("Process_Version: ").append(PROCESS_VERSION).append(" Log_Level: EVT_LOG").append("  EVT_Type: ")
+				.append(evtType != null ? evtType : "NA").append(" Description: ")
+				.append(message != null ? message : "");
+		System.out.println(sb.toString().trim());
+	}
+
+	private String capitalize(String s) {
+		if (s == null || s.isEmpty())
+			return s;
+		return s.substring(0, 1).toUpperCase() + s.substring(1).toLowerCase();
+	}
+
+	// =====================================================================================================
+	// SEAT PLANNER - one rule for every scope (IA/IAU 2 per fi_code, IU 3 per fi_code, IRA 2 and IRU 3 per
+	// fi_code + region_code, IBU 3 per fi_code + region_code + user_branch_id):
+	//   1. HOLDERS keep their seat and are never touched: rows with re_flag set, rows with dsc_id +
+	//      key_cloak_user_id (or a configured dsc_id), ACTIVE / SUSPENDED_BY_SYSTEM rows, rows under a flagged
+	//      or unknown reporting entity. A holder counts only while it is not deactivated.
+	//   2. seats left = limit - holders. Everybody else of the scope competes: active CSV users (last event,
+	//      valid region/branch) AND rows already in the table that are TESTBED (re_flag NULL) even when they
+	//      are not in today's CSV. Newest login_time first (blank last): the first <seats left> get TESTBED,
+	//      the rest DEACTIVATED. IA: winners take the free IAU slot(s), IAU_1 before IAU_2.
+	//   3. No seat left -> every competitor DEACTIVATED. A new scope has no holder -> plain login_time ranking.
+	// =====================================================================================================
+	static final class SeatPlanner {
+		static final Set<String> INACTIVE = new HashSet<String>(Arrays.asList("DEACTIVATED", "MIGRATION_IN_ACTIVE",
+				"IN_ACTIVE", "DELETED", "REJECTED", "ACTIVATION_PENDING", "ACTIVATION_REJECTED", "DELETION_PENDING"));
+
+		static final class Member {
+			String userId; // normalized
+			String rawUserId;
+			String mode;
+			String scope;
+			String login;
+			boolean fromCsv;
+			boolean eligible;
+			String ineligibleStatus; // null = status follows the source code
+			String ineligibleReason;
+			String storedType;
+			String storedStatus;
+		}
+
+		static final class Decision {
+			final String userType;
+			final String status; // TESTBED, MIGRATION_IN_ACTIVE (seat lost) or null (source status decides)
+			final String reason;
+			final Member member;
+
+			Decision(String userType, String status, String reason, Member member) {
+				this.userType = userType;
+				this.status = status;
+				this.reason = reason;
+				this.member = member;
+			}
+		}
+
+		final Map<String, Integer> limits;
+		final Map<String, Integer> heldByScope = new HashMap<String, Integer>();
+		final Map<String, Set<String>> iauTakenByScope = new HashMap<String, Set<String>>();
+		final Map<String, List<Member>> membersByScope = new LinkedHashMap<String, List<Member>>();
+		int holders, competitors, winners, rankedOut, ineligible;
+
+		SeatPlanner(Map<String, Integer> limits) {
+			this.limits = limits;
+		}
+
+		static String n(String s) {
+			return s == null ? "" : s.trim().toLowerCase();
+		}
+
+		static String scopeOf(String mode, String fi, String region, String branch) {
+			if ("IRA".equals(mode) || "IRU".equals(mode))
+				return mode + "|" + n(fi) + "|" + n(region);
+			if ("IBU".equals(mode))
+				return mode + "|" + n(fi) + "|" + n(region) + "|" + n(branch);
+			return mode + "|" + n(fi);
+		}
+
+		static boolean isLive(String status) {
+			return status != null && !status.trim().isEmpty() && !INACTIVE.contains(status.trim().toUpperCase());
+		}
+
+		static String modeOfType(String userType) {
+			String t = userType == null ? "" : userType.trim().toUpperCase();
+			return t.startsWith("IAU") ? "IA" : t;
+		}
+
+		void addHolder(String scope, String storedType) {
+			Integer h = heldByScope.get(scope);
+			heldByScope.put(scope, Integer.valueOf(h == null ? 1 : h.intValue() + 1));
+			String t = storedType == null ? "" : storedType.trim().toUpperCase();
+			if (t.startsWith("IAU")) {
+				Set<String> s = iauTakenByScope.get(scope);
+				if (s == null) {
+					s = new HashSet<String>();
+					iauTakenByScope.put(scope, s);
+				}
+				s.add(t);
+			}
+			holders++;
+		}
+
+		void addMember(Member m) {
+			List<Member> l = membersByScope.get(m.scope);
+			if (l == null) {
+				l = new ArrayList<Member>();
+				membersByScope.put(m.scope, l);
+			}
+			l.add(m);
+		}
+
+		Map<String, Decision> plan() {
+			Map<String, Decision> out = new HashMap<String, Decision>();
+			for (Map.Entry<String, List<Member>> e : membersByScope.entrySet()) {
+				String scope = e.getKey();
+				String mode = scope.substring(0, scope.indexOf('|'));
+				List<Member> comp = new ArrayList<Member>();
+				for (Member m : e.getValue()) {
+					if (m.eligible) {
+						comp.add(m);
+					} else {
+						out.put(m.userId, new Decision("IA".equals(mode) ? "IA" : mode, m.ineligibleStatus, m.ineligibleReason, m));
+						ineligible++;
+					}
+				}
+				Collections.sort(comp, new Comparator<Member>() {
+					@Override
+					public int compare(Member a, Member b) {
+						boolean ba = a.login == null || a.login.trim().isEmpty();
+						boolean bb = b.login == null || b.login.trim().isEmpty();
+						if (ba != bb)
+							return ba ? 1 : -1;
+						int c = ba ? 0 : b.login.trim().compareTo(a.login.trim());
+						return c != 0 ? c : a.userId.compareTo(b.userId);
+					}
+				});
+				competitors += comp.size();
+				Integer held = heldByScope.get(scope);
+				int seatsLeft = Math.max(0, limits.get(mode).intValue() - (held == null ? 0 : held.intValue()));
+				List<String> freeTypes = new ArrayList<String>();
+				if ("IA".equals(mode)) {
+					Set<String> taken = iauTakenByScope.get(scope);
+					for (String t : new String[] { "IAU_1", "IAU_2" })
+						if (taken == null || !taken.contains(t))
+							freeTypes.add(t);
+					seatsLeft = Math.min(seatsLeft, freeTypes.size());
+				}
+				String why = held == null ? "ranked out by login_time" : "seats left " + seatsLeft + " - ranked out by login_time";
+				for (int i = 0; i < comp.size(); i++) {
+					Member m = comp.get(i);
+					if (i < seatsLeft) {
+						out.put(m.userId, new Decision("IA".equals(mode) ? freeTypes.get(i) : mode, "TESTBED", null, m));
+						winners++;
+					} else {
+						out.put(m.userId, new Decision("IA".equals(mode) ? "IA" : mode, "MIGRATION_IN_ACTIVE",
+								seatsLeft == 0 && held != null ? "no seat left (held by re_flag / DSC / ACTIVE users)" : why, m));
+						rankedOut++;
+					}
+				}
+			}
+			return out;
+		}
+	}
+
+	/** Stored rows of the handled user types, read once for the seat planner. */
+	private List<Map<String, String>> loadStoredRowsForSeats() throws SQLException {
+		String sql = "SELECT u.user_id, u.user_type, u.status, u.re_flag, "
+				+ "CASE WHEN u.dsc_id IS NOT NULL THEN 'Y' END AS has_dsc, "
+				+ "CASE WHEN u.key_cloak_user_id IS NOT NULL THEN 'Y' END AS has_kc, "
+				+ "re.fi_code, re.re_flag AS re_level_flag, CASE WHEN re.id IS NULL THEN 'Y' END AS re_missing, "
+				+ "u.metadata->>'bc_organisation' AS bc, u.metadata->>'region_code' AS rc, "
+				+ "u.metadata->>'user_branch_id' AS br, u.metadata->>'login_time' AS lt "
+				+ "FROM " + TARGET_TABLE + " u LEFT JOIN re_mgmt.reporting_entity_pview_bkp_1610 re ON re.id = u.reporting_entity_id "
+				+ "WHERE upper(u.user_type) IN ('IA','IAU_1','IAU_2','IU','IRA','IRU','IBU')";
+		List<Map<String, String>> out = new ArrayList<Map<String, String>>();
+		try (Connection conn = DriverManager.getConnection(pgUrl, pgUser, pgPass)) {
+			conn.setAutoCommit(false);
+			try (PreparedStatement ps = conn.prepareStatement(sql)) {
+				ps.setFetchSize(5000);
+				try (ResultSet rs = ps.executeQuery()) {
+					while (rs.next()) {
+						Map<String, String> r = new HashMap<String, String>();
+						for (String c : new String[] { "user_id", "user_type", "status", "re_flag", "has_dsc", "has_kc", "fi_code",
+								"re_level_flag", "re_missing", "bc", "rc", "br", "lt" })
+							r.put(c, rs.getString(c));
+						out.add(r);
+					}
+				}
+			}
+			conn.rollback();
+		}
+		return out;
+	}
+
+	/** A stored row the run never changes: it keeps its seat (while not deactivated). */
+	private static boolean isSeatHolderRow(Map<String, String> r) {
+		String st = r.get("status") == null ? "" : r.get("status").trim().toUpperCase();
+		return r.get("re_flag") != null || r.get("has_dsc") != null || "ACTIVE".equals(st) || "SUSPENDED_BY_SYSTEM".equals(st)
+				|| r.get("re_level_flag") != null || r.get("re_missing") != null;
+	}
+
+	/**
+	 * Builds the seat plan from the stored rows and the LAST master row of every CSV user.
+	 * Returns user_id (normalized) -> decision; stored-only competitors are in the same map (fromCsv=false).
+	 */
+	private Map<String, SeatPlanner.Decision> planSeats(java.util.Collection<Map<String, String>> lastCsvRows,
+			Map<String, String> reLookup, Map<String, String> regionLookup, Map<String, String> branchLookup) {
+		SeatPlanner p = new SeatPlanner(USER_MODE_MAX_COUNT);
+		List<Map<String, String>> stored;
+		try {
+			stored = loadStoredRowsForSeats();
+		} catch (SQLException e) {
+			log("ERROR", "Seat planner could not read the table: " + e.getMessage(), null, "RANKING");
+			return new HashMap<String, SeatPlanner.Decision>();
+		}
+		Map<String, Map<String, String>> storedById = new HashMap<String, Map<String, String>>();
+		for (Map<String, String> r : stored)
+			if (!isBlank(r.get("user_id")))
+				storedById.put(normalizeKey(r.get("user_id")), r);
+		Set<String> csvIds = new HashSet<String>();
+		for (Map<String, String> row : lastCsvRows)
+			if (!isBlank(get(row, "user_id")))
+				csvIds.add(normalizeKey(get(row, "user_id")));
+
+		// 1) stored rows: holders, and TESTBED rows that are not in today's CSV (they compete too)
+		for (Map<String, String> r : stored) {
+			String uid = normalizeKey(r.get("user_id"));
+			String mode = SeatPlanner.modeOfType(r.get("user_type"));
+			if (!USER_MODE_MAX_COUNT.containsKey(mode))
+				continue;
+			String fi = !isBlank(r.get("fi_code")) ? r.get("fi_code") : r.get("bc");
+			String scope = SeatPlanner.scopeOf(mode, fi, r.get("rc"), r.get("br"));
+			if (isSeatHolderRow(r)) {
+				if (SeatPlanner.isLive(r.get("status")))
+					p.addHolder(scope, r.get("user_type"));
+				continue;
+			}
+			if (csvIds.contains(uid) || !STATUS_TESTBED.equalsIgnoreCase(r.get("status") == null ? "" : r.get("status").trim()))
+				continue;
+			if (isBlank(fi) || (("IRA".equals(mode) || "IRU".equals(mode) || "IBU".equals(mode)) && isBlank(r.get("rc")))
+					|| ("IBU".equals(mode) && isBlank(r.get("br"))))
+				continue; // no complete scope in its metadata: left as it is
+			SeatPlanner.Member m = new SeatPlanner.Member();
+			m.userId = uid;
+			m.rawUserId = r.get("user_id");
+			m.mode = mode;
+			m.scope = scope;
+			m.login = r.get("lt");
+			m.fromCsv = false;
+			m.eligible = true;
+			m.storedType = r.get("user_type");
+			m.storedStatus = r.get("status");
+			p.addMember(m);
+		}
+		// 2) CSV users (last event of each user)
+		for (Map<String, String> row : lastCsvRows) {
+			String uid = normalizeKey(get(row, "user_id"));
+			if (isBlank(uid))
+				continue;
+			String mode = get(row, "user_mode").trim().toUpperCase();
+			if (!USER_MODE_MAX_COUNT.containsKey(mode))
+				continue;
+			Map<String, String> s = storedById.get(uid);
+			if (s != null && isSeatHolderRow(s))
+				continue; // never touched, already counted as a holder
+			String fi = get(row, "bc_organisation");
+			if (isBlank(resolveReportingEntityId(fi, reLookup)))
+				continue; // unknown fi_code: the row is skipped anyway
+			SeatPlanner.Member m = new SeatPlanner.Member();
+			m.userId = uid;
+			m.rawUserId = get(row, "user_id");
+			m.mode = mode;
+			m.scope = SeatPlanner.scopeOf(mode, fi, get(row, "region_code"), get(row, "user_branch_id"));
+			m.login = get(row, "login_time");
+			m.fromCsv = true;
+			m.storedType = s == null ? null : s.get("user_type");
+			m.storedStatus = s == null ? null : s.get("status");
+			boolean activeSrc = RANKED_STATUSES.contains(get(row, "user_status").trim());
+			boolean regionOk = passesRegionBranchValidation(mode, row, regionLookup, branchLookup);
+			m.eligible = activeSrc && regionOk;
+			if (!regionOk) {
+				m.ineligibleStatus = STATUS_MIGRATION_IN_ACTIVE;
+				m.ineligibleReason = "invalid region/branch";
+			}
+			p.addMember(m);
+		}
+		Map<String, SeatPlanner.Decision> plan = p.plan();
+		log("INFO", "Seat plan | scopes=" + p.membersByScope.size() + " | seats held (re_flag/DSC/ACTIVE)=" + p.holders
+				+ " | competing=" + p.competitors + " | TESTBED=" + p.winners + " | ranked out=" + p.rankedOut
+				+ " | inactive/invalid=" + p.ineligible, null, "RANKING");
+		return plan;
+	}
+
+	/**
+	 * Applies the seat plan to stored users that are NOT in today's CSV (only TESTBED rows with re_flag NULL
+	 * compete): a user ranked out becomes DEACTIVATED (previous_status kept in metadata), a winner may move
+	 * between IAU_1 and IAU_2. Guarded in SQL so a re_flag / DSC / ACTIVE row can never be changed.
+	 */
+	private void applySeatPlanToStoredOnlyUsers(Map<String, SeatPlanner.Decision> plan) {
+		String sql = "UPDATE " + TARGET_TABLE + " u SET user_type = ?, status = ?, active = ?, "
+				+ "metadata = CASE WHEN ? = 'DEACTIVATED' THEN COALESCE(u.metadata, '{}'::jsonb) "
+				+ "|| jsonb_build_object('previous_status', u.status, 'deactivation_reason', CAST(? AS text)) ELSE u.metadata END, "
+				+ "same_registration_correspondence_address = CASE WHEN CAST(? AS text) LIKE 'IAU%' THEN true "
+				+ "WHEN u.user_type LIKE 'IAU%' THEN NULL ELSE u.same_registration_correspondence_address END "
+				+ "WHERE u.user_id = ? AND u.re_flag IS NULL AND u.status = 'TESTBED' AND u.dsc_id IS NULL";
+		int deactivated = 0, moved = 0, blocked = 0;
+		try (Connection conn = DriverManager.getConnection(pgUrl, pgUser, pgPass)) {
+			conn.setAutoCommit(false);
+			try (PreparedStatement ps = conn.prepareStatement(sql)) {
+				for (SeatPlanner.Decision d : plan.values()) {
+					if (d.member.fromCsv)
+						continue;
+					String newStatus = STATUS_TESTBED.equals(d.status) ? STATUS_TESTBED : STATUS_DEACTIVATED;
+					String oldType = d.member.storedType == null ? "" : d.member.storedType.trim().toUpperCase();
+					if (STATUS_TESTBED.equals(newStatus) && oldType.equals(d.userType))
+						continue;
+					ps.setString(1, d.userType);
+					ps.setString(2, newStatus);
+					ps.setBoolean(3, STATUS_TESTBED.equals(newStatus));
+					ps.setString(4, newStatus);
+					ps.setString(5, d.reason);
+					ps.setString(6, d.userType);
+					ps.setString(7, d.member.rawUserId);
+					ps.addBatch();
+					if (STATUS_DEACTIVATED.equals(newStatus)) {
+						deactivated++;
+						audit.group("SEAT - stored user ranked out (" + d.reason + ")", d.member.rawUserId);
+					} else {
+						moved++;
+						audit.group("SEAT - stored user slot " + oldType + " -> " + d.userType, d.member.rawUserId);
+					}
+				}
+				for (int r : ps.executeBatch())
+					if (r == 0)
+						blocked++;
+			}
+			conn.commit();
+		} catch (SQLException e) {
+			log("ERROR", "Seat plan for stored users failed: " + e.getMessage(), null, "RANKING");
+			return;
+		}
+		log("INFO", "Seat plan applied to stored users not in CSV | deactivated=" + deactivated + " | IAU slot moved=" + moved
+				+ (blocked > 0 ? " | refused by guard=" + blocked : ""), null, "RANKING");
+	}
+
+}

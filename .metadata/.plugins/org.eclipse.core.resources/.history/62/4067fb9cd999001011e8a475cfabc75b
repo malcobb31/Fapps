@@ -1,0 +1,177 @@
+package ip_parser_v1;
+
+import java.io.*;
+import java.nio.file.*;
+import java.sql.*;
+import java.text.SimpleDateFormat;
+import java.util.*;
+
+public class ip_parser_methods {
+
+    static class TableSummary {
+        String processName;
+        String serverIp;
+        String tableName;
+        Timestamp processStart;
+        Timestamp processEnd;
+        Timestamp tableStart;
+        Timestamp tableEnd;
+        int totalFiles = 0;
+        int filesSuccess = 0;
+        int filesFailed = 0;
+        String tableStatus = "Unknown";
+        String processStatus = "Unknown";
+
+        long getDurationSeconds() {
+            if (tableStart != null && tableEnd != null) {
+                return (tableEnd.getTime() - tableStart.getTime()) / 1000;
+            }
+            return 0;
+        }
+    }
+
+    private static final SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+
+    public void log(String level, String evtType, String message, String serverIP) {
+        Timestamp now = new Timestamp(System.currentTimeMillis());
+        System.out.printf("ALERT - %s --> Process_Name:%s Server_IP:%s Process_Version:1.0.0 Log_Level:%s EVT_Type:%s Description:%s%n",
+                now, "IP_PARSER", serverIP, level, evtType, message);
+    }
+
+    /**
+     * Main parser function: call this from your main
+     */
+    public void parseFile(String csvLogFile, String summaryTable, String dbUrl, String dbUser, String dbPass, String serverIP) {
+        Map<String, TableSummary> summaries = new HashMap<>();
+        String processName = null;
+        Timestamp processStart = null, processEnd = null;
+
+        try {
+            for (String line : Files.readAllLines(Paths.get(csvLogFile))) {
+                if (!line.contains("CSV_TO_PSQL")) continue; // only target process logs
+
+                String[] parts = line.split(" --> ");
+                if (parts.length < 2) continue;
+
+                String timestampStr = parts[0].split("ALERT - ")[1].trim();
+                Timestamp timestamp = new Timestamp(sdf.parse(timestampStr).getTime());
+
+                String[] kvPairs = parts[1].split(" ");
+                Map<String, String> fields = new HashMap<>();
+                for (String kv : kvPairs) {
+                    if (kv.contains(":")) {
+                        String[] kvSplit = kv.split(":", 2);
+                        fields.put(kvSplit[0].trim(), kvSplit[1].trim());
+                    }
+                }
+
+                String evtType = fields.get("EVT_Type");
+                if (processName == null && fields.containsKey("Process_Name")) {
+                    processName = fields.get("Process_Name");
+                }
+
+                switch (evtType) {
+                    case "PROCESS_START":
+                        processStart = timestamp;
+                        break;
+                    case "PROCESS_END":
+                        processEnd = timestamp;
+                        break;
+                    case "TABLE_START": {
+                        String table = fields.get("Description").split("Table:")[1].split(" ")[0].trim();
+                        TableSummary ts = summaries.computeIfAbsent(table, k -> new TableSummary());
+                        ts.processName = processName;
+                        ts.serverIp = serverIP;
+                        ts.tableName = table;
+                        ts.tableStart = timestamp;
+                        ts.processStart = processStart;
+                        break;
+                    }
+                    case "TABLE_END": {
+                        String table = fields.get("Description").split("Table:")[1].split(" ")[0].trim();
+                        TableSummary ts = summaries.get(table);
+                        if (ts != null) {
+                            ts.tableEnd = timestamp;
+                            ts.tableStatus = fields.get("Description").contains("Success") ? "Success" : "Failed";
+                            ts.processEnd = processEnd;
+                            ts.processStatus = ts.tableStatus;
+                        }
+                        break;
+                    }
+                    case "FILE_START": {
+                        String table = fields.get("Description").split("Table:")[1].trim();
+                        TableSummary ts = summaries.computeIfAbsent(table, k -> new TableSummary());
+                        ts.totalFiles++;
+                        break;
+                    }
+                    case "FILE_END": {
+                        String desc = fields.get("Description");
+                        if (desc.contains("Table:")) {
+                            String table = desc.split("Table:")[1].trim();
+                            TableSummary ts = summaries.get(table);
+                            if (ts != null) {
+                                if (desc.toLowerCase().contains("fail")) ts.filesFailed++;
+                                else ts.filesSuccess++;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Only keep tables that processed files
+            List<TableSummary> finalSummaries = new ArrayList<>();
+            for (TableSummary ts : summaries.values()) {
+                if (ts.totalFiles > 0) finalSummaries.add(ts);
+            }
+
+            // Insert into DB
+            try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass)) {
+                for (TableSummary ts : finalSummaries) {
+                    String sql = "INSERT INTO " + summaryTable +
+                            " (process_name, server_ip, process_start, process_end, table_name, " +
+                            "table_start, table_end, total_files, files_success, files_failed, " +
+                            "table_status, process_status, duration_seconds) " +
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, ts.processName);
+                        ps.setString(2, ts.serverIp);
+                        ps.setTimestamp(3, ts.processStart);
+                        ps.setTimestamp(4, ts.processEnd);
+                        ps.setString(5, ts.tableName);
+                        ps.setTimestamp(6, ts.tableStart);
+                        ps.setTimestamp(7, ts.tableEnd);
+                        ps.setInt(8, ts.totalFiles);
+                        ps.setInt(9, ts.filesSuccess);
+                        ps.setInt(10, ts.filesFailed);
+                        ps.setString(11, ts.tableStatus);
+                        ps.setString(12, ts.processStatus);
+                        ps.setLong(13, ts.getDurationSeconds());
+                        ps.executeUpdate();
+                    }
+                }
+            }
+
+            // Print summaries
+            for (TableSummary ts : finalSummaries) {
+                System.out.println("---- Summary for table: " + ts.tableName + " ----");
+                System.out.println("process_name: " + ts.processName);
+                System.out.println("server_ip: " + ts.serverIp);
+                System.out.println("process_start: " + (ts.processStart != null ? sdf.format(ts.processStart) : "N/A"));
+                System.out.println("process_end: " + (ts.processEnd != null ? sdf.format(ts.processEnd) : "N/A"));
+                System.out.println("table_start: " + (ts.tableStart != null ? sdf.format(ts.tableStart) : "N/A"));
+                System.out.println("table_end: " + (ts.tableEnd != null ? sdf.format(ts.tableEnd) : "N/A"));
+                System.out.println("total_files: " + ts.totalFiles);
+                System.out.println("files_success: " + ts.filesSuccess);
+                System.out.println("files_failed: " + ts.filesFailed);
+                System.out.println("table_status: " + ts.tableStatus);
+                System.out.println("process_status: " + ts.processStatus);
+                System.out.println("duration_seconds: " + ts.getDurationSeconds());
+                System.out.println("-------------------------------------------");
+            }
+
+        } catch (Exception e) {
+            log("ERROR", "PARSER_FAIL", "Failed to parse log: " + e.getMessage(), serverIP);
+        }
+    }
+}

@@ -1,0 +1,168 @@
+package ip_parser_v1;
+
+import java.io.*;
+import java.sql.*;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+
+public class ip_parser_methods {
+
+    private final String processName = "IP_PARSER";
+    private final String processVersion = "1.0.0";
+
+    public class TableSummary {
+        public String processName;
+        public String serverIP;
+        public LocalDateTime processStart;
+        public LocalDateTime processEnd;
+        public String tableName;
+        public LocalDateTime tableStart;
+        public LocalDateTime tableEnd;
+        public int totalFiles = 0;
+        public int filesSuccess = 0;
+        public int filesFailed = 0;
+        public String tableStatus;
+        public String processStatus;
+        public int durationSeconds; // duration in seconds
+    }
+
+    public void log(String level, String evtType, String message, String serverIP) {
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+        String now = LocalDateTime.now().format(formatter);
+        System.out.printf(
+            "ALERT - %s --> Process_Name:%s Server_IP:%s Process_Version:%s Log_Level:%s EVT_Type:%s Description:%s%n",
+            now, processName, serverIP, processVersion, level, evtType, message
+        );
+    }
+
+    public void parseFile(String csvFilePath, String tableName, String dbUrl, String dbUser, String dbPass, String serverIP) {
+        LocalDateTime processStart = LocalDateTime.now();
+        log("INFO", "PROCESS_START", "IP Parser started", serverIP);
+
+        TableSummary summary = new TableSummary();
+        summary.processName = processName;
+        summary.serverIP = serverIP;
+        summary.processStart = processStart;
+        summary.tableName = tableName;
+
+        try (BufferedReader br = new BufferedReader(new FileReader(csvFilePath))) {
+            String headerLine = br.readLine();
+            if (headerLine == null) {
+                log("ERROR", "CSV_EMPTY", "CSV is empty: " + csvFilePath, serverIP);
+                return;
+            }
+            String[] headers = headerLine.split(",", -1);
+
+            String line;
+            while ((line = br.readLine()) != null) {
+                String[] cols = line.split(",", -1);
+
+                Map<String, String> row = new HashMap<>();
+                for (int i = 0; i < headers.length && i < cols.length; i++) {
+                    row.put(headers[i], cols[i]);
+                }
+
+                String evtType = row.getOrDefault("EVT_Type", "");
+                String description = row.getOrDefault("Description", "");
+
+                if (evtType.equals("TABLE_START")) {
+                    summary.tableStart = parseTimeFromDescription(description);
+                } else if (evtType.equals("TABLE_END")) {
+                    summary.tableEnd = parseTimeFromDescription(description);
+                    if (description.toLowerCase().contains("success")) {
+                        summary.tableStatus = "Success";
+                    } else {
+                        summary.tableStatus = "Failed";
+                    }
+                } else if (evtType.equals("PSQL_IMPORT_SUCCESS")) {
+                    summary.filesSuccess++;
+                    summary.totalFiles++;
+                } else if (evtType.equals("CSV_DETAILS")) {
+                    summary.totalFiles++;
+                } else if (evtType.toLowerCase().contains("fail") || description.toLowerCase().contains("fail")) {
+                    summary.filesFailed++;
+                    summary.totalFiles++;
+                }
+            }
+        } catch (Exception e) {
+            log("ERROR", "CSV_READ_FAIL", "Failed to read CSV: " + e.getMessage(), serverIP);
+            summary.tableStatus = "Failed";
+            summary.processStatus = "Failed";
+        }
+
+        summary.processEnd = LocalDateTime.now();
+        summary.durationSeconds = summary.tableStart != null && summary.tableEnd != null ?
+                (int) Duration.between(summary.tableStart, summary.tableEnd).getSeconds() :
+                (int) Duration.between(summary.processStart, summary.processEnd).getSeconds();
+
+        if (summary.processStatus == null) summary.processStatus = summary.filesFailed > 0 ? "Failed" : "Success";
+
+        // Insert into DB
+        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass)) {
+            String createTableSQL = "CREATE TABLE IF NOT EXISTS " + tableName + " (" +
+                    "process_name VARCHAR(50), " +
+                    "server_ip VARCHAR(50), " +
+                    "process_start TIMESTAMP, " +
+                    "process_end TIMESTAMP, " +
+                    "table_name VARCHAR(100), " +
+                    "table_start TIMESTAMP, " +
+                    "table_end TIMESTAMP, " +
+                    "total_files INT, " +
+                    "files_success INT, " +
+                    "files_failed INT, " +
+                    "table_status VARCHAR(20), " +
+                    "process_status VARCHAR(20), " +
+                    "duration_seconds INT" +
+                    ")";
+            try (Statement stmt = conn.createStatement()) {
+                stmt.execute(createTableSQL);
+            }
+
+            String insertSQL = "INSERT INTO " + tableName +
+                    " (process_name, server_ip, process_start, process_end, table_name, table_start, table_end," +
+                    " total_files, files_success, files_failed, table_status, process_status, duration_seconds) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+            try (PreparedStatement ps = conn.prepareStatement(insertSQL)) {
+                ps.setString(1, summary.processName);
+                ps.setString(2, summary.serverIP);
+                ps.setTimestamp(3, Timestamp.valueOf(summary.processStart));
+                ps.setTimestamp(4, Timestamp.valueOf(summary.processEnd));
+                ps.setString(5, summary.tableName);
+                ps.setTimestamp(6, summary.tableStart != null ? Timestamp.valueOf(summary.tableStart) : null);
+                ps.setTimestamp(7, summary.tableEnd != null ? Timestamp.valueOf(summary.tableEnd) : null);
+                ps.setInt(8, summary.totalFiles);
+                ps.setInt(9, summary.filesSuccess);
+                ps.setInt(10, summary.filesFailed);
+                ps.setString(11, summary.tableStatus);
+                ps.setString(12, summary.processStatus);
+                ps.setInt(13, summary.durationSeconds);
+
+                ps.executeUpdate();
+            }
+
+        } catch (SQLException e) {
+            log("ERROR", "DB_FAIL", "Failed to insert into " + tableName + ": " + e.getMessage(), serverIP);
+        }
+
+        log("INFO", "PROCESS_END", "IP Parser completed", serverIP);
+
+        // Print summary to console
+        System.out.println("Summary:");
+        System.out.println("Process: " + summary.processName);
+        System.out.println("Table: " + summary.tableName);
+        System.out.println("Total Files: " + summary.totalFiles);
+        System.out.println("Success: " + summary.filesSuccess);
+        System.out.println("Failed: " + summary.filesFailed);
+        System.out.println("Table Status: " + summary.tableStatus);
+        System.out.println("Process Status: " + summary.processStatus);
+        System.out.println("Duration (seconds): " + summary.durationSeconds);
+    }
+
+    private LocalDateTime parseTimeFromDescription(String desc) {
+        // Example: "Table processing started - Table:your_table_name SNO:2 Files_Count:1"
+        // For simplicity, we use current time. You can parse if timestamps exist in description
+        return LocalDateTime.now();
+    }
+}

@@ -1,0 +1,305 @@
+package ntp12_process_v1;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.io.File;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+public class ntp12_process_methods {
+
+    private static final String processName = "NTP12";
+    private static final String processVersion = "1.0";
+    private static final boolean debugEnabled = true;
+    private static final DateTimeFormatter logFormat =
+            DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss SSS");
+
+    private final Map<String, Integer> iaCounterByUser = new HashMap<>();
+
+    public boolean run(String csvFolderPath) {
+        return run(csvFolderPath, null);
+    }
+
+    public boolean run(String csvFolderPath, String outputFolderPath) {
+        Path inputDir = Paths.get(csvFolderPath);
+        Path outputDir = (outputFolderPath == null || outputFolderPath.trim().isEmpty())
+                ? inputDir
+                : Paths.get(outputFolderPath);
+
+        try {
+            if (!Files.exists(inputDir) || !Files.isDirectory(inputDir)) {
+                log("ERROR", "CSV folder does not exist or is not a directory: " + csvFolderPath, null, "CONFIG_LOAD");
+                return false;
+            }
+
+            if (!Files.exists(outputDir)) {
+                Files.createDirectories(outputDir);
+            }
+
+            List<Path> csvFiles = findCsvFiles(inputDir);
+            if (csvFiles.isEmpty()) {
+                log("WARN", "No CSV files found in folder: " + csvFolderPath, null, "FILE_SCAN");
+                return false;
+            }
+
+            int totalWritten = 0;
+            int totalSkipped = 0;
+
+            for (Path csvFile : csvFiles) {
+                iaCounterByUser.clear();
+
+                FileResult result = processOneFile(csvFile, outputDir);
+                totalWritten += result.writtenRows;
+                totalSkipped += result.skippedRows;
+            }
+
+            log("INFO",
+                    "IA parser completed | WrittenRows=" + totalWritten + " | SkippedRows=" + totalSkipped,
+                    null,
+                    "PROCESS_END");
+            return true;
+
+        } catch (Exception e) {
+            log("ERROR", "Fatal error in IA parser: " + e.getMessage(), null, "PROCESS_ERROR");
+            return false;
+        }
+    }
+
+    private List<Path> findCsvFiles(Path inputDir) throws IOException {
+        List<Path> files = new ArrayList<>();
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(inputDir, "*.csv")) {
+            for (Path p : stream) {
+                if (Files.isRegularFile(p)) {
+                    files.add(p);
+                }
+            }
+        }
+        return files;
+    }
+
+    private FileResult processOneFile(Path inputFile, Path outputDir) {
+        int writtenRows = 0;
+        int skippedRows = 0;
+
+        Path outputFile = outputDir.resolve(
+                stripExtension(inputFile.getFileName().toString()) + "_iau.csv"
+        );
+
+        log("INFO", "Processing file: " + inputFile.getFileName(), null, "FILE_START");
+
+        try (BufferedReader br = Files.newBufferedReader(inputFile, StandardCharsets.ISO_8859_1);
+             BufferedWriter bw = Files.newBufferedWriter(outputFile, StandardCharsets.ISO_8859_1)) {
+
+            String headerLine = br.readLine();
+            if (headerLine == null || headerLine.trim().isEmpty()) {
+                log("WARN", "Empty file skipped: " + inputFile.getFileName(), null, "CSV_EMPTY_SKIP");
+                return new FileResult(0, 0);
+            }
+
+            List<String> headers = parseDelimitedLine(headerLine, '|');
+            if (headers.isEmpty()) {
+                log("WARN", "Header not found in file: " + inputFile.getFileName(), null, "CSV_HEADER_SKIP");
+                return new FileResult(0, 0);
+            }
+
+            int userIdIdx = indexOfIgnoreCase(headers, "user_id");
+            int userModeIdx = indexOfIgnoreCase(headers, "user_mode");
+
+            if (userIdIdx < 0 || userModeIdx < 0) {
+                log("ERROR",
+                        "Required columns not found in file: " + inputFile.getFileName()
+                                + " | user_idIdx=" + userIdIdx + " | userModeIdx=" + userModeIdx,
+                        null,
+                        "CSV_SCHEMA_ERROR");
+                return new FileResult(0, 0);
+            }
+
+            bw.write(headerLine);
+            bw.newLine();
+
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.trim().isEmpty()) {
+                    continue;
+                }
+
+                List<String> values = parseDelimitedLine(line, '|');
+                if (values.size() < headers.size()) {
+                    while (values.size() < headers.size()) {
+                        values.add("");
+                    }
+                }
+
+                String userId = safeGet(values, userIdIdx);
+                String userMode = safeGet(values, userModeIdx);
+
+                if (userId == null || userId.isEmpty()) {
+                    skippedRows++;
+                    log("WARN", "Skipping row with empty user_id in file: " + inputFile.getFileName(), null, "ROW_SKIP");
+                    continue;
+                }
+
+                if (userMode == null || !"IA".equalsIgnoreCase(userMode.trim())) {
+                    skippedRows++;
+                    continue;
+                }
+
+                int count = iaCounterByUser.getOrDefault(userId, 0) + 1;
+                iaCounterByUser.put(userId, count);
+
+                if (count == 1) {
+                    values.set(userModeIdx, "IAU_1");
+                } else if (count == 2) {
+                    values.set(userModeIdx, "IAU_2");
+                } else {
+                    skippedRows++;
+                    log("WARN",
+                            "More than 2 IA rows found for same user_id=" + userId
+                                    + " | occurrence=" + count + " | skipping row",
+                            null,
+                            "IA_SKIP");
+                    continue;
+                }
+
+                bw.write(joinDelimitedLine(values, '|'));
+                bw.newLine();
+                writtenRows++;
+            }
+
+            bw.flush();
+
+            log("INFO",
+                    "File completed: " + inputFile.getFileName()
+                            + " | WrittenRows=" + writtenRows
+                            + " | SkippedRows=" + skippedRows
+                            + " | Output=" + outputFile.getFileName(),
+                    null,
+                    "FILE_END");
+
+        } catch (Exception e) {
+            log("ERROR",
+                    "Failed to process file: " + inputFile.getFileName() + " | Error: " + e.getMessage(),
+                    null,
+                    "FILE_ERROR");
+        }
+
+        return new FileResult(writtenRows, skippedRows);
+    }
+
+    private int indexOfIgnoreCase(List<String> headers, String target) {
+        if (headers == null || target == null) return -1;
+        for (int i = 0; i < headers.size(); i++) {
+            String h = headers.get(i);
+            if (h != null && h.trim().equalsIgnoreCase(target.trim())) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private String safeGet(List<String> values, int idx) {
+        if (values == null || idx < 0 || idx >= values.size()) return "";
+        String v = values.get(idx);
+        return v == null ? "" : v.trim();
+    }
+
+    private String stripExtension(String fileName) {
+        if (fileName == null) return "output";
+        int dot = fileName.lastIndexOf('.');
+        return (dot > 0) ? fileName.substring(0, dot) : fileName;
+    }
+
+    private List<String> parseDelimitedLine(String line, char delimiter) {
+        List<String> out = new ArrayList<>();
+        if (line == null) return out;
+
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+
+            if (c == '"') {
+                if (inQuotes && i + 1 < line.length() && line.charAt(i + 1) == '"') {
+                    current.append('"');
+                    i++;
+                } else {
+                    inQuotes = !inQuotes;
+                }
+            } else if (c == delimiter && !inQuotes) {
+                out.add(current.toString());
+                current.setLength(0);
+            } else {
+                current.append(c);
+            }
+        }
+
+        out.add(current.toString());
+        return out;
+    }
+
+    private String joinDelimitedLine(List<String> values, char delimiter) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < values.size(); i++) {
+            if (i > 0) sb.append(delimiter);
+            sb.append(quoteCsv(values.get(i)));
+        }
+        return sb.toString();
+    }
+
+    private String quoteCsv(String value) {
+        if (value == null) {
+            return "\"\"";
+        }
+        return "\"" + value.replace("\"", "\"\"") + "\"";
+    }
+
+    private static void log(String level, String message, String serverIP, String evtType) {
+        if ("DEBUG".equalsIgnoreCase(level) && !debugEnabled) return;
+
+        String timestamp = LocalDateTime.now().format(logFormat);
+        StringBuilder logBuilder = new StringBuilder(512);
+
+        logBuilder.append("Time:").append(timestamp)
+                .append(" [").append(capitalize(level)).append("] ")
+                .append("Process_Name: ").append(processName).append(" ");
+
+        if (serverIP != null && !serverIP.isEmpty()) {
+            logBuilder.append("Server_IP: ").append(serverIP).append(" ");
+        }
+
+        logBuilder.append("Process_Version: ").append(processVersion)
+                .append(" Log_Level: EVT_LOG ")
+                .append(" EVT_Type: ").append(evtType != null ? evtType : "NA")
+                .append(" Description: ").append(message != null ? message : "");
+
+        System.out.println(logBuilder.toString().trim());
+    }
+
+    private static String capitalize(String s) {
+        if (s == null || s.isEmpty()) return s;
+        return s.substring(0, 1).toUpperCase() + s.substring(1).toLowerCase();
+    }
+
+    private static class FileResult {
+        final int writtenRows;
+        final int skippedRows;
+
+        FileResult(int writtenRows, int skippedRows) {
+            this.writtenRows = writtenRows;
+            this.skippedRows = skippedRows;
+        }
+    }
+}

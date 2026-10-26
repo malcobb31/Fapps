@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename type &apos;dell_scality.csv_generate&apos; to &apos;Csv_generate&apos;&#x0D;&#x0A;- Original project: &apos;DELL_TO_SCALITY&apos;&#x0D;&#x0A;- Original element: &apos;dell_scality.csv_generate&apos;&#x0D;&#x0A;- Renamed element: &apos;dell_scality.Csv_generate&apos;&#x0D;&#x0A;- Update references to refactored element&#x0D;&#x0A;- Update textual occurrences in comments and strings" description="Rename type &apos;csv_generate&apos;" flags="589830" id="org.eclipse.jdt.ui.rename.type" input="/src&lt;dell_scality{csv_generate.java[csv_generate" matchStrategy="1" name="Csv_generate" qualified="false" references="true" similarDeclarations="false" stamp="1771825091458" textual="false" version="1.0"/>
+</session>

@@ -1,0 +1,225 @@
+package postgre_agent_v4;
+
+import java.io.*;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.nio.file.*;
+import java.sql.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
+
+public class postgre_v4_methods_test {
+    private static final String PROCESS_NAME = "CSV_TO_DB";
+    private static final String PROCESS_VERSION = "4.0";
+
+    // ----------------- MAIN ENTRY -----------------
+    public static void main(String[] args) {
+           }
+
+    // ----------------- PROCESS DIRECTORY -----------------
+    public static void processAllInDirectory(
+            String dirPath,
+            String processedDirPath,
+            String headerFlag,
+            String delimiter,
+
+            // Source DB (Config DB)
+            String srcDbUrl,
+            String srcDbUser,
+            String srcDbPass,
+            String configTable,
+
+            // Destination DB (Target DB)
+            String destHost,
+            String destPort,
+            String destName,
+            String destUser,
+            String destPass,
+            String dbTypeStr,
+
+            // Extra params
+            String numTablesToPickStr,
+            String MAX_CPU_UTILIZATION,
+            String MAX_MEMORY_UTILIZATION,
+            String bulkNumberStr
+    ) {
+        int numTablesToPick = Integer.parseInt(numTablesToPickStr);
+        int bulkThreshold = Integer.parseInt(bulkNumberStr);
+
+        log("Starting directory processing");
+
+        try {
+            // 1. Fetch ready tables from Config DB
+            List<TableConfig> tablesToProcess = new ArrayList<>();
+            try (Connection conn = DriverManager.getConnection(srcDbUrl, srcDbUser, srcDbPass);
+                 PreparedStatement ps = conn.prepareStatement(
+                         "SELECT sno, table_name FROM " + configTable +
+                                 " WHERE sync_status = 'ready_to_import' LIMIT ?")) {
+                ps.setInt(1, numTablesToPick);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        tablesToProcess.add(new TableConfig(rs.getInt("sno"), rs.getString("table_name")));
+                    }
+                }
+            }
+
+            if (tablesToProcess.isEmpty()) {
+                log("No tables found for processing.");
+                return;
+            }
+
+            // 2. Process CSV files
+            Files.list(Paths.get(dirPath))
+                    .filter(Files::isRegularFile)
+                    .sorted()
+                    .forEach(file -> {
+                        for (TableConfig tbl : tablesToProcess) {
+                            if (file.getFileName().toString().contains(tbl.tableName)) {
+                                boolean success = process(file.toString(), headerFlag, delimiter,
+                                        srcDbUrl, srcDbUser, srcDbPass, configTable,
+                                        destHost, destPort, destName, destUser, destPass,
+                                        bulkThreshold, dbTypeStr);
+
+                                if (success) {
+                                    try {
+                                        Files.move(file, Paths.get(processedDirPath, file.getFileName().toString()),
+                                                StandardCopyOption.REPLACE_EXISTING);
+                                        log("Moved file: " + file.getFileName());
+                                    } catch (IOException e) {
+                                        log("Error moving file: " + e.getMessage());
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+        } catch (Exception e) {
+            log("Error in processAllInDirectory: " + e.getMessage());
+        }
+    }
+
+    // ----------------- PROCESS CSV -----------------
+    public static boolean process(
+            String csvFile,
+            String headerFlag,
+            String delimiter,
+
+            // Config DB
+            String srcDbUrl, String srcDbUser, String srcDbPass, String configTable,
+
+            // Destination DB
+            String destHost, String destPort, String destName, String destUser, String destPass,
+
+            int bulkNumber, String dbType
+    ) {
+        log("Processing file: " + csvFile);
+
+        try {
+            // Resolve table name from Config DB
+            String tableName = resolveTableFromCsvName(csvFile, srcDbUrl, srcDbUser, srcDbPass, configTable);
+            if (tableName == null) {
+                log("No table mapping found for CSV: " + csvFile);
+                return false;
+            }
+
+            // Ensure table exists in Destination DB
+            if (!tableExists(tableName, destHost, destPort, destName, destUser, destPass, dbType)) {
+                createTable(tableName, csvFile, headerFlag, delimiter,
+                        destHost, destPort, destName, destUser, destPass, dbType);
+            }
+
+            // Import CSV into Destination DB
+            importCsvToTable(csvFile, tableName, headerFlag, delimiter,
+                    destHost, destPort, destName, destUser, destPass,
+                    bulkNumber, dbType);
+
+            log("Successfully processed: " + csvFile);
+            return true;
+
+        } catch (Exception e) {
+            log("Error processing file " + csvFile + ": " + e.getMessage());
+            return false;
+        }
+    }
+
+    // ----------------- HELPERS -----------------
+    private static String resolveTableFromCsvName(String csvFile, String srcDbUrl, String srcDbUser, String srcDbPass, String configTable) throws SQLException {
+        String csvName = Paths.get(csvFile).getFileName().toString();
+        try (Connection conn = DriverManager.getConnection(srcDbUrl, srcDbUser, srcDbPass);
+             PreparedStatement ps = conn.prepareStatement(
+                     "SELECT table_name FROM " + configTable + " WHERE csv_name = ?")) {
+            ps.setString(1, csvName);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getString("table_name");
+                }
+            }
+        }
+        return null;
+    }
+
+    private static boolean tableExists(String tableName, String host, String port,
+                                       String dbName, String user, String pass, String dbType) throws SQLException {
+        String url = "jdbc:" + dbType + "://" + host + ":" + port + "/" + dbName;
+        try (Connection conn = DriverManager.getConnection(url, user, pass);
+             ResultSet rs = conn.getMetaData().getTables(null, null, tableName, null)) {
+            return rs.next();
+        }
+    }
+
+    private static void createTable(String tableName, String csvFile, String headerFlag, String delimiter,
+                                    String host, String port, String dbName, String user, String pass, String dbType) throws SQLException {
+        String url = "jdbc:" + dbType + "://" + host + ":" + port + "/" + dbName;
+        try (Connection conn = DriverManager.getConnection(url, user, pass);
+             Statement stmt = conn.createStatement()) {
+            // TODO: Build CREATE TABLE statement based on CSV headers
+            String sql = "CREATE TABLE " + tableName + " (id SERIAL PRIMARY KEY, data TEXT)";
+            stmt.execute(sql);
+            log("Created table: " + tableName);
+        }
+    }
+
+    private static void importCsvToTable(String csvFile, String tableName, String headerFlag, String delimiter,
+                                         String host, String port, String dbName, String user, String pass,
+                                         int bulkNumber, String dbType) throws SQLException, IOException {
+        String url = "jdbc:" + dbType + "://" + host + ":" + port + "/" + dbName;
+        try (Connection conn = DriverManager.getConnection(url, user, pass);
+             BufferedReader br = new BufferedReader(new FileReader(csvFile))) {
+            String line;
+            int batchCount = 0;
+            PreparedStatement ps = conn.prepareStatement("INSERT INTO " + tableName + " (data) VALUES (?)");
+
+            while ((line = br.readLine()) != null) {
+                ps.setString(1, line);
+                ps.addBatch();
+                batchCount++;
+                if (batchCount >= bulkNumber) {
+                    ps.executeBatch();
+                    batchCount = 0;
+                }
+            }
+            if (batchCount > 0) {
+                ps.executeBatch();
+            }
+            log("CSV imported into table: " + tableName);
+        }
+    }
+
+    private static void log(String msg) {
+        String ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        System.out.println("[" + ts + "] [" + PROCESS_NAME + " v" + PROCESS_VERSION + "] " + msg);
+    }
+
+    private static class TableConfig {
+        int sno;
+        String tableName;
+
+        TableConfig(int sno, String tableName) {
+            this.sno = sno;
+            this.tableName = tableName;
+        }
+    }
+}

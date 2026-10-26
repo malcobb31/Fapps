@@ -1,0 +1,114 @@
+package url_parserV1;
+
+import org.openqa.selenium.*;
+import org.openqa.selenium.chrome.ChromeDriver;
+import org.openqa.selenium.chrome.ChromeOptions;
+import org.apache.commons.io.FileUtils;
+import org.openqa.selenium.support.ui.ExpectedConditions;
+import org.openqa.selenium.support.ui.WebDriverWait;
+
+import java.io.*;
+import java.text.SimpleDateFormat;
+import java.util.Base64;
+import java.util.Date;
+import java.time.Duration;
+import java.util.Scanner;
+
+public class url_parser_methods {
+
+    public static void main(String[] args) throws Exception {
+
+        // ---------------------------
+        // FIXED: Windows ChromeDriver
+        // ---------------------------
+        System.setProperty("webdriver.chrome.driver", "C:\\chromedrivers\\chromedriver.exe");
+
+        ChromeOptions options = new ChromeOptions();
+        options.addArguments("--remote-allow-origins=*");
+        options.setAcceptInsecureCerts(true);
+
+        // ---------------------------
+        // FIXED: Normal Chrome on Windows
+        // ---------------------------
+        WebDriver driver = new ChromeDriver(options);
+
+        // FIXED for Selenium 4 (requires Duration)
+        WebDriverWait wait = new WebDriverWait(driver, 15);
+
+
+        Scanner scanner = new Scanner(System.in);
+
+        // STEP 1: Open login page
+        driver.get("https://ocbms.dot.gov.in/#/login-page");
+        Thread.sleep(2000);
+
+        // STEP 2: Enter user ID
+        WebElement userIdField = wait.until(
+                ExpectedConditions.visibilityOfElementLocated(By.cssSelector("input[formcontrolname='email']"))
+        );
+        userIdField.sendKeys("nttin.escalation.mana2ger@global.ntt");
+
+        // STEP 3: Click Submit
+        WebElement submitButton = driver.findElement(By.xpath("//button[contains(., 'Submit')]"));
+        submitButton.click();
+
+        Thread.sleep(3000);
+
+        // STEP 4: Enter Password
+        WebElement passwordField = wait.until(
+                ExpectedConditions.visibilityOfElementLocated(By.cssSelector("input[placeholder='Enter password']"))
+        );
+        passwordField.sendKeys("Microf@cus@1234");
+
+        // STEP 5: Read CAPTCHA image
+        WebElement captchaImg = driver.findElement(By.xpath("//img[contains(@src, 'data:image')]"));
+        String src = captchaImg.getAttribute("src");
+        String base64Image = src.split(",")[1];
+
+        // STEP 6: Save CAPTCHA
+        byte[] imageBytes = Base64.getDecoder().decode(base64Image);
+        File imageFile = new File("captcha.png");
+        FileOutputStream fos = new FileOutputStream(imageFile);
+        fos.write(imageBytes);
+        fos.close();
+
+        System.out.println("CAPTCHA image saved at: " + imageFile.getAbsolutePath());
+
+        // STEP 7: Enter CAPTCHA manually
+        System.out.print("Enter CAPTCHA: ");
+        String captchaText = scanner.nextLine();
+        WebElement captchaField = driver.findElement(By.cssSelector("input[placeholder='Enter captcha']"));
+        captchaField.sendKeys(captchaText);
+
+        // STEP 8: Click Next
+        WebElement nextButton = driver.findElement(By.xpath("//button[contains(., 'Next')]"));
+        nextButton.click();
+
+        // STEP 9: Wait for OTP field
+        WebElement otpField = wait.until(
+                ExpectedConditions.visibilityOfElementLocated(By.cssSelector("input[formcontrolname='otp']"))
+        );
+
+        // STEP 10: Get OTP from user
+        System.out.print("Enter OTP: ");
+        String otp = scanner.nextLine();
+        otpField.sendKeys(otp);
+
+        // STEP 11: Click Verify
+        WebElement verifyButton = wait.until(
+                ExpectedConditions.elementToBeClickable(By.xpath("//button[contains(., 'Verify')]"))
+        );
+        verifyButton.click();
+
+        // STEP 12: Screenshot after login
+        Thread.sleep(8000);
+        File screenshot = ((TakesScreenshot) driver).getScreenshotAs(OutputType.FILE);
+        String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+        File savedFile = new File("login_success_" + timestamp + ".png");
+        FileUtils.copyFile(screenshot, savedFile);
+
+        System.out.println("Screenshot Saved: " + savedFile.getAbsolutePath());
+
+        driver.quit();
+    }
+}

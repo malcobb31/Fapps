@@ -1,0 +1,370 @@
+package binlog_reader_pre;
+
+import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Pattern;
+import java.util.Comparator;
+
+public class binlog_reader_pre_methods {
+
+    private static final long MIN_FILE_AGE_MS = 2L * 60L * 1000L;
+    private static final String STATUS_INIT = "INIT";
+    private static final Pattern BINLOG_FILE_PATTERN =
+            Pattern.compile("^binary_log\\.\\d+$");
+
+    private static final String EVT_START = "START";
+    private static final String EVT_SOURCE_SCAN = "SOURCE_SCAN";
+    private static final String EVT_FILE_MOVE = "FILE_MOVE";
+    private static final String EVT_DB_INSERT = "DB_INSERT";
+    private static final String EVT_DUPLICATE_FILE = "DUPLICATE_FILE";
+    private static final String EVT_SUMMARY = "SUMMARY";
+    private static final String EVT_ERROR = "ERROR";
+    private static final String EVT_END = "END";
+
+    private final String processName;
+    private final String processVersion;
+    private final DateTimeFormatter logFormat;
+    private final boolean debugEnabled;
+    private final String configTableName;
+
+    public binlog_reader_pre_methods(
+            String processName,
+            String processVersion,
+            DateTimeFormatter logFormat,
+            boolean debugEnabled,
+            String configTableName) {
+
+        this.processName = processName;
+        this.processVersion = processVersion;
+        this.logFormat = logFormat;
+        this.debugEnabled = debugEnabled;
+        this.configTableName = validateIdentifier(configTableName);
+    }
+
+    public void runPreProcess(
+            String binlogFolder,
+            String preBinlogFolder,
+            String mysqlUrl,
+            String mysqlUser,
+            String mysqlPass) throws Exception {
+
+        log("INFO", "Pipeline execution started.", null, EVT_START);
+
+        File sourceDir = validateSourceDirectory(binlogFolder);
+        File destDir = prepareDestinationDirectory(preBinlogFolder);
+
+        log("INFO", "Scanning source directory: [" + binlogFolder + "]", null, EVT_SOURCE_SCAN);
+
+        List<File> allFiles = listRegularFiles(sourceDir);
+        List<File> eligibleFiles = filterByAgeAndName(allFiles);
+
+        // Sort binlog files in ascending sequence
+        eligibleFiles.sort((f1, f2) -> {
+            long n1 = Long.parseLong(f1.getName().replace("mysql-bin.", ""));
+            long n2 = Long.parseLong(f2.getName().replace("mysql-bin.", ""));
+            return Long.compare(n1, n2);
+        });
+
+        log("INFO",
+                "Scan complete. TotalFilesFound: " + allFiles.size() + " EligibleFiles: " + eligibleFiles.size()
+                        + " (modified within last 2 minutes)",
+                null,
+                EVT_SOURCE_SCAN);
+
+        if (eligibleFiles.isEmpty()) {
+            log("INFO", "No eligible files to process. Exiting pipeline.", null, EVT_END);
+            return;
+        }
+
+        List<MovedFile> movedFiles = moveEligibleFiles(eligibleFiles, destDir);
+
+        log("INFO",
+                "File move phase complete. EligibleCount: " + eligibleFiles.size() + " MovedCount: " + movedFiles.size(),
+                null,
+                EVT_FILE_MOVE);
+
+        if (movedFiles.isEmpty()) {
+            log("INFO", "No files were moved successfully. Exiting pipeline.", null, EVT_END);
+            return;
+        }
+
+        processDatabase(movedFiles, mysqlUrl, mysqlUser, mysqlPass);
+    }
+
+    private File validateSourceDirectory(String path) throws Exception {
+        if (path == null || path.trim().isEmpty()) {
+            throw new IllegalArgumentException("binlog_folder argument is null or empty.");
+        }
+
+        File dir = new File(path);
+
+        if (!dir.exists()) {
+            throw new IllegalArgumentException("Source directory does not exist: [" + path + "]");
+        }
+        if (!dir.isDirectory()) {
+            throw new IllegalArgumentException("Source path is not a directory: [" + path + "]");
+        }
+        if (!dir.canRead()) {
+            throw new IllegalArgumentException("Source directory is not readable: [" + path + "]");
+        }
+
+        return dir;
+    }
+
+    private File prepareDestinationDirectory(String path) throws Exception {
+        if (path == null || path.trim().isEmpty()) {
+            throw new IllegalArgumentException("pre_binlog_folder argument is null or empty.");
+        }
+
+        File dir = new File(path);
+
+        if (!dir.exists()) {
+            log("INFO", "Destination directory does not exist, creating: [" + path + "]", null, EVT_FILE_MOVE);
+            boolean created = dir.mkdirs();
+            if (!created) {
+                throw new Exception("Failed to create destination directory: [" + path + "]");
+            }
+        }
+
+        if (!dir.isDirectory()) {
+            throw new IllegalArgumentException("Destination path is not a directory: [" + path + "]");
+        }
+        if (!dir.canWrite()) {
+            throw new IllegalArgumentException("Destination directory is not writable: [" + path + "]");
+        }
+
+        return dir;
+    }
+
+    private List<File> listRegularFiles(File sourceDir) throws Exception {
+        File[] entries = sourceDir.listFiles();
+
+        if (entries == null) {
+            throw new Exception("Unable to list files in source directory: [" + sourceDir.getAbsolutePath() + "]");
+        }
+
+        List<File> files = new ArrayList<>();
+        for (File entry : entries) {
+            if (entry.isFile()) {
+                files.add(entry);
+            }
+        }
+
+        return files;
+    }
+
+    private List<File> filterByAgeAndName(List<File> files) {
+        long threshold = System.currentTimeMillis() + MIN_FILE_AGE_MS;
+        List<File> eligible = new ArrayList<>();
+
+        for (File file : files) {
+            String fileName = file.getName();
+            if (!isValidBinlogFile(fileName)) {
+                continue;
+            }
+            if (file.lastModified() >= threshold) {
+                eligible.add(file);
+            }
+        }
+
+        return eligible;
+    }
+
+    private boolean isValidBinlogFile(String fileName) {
+        return fileName != null && BINLOG_FILE_PATTERN.matcher(fileName).matches();
+    }
+
+    private List<MovedFile> moveEligibleFiles(List<File> eligibleFiles, File destDir) {
+        List<MovedFile> moved = new ArrayList<>();
+        int errorCount = 0;
+
+        for (File file : eligibleFiles) {
+            String fileName = file.getName();
+            Path sourcePath = file.toPath();
+            Path targetPath = Paths.get(destDir.getAbsolutePath(), fileName);
+
+            try {
+                Files.move(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING);
+                moved.add(new MovedFile(fileName, targetPath.toAbsolutePath().toString()));
+            } catch (Exception e) {
+                errorCount++;
+                log("ERROR", "Failed to move file: [" + fileName + "] Cause: " + e.getMessage(), null, EVT_ERROR);
+            }
+        }
+
+        if (errorCount > 0) {
+            log("ERROR", "File move phase encountered errors. ErrorCount: " + errorCount, null, EVT_ERROR);
+        }
+
+        return moved;
+    }
+
+    private void processDatabase(
+            List<MovedFile> movedFiles,
+            String mysqlUrl,
+            String mysqlUser,
+            String mysqlPass) throws Exception {
+
+        log("INFO", "Opening database connection. URL: [" + mysqlUrl + "]", null, EVT_DB_INSERT);
+
+        try (Connection conn = openConnection(mysqlUrl, mysqlUser, mysqlPass)) {
+
+            log("INFO", "Database connection established. URL: [" + mysqlUrl + "]", null, EVT_DB_INSERT);
+
+            conn.setAutoCommit(false);
+
+            int insertedCount = 0;
+            int duplicateCount = 0;
+            int dbErrorCount = 0;
+
+            for (MovedFile mf : movedFiles) {
+                try {
+                    if (fileExistsInDb(conn, mf.fileName)) {
+                        duplicateCount++;
+                        log("INFO", "Duplicate file skipped: [" + mf.fileName + "]", null, EVT_DUPLICATE_FILE);
+                    } else {
+                        insertRecord(conn, mf.fileName, mf.movedPath);
+                        conn.commit();
+                        insertedCount++;
+                        log("INFO", "Inserted new record: [" + mf.fileName + "]", null, EVT_DB_INSERT);
+                    }
+                } catch (SQLException sqlEx) {
+                    dbErrorCount++;
+                    safeRollback(conn);
+                    log("ERROR",
+                            "DB error processing file: [" + mf.fileName + "] SQLState: [" + sqlEx.getSQLState()
+                                    + "] ErrorCode: [" + sqlEx.getErrorCode() + "] Message: " + sqlEx.getMessage(),
+                            null,
+                            EVT_ERROR);
+                }
+            }
+
+            log("INFO",
+                    "Pipeline summary. FilesProcessed: " + movedFiles.size() + " Inserted: " + insertedCount
+                            + " Duplicates: " + duplicateCount + " DB_Errors: " + dbErrorCount,
+                    null,
+                    EVT_SUMMARY);
+        }
+    }
+
+    private boolean fileExistsInDb(Connection conn, String fileName) throws SQLException {
+        String sql = "SELECT COUNT(*) FROM " + configTableName + " WHERE file_name = ?";
+
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, fileName);
+
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getInt(1) > 0;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private void insertRecord(Connection conn, String fileName, String movedPath) throws SQLException {
+        String sql = "INSERT INTO " + configTableName +
+                " (file_name, status, source_path, dest_path, entry_time, last_time_processed) VALUES (?, ?, ?, NULL, ?, NULL)";
+
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, fileName);
+            ps.setString(2, STATUS_INIT);
+            ps.setString(3, movedPath);
+            ps.setTimestamp(4, Timestamp.valueOf(LocalDateTime.now()));
+            ps.executeUpdate();
+        }
+    }
+
+    private void safeRollback(Connection conn) {
+        try {
+            if (conn != null) {
+                conn.rollback();
+            }
+        } catch (SQLException rbEx) {
+            log("ERROR", "Rollback failed. Cause: " + rbEx.getMessage(), null, EVT_ERROR);
+        }
+    }
+
+    private Connection openConnection(String url, String user, String password) throws SQLException {
+        try {
+            Class.forName("com.mysql.cj.jdbc.Driver");
+        } catch (ClassNotFoundException modern) {
+            try {
+                Class.forName("com.mysql.jdbc.Driver");
+            } catch (ClassNotFoundException legacy) {
+                throw new SQLException("MySQL JDBC driver not found on classpath.", legacy);
+            }
+        }
+
+        return DriverManager.getConnection(url, user, password);
+    }
+
+    public void log(String level, String message, String serverIP, String evtType) {
+        if ("DEBUG".equalsIgnoreCase(level) && !debugEnabled) {
+            return;
+        }
+
+        String timestamp = LocalDateTime.now().format(logFormat);
+        StringBuilder sb = new StringBuilder(512);
+
+        sb.append("Time:").append(timestamp)
+          .append(" [").append(capitalize(level)).append("] ")
+          .append("Process_Name: ").append(processName).append(" ");
+
+        if (serverIP != null && !serverIP.isEmpty()) {
+            sb.append("Server_IP: ").append(serverIP).append(" ");
+        }
+
+        sb.append("Process_Version: ").append(processVersion).append(" ")
+          .append("Log_Level: EVT_LOG ")
+          .append(" EVT_Type: ").append(evtType != null ? evtType : "NA")
+          .append(" Description: ")
+          .append(message != null ? message : "");
+
+        System.out.println(sb.toString().trim());
+    }
+
+    private String capitalize(String input) {
+        if (input == null || input.isEmpty()) {
+            return "";
+        }
+        return Character.toUpperCase(input.charAt(0)) + input.substring(1).toLowerCase();
+    }
+
+    private String validateIdentifier(String name) {
+        if (name == null || name.trim().isEmpty()) {
+            throw new IllegalArgumentException("Config table name cannot be empty.");
+        }
+
+        String trimmed = name.trim();
+        if (!trimmed.matches("[A-Za-z0-9_]+")) {
+            throw new IllegalArgumentException("Invalid config table name: " + name);
+        }
+
+        return trimmed;
+    }
+
+    private static final class MovedFile {
+        final String fileName;
+        final String movedPath;
+
+        MovedFile(String fileName, String movedPath) {
+            this.fileName = fileName;
+            this.movedPath = movedPath;
+        }
+    }
+}

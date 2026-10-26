@@ -1,0 +1,206 @@
+package ip_parser_v1;
+
+import java.sql.*;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+
+public class ip_parser_methods {
+
+    public static class FileTableDetail {
+        public String fileName = "";
+        public String tableName = "";
+        public LocalDateTime startTime;
+        public LocalDateTime endTime;
+        public long durationSeconds;
+        public int rawCount = -1;
+        public double fileSizeMB = -1;
+        public int threadId = 0; // table/thread number
+    }
+
+    public static class ProcessSummary {
+        public String processName;
+        public String processVersion;
+        public String serverIP;
+        public LocalDateTime startTime;
+        public LocalDateTime endTime;
+        public long durationSeconds;
+        public List<FileTableDetail> details = new ArrayList<>();
+        public int totalThreads = 0;
+        public int totalFiles = 0;
+        public int totalTables = 0;
+    }
+
+    public void parseLogs(String sourceTable, String destTable, String dbUrl, String dbUser, String dbPass) {
+        Map<String, ProcessSummary> processes = new LinkedHashMap<>();
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass)) {
+
+            // Fetch all log rows
+            String selectSQL = "SELECT Time_Stamp, Process_Name, Process_Version, Server_IP, EVT_Type, Description FROM " + sourceTable + " ORDER BY Time_Stamp";
+            try (PreparedStatement ps = conn.prepareStatement(selectSQL);
+                 ResultSet rs = ps.executeQuery()) {
+
+                while (rs.next()) {
+                    String processName = rs.getString("Process_Name");
+                    String processVersion = rs.getString("Process_Version");
+                    String serverIP = rs.getString("Server_IP");
+                    String evtType = rs.getString("EVT_Type");
+                    String desc = rs.getString("Description");
+                    LocalDateTime ts = rs.getTimestamp("Time_Stamp").toLocalDateTime();
+
+                    ProcessSummary process = processes.getOrDefault(processName, new ProcessSummary());
+                    process.processName = processName;
+                    process.processVersion = processVersion;
+                    process.serverIP = serverIP;
+
+                    // Process start
+                    if (evtType.contains("PROCESS_START") || evtType.equals("START")) {
+                        process.startTime = ts;
+                    }
+                    // Process end
+                    if (evtType.contains("PROCESS_END") || evtType.equals("End")) {
+                        process.endTime = ts;
+                        if (process.startTime != null)
+                            process.durationSeconds = Duration.between(process.startTime, process.endTime).getSeconds();
+                    }
+
+                    // Files/tables
+                    if (evtType.contains("Thread_Start") || evtType.contains("TABLE_START") || evtType.contains("FILE_START")) {
+                        FileTableDetail detail = new FileTableDetail();
+                        if (desc.contains("file:") || desc.contains("File:")) {
+                            detail.fileName = extractValue(desc, "file");
+                        } else if (desc.contains("tableName:")) {
+                            detail.tableName = extractValue(desc, "tableName");
+                            detail.tableName = extractValue(desc, "Table");
+                        }
+                        detail.startTime = ts;
+                        process.details.add(detail);
+                        process.totalThreads++;
+                    }
+
+                    if (evtType.contains("Thread_End") || evtType.contains("TABLE_END") || evtType.contains("FILE_END")) {
+                        String name = "";
+                        if (desc.contains("file:") || desc.contains("File:")) name = extractValue(desc, "file");
+                        else if (desc.contains("tableName:")) name = extractValue(desc, "tableName");
+
+                        // Match with last started
+                        for (int i = process.details.size() - 1; i >= 0; i--) {
+                            FileTableDetail f = process.details.get(i);
+                            if (f.endTime == null && (f.fileName.equals(name) || f.tableName.equals(name))) {
+                                f.endTime = ts;
+                                f.durationSeconds = Duration.between(f.startTime, f.endTime).getSeconds();
+                                break;
+                            }
+                        }
+                    }
+
+                    // Raw count
+                    if (evtType.contains("rawCount")) {
+                        String table = extractValue(desc, "tableName");
+                        int raw = Integer.parseInt(extractValue(desc, "rawCount"));
+                        for (int i = process.details.size() - 1; i >= 0; i--) {
+                            FileTableDetail f = process.details.get(i);
+                            if ((f.tableName.equals(table) || f.fileName.equals(table)) && f.rawCount == -1) {
+                                f.rawCount = raw;
+                                break;
+                            }
+                        }
+                    }
+
+                    // File size
+                    if (evtType.contains("CSV_DETAILS")) {
+                        String file = extractValue(desc, "CSV");
+                        double size = Double.parseDouble(extractValue(desc, "File Size"));
+                        for (int i = process.details.size() - 1; i >= 0; i--) {
+                            FileTableDetail f = process.details.get(i);
+                            if (f.fileName.equals(file)) {
+                                f.fileSizeMB = size;
+                                break;
+                            }
+                        }
+                    }
+
+                    processes.put(processName, process);
+                }
+            }
+
+            // Insert into dest table
+            String insertSQL = "INSERT INTO " + destTable + " (Process_Name, Process_Version, Server_IP, Process_Start, Process_End, Process_Duration, File_Name, Table_Name, File_Start, File_End, File_Duration, Raw_Count, File_Size_MB, Threads_Opened, Total_Files, Total_Tables) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+            try (PreparedStatement ps = conn.prepareStatement(insertSQL)) {
+                for (ProcessSummary p : processes.values()) {
+                    int files = 0, tables = 0;
+                    for (FileTableDetail f : p.details) {
+                        ps.setString(1, p.processName);
+                        ps.setString(2, p.processVersion);
+                        ps.setString(3, p.serverIP);
+                        ps.setString(4, p.startTime != null ? p.startTime.toString() : null);
+                        ps.setString(5, p.endTime != null ? p.endTime.toString() : null);
+                        ps.setLong(6, p.durationSeconds);
+                        ps.setString(7, f.fileName);
+                        ps.setString(8, f.tableName);
+                        ps.setString(9, f.startTime != null ? f.startTime.toString() : null);
+                        ps.setString(10, f.endTime != null ? f.endTime.toString() : null);
+                        ps.setLong(11, f.durationSeconds);
+                        ps.setObject(12, f.rawCount >= 0 ? f.rawCount : null);
+                        ps.setObject(13, f.fileSizeMB >= 0 ? f.fileSizeMB : null);
+                        ps.setInt(14, p.totalThreads);
+                        ps.setInt(15, f.fileName.isEmpty() ? 0 : 1);
+                        ps.setInt(16, f.tableName.isEmpty() ? 0 : 1);
+                        ps.addBatch();
+
+                        if (!f.fileName.isEmpty()) files++;
+                        if (!f.tableName.isEmpty()) tables++;
+                    }
+                    ps.executeBatch();
+
+                    // Insert summary row for the process
+                    ps.setString(1, p.processName + " (Summary)");
+                    ps.setString(2, p.processVersion);
+                    ps.setString(3, p.serverIP);
+                    ps.setString(4, p.startTime != null ? p.startTime.toString() : null);
+                    ps.setString(5, p.endTime != null ? p.endTime.toString() : null);
+                    ps.setLong(6, p.durationSeconds);
+                    ps.setString(7, null);
+                    ps.setString(8, null);
+                    ps.setString(9, null);
+                    ps.setString(10, null);
+                    ps.setLong(11, 0);
+                    ps.setObject(12, null);
+                    ps.setObject(13, null);
+                    ps.setInt(14, p.totalThreads);
+                    ps.setInt(15, files);
+                    ps.setInt(16, tables);
+                    ps.addBatch();
+                    ps.executeBatch();
+                }
+            }
+
+            System.out.println("Parsing and insertion complete.");
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private static String extractValue(String desc, String key) {
+        try {
+            String pattern = key + ":";
+            int idx = desc.indexOf(pattern);
+            if (idx < 0) return "";
+            String s = desc.substring(idx + pattern.length()).trim();
+            // Take until next # or space
+            if (s.contains("#")) s = s.split("#")[0];
+            else if (s.contains(" ")) s = s.split(" ")[0];
+            return s;
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    public static void main(String[] args) {
+        
+    }
+}

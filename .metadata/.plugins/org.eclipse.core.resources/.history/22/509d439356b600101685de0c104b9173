@@ -1,0 +1,207 @@
+package rest_api_job;
+
+import org.json.JSONObject;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.sql.*;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import javax.net.ssl.*;
+
+public class rest_api_methods {
+
+    // =================== CONFIG =====================
+    private static final String BASE_URL = "https://poc.itsimple.in/restapi";
+    private static final String AUTH_URL = BASE_URL + "/authenticate";
+    private static final String JOB_DETAILS_URL = BASE_URL + "/activity/jobs/";
+
+    private static final String DB_URL = "jdbc:mysql://localhost:3306/pview";
+    private static final String DB_USER = "root";
+    private static final String DB_PASS = "root";
+
+    private static final SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+    private String token = null;
+
+    // =================================================
+    // STEP 1: Disable SSL Verification (Trust All)
+    // =================================================
+    static {
+        try {
+            TrustManager[] trustAllCerts = new TrustManager[]{
+                new X509TrustManager() {
+                    public java.security.cert.X509Certificate[] getAcceptedIssuers() { return null; }
+                    public void checkClientTrusted(java.security.cert.X509Certificate[] certs, String authType) {}
+                    public void checkServerTrusted(java.security.cert.X509Certificate[] certs, String authType) {}
+                }
+            };
+            SSLContext sc = SSLContext.getInstance("TLS");
+            sc.init(null, trustAllCerts, new java.security.SecureRandom());
+            HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
+            HttpsURLConnection.setDefaultHostnameVerifier(new HostnameVerifier() {
+                public boolean verify(String hostname, SSLSession session) {
+                    return true;
+                }
+            });
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    // =================================================
+    // STEP 2: Authentication
+    // =================================================
+    public void authenticate(String username, String password) {
+        try {
+            log("INFO", "Authenticating user: " + username);
+            URL url = new URL(AUTH_URL);
+            HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setDoOutput(true);
+
+            String payload = "{\"username\":\"" + username + "\",\"password\":\"" + password + "\"}";
+            OutputStream os = conn.getOutputStream();
+            os.write(payload.getBytes(StandardCharsets.UTF_8));
+            os.flush();
+            os.close();
+
+            int responseCode = conn.getResponseCode();
+            if (responseCode != 200) {
+                log("ERROR", "Authentication failed. HTTP code: " + responseCode);
+                return;
+            }
+
+            BufferedReader in = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+            StringBuilder response = new StringBuilder();
+            String line;
+            while ((line = in.readLine()) != null) {
+                response.append(line);
+            }
+            in.close();
+
+            JSONObject json = new JSONObject(response.toString());
+            token = json.optString("token", null);
+
+            if (token != null) {
+                log("INFO", "Authentication successful.");
+            } else {
+                log("ERROR", "Token not found in response.");
+            }
+
+        } catch (Exception e) {
+            log("ERROR", "Authentication error: " + e.getMessage());
+        }
+    }
+
+    // =================================================
+    // STEP 3: Process all pending archiving jobs
+    // =================================================
+    public void processArchivingJobs() {
+        Connection conn = null;
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+
+        try {
+            conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+            String query = "SELECT job_id FROM archiving_details WHERE status IS NULL OR status <> 'Completed'";
+            ps = conn.prepareStatement(query);
+            rs = ps.executeQuery();
+
+            while (rs.next()) {
+                int jobId = rs.getInt("job_id");
+                log("INFO", "Processing Job ID: " + jobId);
+                processSingleJob(conn, jobId);
+            }
+
+        } catch (Exception e) {
+            log("ERROR", "Failed to process jobs: " + e.getMessage());
+        } finally {
+            try { if (rs != null) rs.close(); } catch (Exception e) {}
+            try { if (ps != null) ps.close(); } catch (Exception e) {}
+            try { if (conn != null) conn.close(); } catch (Exception e) {}
+        }
+    }
+
+    // =================================================
+    // STEP 4: Fetch job details and update DB
+    // =================================================
+    private void processSingleJob(Connection conn, int jobId) {
+        JSONObject jobData = fetchJobDetails(jobId);
+        if (jobData == null) {
+            log("WARN", "No data received for job ID: " + jobId);
+            return;
+        }
+
+        try {
+            JSONObject archive = jobData.getJSONObject("archive");
+            String jobName = archive.optString("name", null);
+            String creationDate = archive.optString("creationDate", null);
+            String status = jobData.optString("status", null);
+            String expectedVolume = jobData.optString("expectedVolume", null);
+            String volume = jobData.optString("volume", null);
+
+            String updateQuery = "UPDATE archiving_details SET JobName=?, CreationDate=?, Status=?, ExpectedVolume=?, Volume=? WHERE job_id=?";
+            PreparedStatement ps = conn.prepareStatement(updateQuery);
+            ps.setString(1, jobName);
+            ps.setString(2, creationDate);
+            ps.setString(3, status);
+            ps.setString(4, expectedVolume);
+            ps.setString(5, volume);
+            ps.setInt(6, jobId);
+            ps.executeUpdate();
+            ps.close();
+
+            log("INFO", "Updated Job ID " + jobId + " | Status: " + status);
+
+        } catch (Exception e) {
+            log("ERROR", "Error updating job " + jobId + ": " + e.getMessage());
+        }
+    }
+
+    // =================================================
+    // STEP 5: Fetch single job details from API
+    // =================================================
+    private JSONObject fetchJobDetails(int jobId) {
+        BufferedReader in = null;
+        try {
+            String urlStr = JOB_DETAILS_URL + jobId + "/";
+            URL url = new URL(urlStr);
+            HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("Authorization", "Token " + token);
+
+            int responseCode = conn.getResponseCode();
+            if (responseCode != 200) {
+                log("WARN", "Job ID " + jobId + " | Response Code: " + responseCode);
+                return null;
+            }
+
+            in = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+            StringBuilder response = new StringBuilder();
+            String line;
+            while ((line = in.readLine()) != null) {
+                response.append(line);
+            }
+
+            return new JSONObject(response.toString());
+
+        } catch (Exception e) {
+            log("ERROR", "Failed to fetch job " + jobId + ": " + e.getMessage());
+            return null;
+        } finally {
+            try { if (in != null) in.close(); } catch (Exception e) {}
+        }
+    }
+
+    // =================================================
+    // STEP 6: Logger
+    // =================================================
+    private void log(String level, String msg) {
+        String time = sdf.format(new Date());
+        System.out.println("[" + time + "] [" + level + "] " + msg);
+    }
+}

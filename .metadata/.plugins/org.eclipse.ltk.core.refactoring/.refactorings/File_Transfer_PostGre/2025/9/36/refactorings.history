@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename package &apos;ftp_postgre&apos; to &apos;preprocess_ip&apos;&#x0D;&#x0A;- Original project: &apos;File_Transfer_PostGre&apos;&#x0D;&#x0A;- Original element: &apos;File_Transfer_PostGre/src/ftp_postgre&apos;&#x0D;&#x0A;- Renamed element: &apos;File_Transfer_PostGre/src/preprocess_ip&apos;&#x0D;&#x0A;- Update references to refactored element&#x0D;&#x0A;- Update textual occurrences in comments and strings" description="Rename package &apos;ftp_postgre&apos;" flags="589830" hierarchical="false" id="org.eclipse.jdt.ui.rename.package" input="/src&lt;ftp_postgre" name="preprocess_ip" qualified="false" references="true" stamp="1756880178170" textual="false" version="1.0"/>
+</session>

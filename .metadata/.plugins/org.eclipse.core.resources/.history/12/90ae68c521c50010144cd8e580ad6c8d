@@ -1,0 +1,1265 @@
+package rest_api_v4;
+
+import java.io.*;
+import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import javax.net.ssl.*;
+import org.json.*;
+
+public class rest_api_methods {
+	private static final String BASE_URL = "https://poc.itsimple.in/restapi";
+	private static final String LOG_PREFIX_INFO = "[INFO]";
+	private static final String LOG_PREFIX_DEBUG = "[DEBUG]";
+	private static final String LOG_PREFIX_SUCCESS = "[SUCCESS]";
+	private static final String LOG_PREFIX_ERROR = "[ERROR]";
+	private static final String LOG_PREFIX_WARN = "[WARN]";
+	private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+	/**
+	 * Main orchestration method - executes all setup steps in sequence
+	 */
+	public void run(String enterpriseName, String username, String password, String confirmPassword, String accessKey,
+			String secretKey, String bucketName, String userQuota) throws Exception {
+
+		logInfo("========================================");
+		logInfo("Starting REST API Setup Process");
+		logInfo("Enterprise: " + enterpriseName);
+		logInfo("Username: " + username);
+		logInfo("========================================");
+
+		try {
+			// Step 0: Disable SSL verification
+			logInfo("Step 0: Disabling SSL verification...");
+			disableSSL();
+			logSuccess("SSL verification disabled successfully");
+
+			// Step 1: Authenticate
+			logInfo("Step 1: Authenticating user...");
+			String token = authenticate(BASE_URL, "ADA", "root", "ATempo@123");
+			if (token == null || token.isEmpty()) {
+				throw new Exception("Authentication failed, Code: 5");
+			}
+			logSuccess("Authentication successful. Token obtained.");
+			logDebug("Token length: " + token.length());
+
+			// Step 1.5: Check Enterprise and User existence in DB
+			logInfo("Step 1.5: Checking enterprise and user existence in database...");
+			boolean enterpriseExists = rest_api_DBConnection.enterpriseExists(enterpriseName);
+			boolean userExists = rest_api_DBConnection.userExists(enterpriseName, username);
+			logDebug("Enterprise exists: " + enterpriseExists);
+			logDebug("User exists: " + userExists);
+
+			// ========================== CASE HANDLING
+			// ==========================
+
+			if (!enterpriseExists && !userExists) {
+				logInfo("[CASE 1] Enterprise = N, User = N -> Running full setup sequence...");
+
+				// Step 2: Create/Get Enterprise Repository
+				logInfo("Step 2: Handling enterprise repository...");
+				int enterpriseId = handleEnterprise(enterpriseName, username, token);
+				logSuccess("Enterprise ID obtained: " + enterpriseId);
+
+				// Step 3: Create Enterprise Folder
+				logInfo("Step 3: Creating enterprise folder...");
+				createEnterpriseFolder(enterpriseId, enterpriseName, username, token);
+				createUserFolder(enterpriseName,username,token); //User create
+				logSuccess("Enterprise folder created successfully");
+
+				// Step 4: Create Archival Project
+				logInfo("Step 4: Creating archival project...");
+				createProject(enterpriseName, token);
+				logSuccess("Archival project created successfully");
+
+				// Step 5: Handle Bucket(s)
+				logInfo("Step 5: Handling bucket creation...");
+				handleBucket(enterpriseName, username, password, bucketName, accessKey, secretKey, userQuota, token);
+				logSuccess("Bucket handling completed successfully");
+
+				// Step 6: Create Agent Folder
+				logInfo("Step 6: Creating agent folder...");
+				createAgentFolder(enterpriseName, token);
+				logSuccess("Agent folder created successfully");
+
+				// Step 7: Create Storage Container
+				logInfo("Step 7: Creating storage container...");
+				createContainer(enterpriseName,username, token);
+				logSuccess("Storage container created successfully");
+
+				// Step 8: Create Policy
+				logInfo("Step 8: Creating policy...");
+				createPolicy(enterpriseName, token);
+				logSuccess("Policy created successfully, Code: 1");
+				
+				rest_api_DBConnection.user_status();
+				
+				System.out.println("Enterprise Created & User Created Successfully");
+
+			} else if (enterpriseExists && !userExists) {
+				logInfo("[CASE 2] Enterprise = Y, User = N -> Running user setup sequence...");
+
+				// Get existing enterprise info
+				logInfo("Fetching existing enterprise repository info...");
+				int enterpriseId = rest_api_DBConnection.getEnterpriseId(enterpriseName);
+				logDebug("Existing enterprise ID: " + enterpriseId);
+
+				// Create user folder
+				logInfo("Step 2: Creating user folder...");
+//				createEnterpriseFolder(enterpriseId, enterpriseName, username, token);
+				createUserFolder(enterpriseName,username,token);
+				logSuccess("User folder created successfully");
+
+				// Create SCMs for user
+				logInfo("Step 3: Creating SCMs for user...");
+				handleBucket(enterpriseName, username, password, bucketName, accessKey, secretKey, userQuota, token);
+				logSuccess("User SCMs created successfully");
+
+				// Create Target SMC on Disk
+				logInfo("Step 4: Creating target SMC on disk...");
+				createAgentFolder(enterpriseName, token);
+				logSuccess("Target SMC created successfully");
+				
+				// Create Target Container
+				logInfo("Step 5 : Creating storage container...");
+				createContainer(enterpriseName,username,token);
+				logSuccess("Storage container created successfully");
+				
+				rest_api_DBConnection.user_status();
+				System.out.println("Enterprise Already There & User Created Successfully, Code: 2");
+
+			} else if (enterpriseExists && userExists) {
+				
+				logInfo("[CASE 3] Enterprise = Y, User = Y -> No creation needed");
+				rest_api_DBConnection.user_status();
+				logSuccess("Both enterprise and user already exist, Code: 3");
+			}
+
+			// ===================================================================
+
+//			logInfo("========================================");
+//			logSuccess("REST API Setup Process Completed Successfully!");
+//			logInfo("========================================");
+//			System.out.println("1");
+
+		} catch (Exception e) {
+//			logError("Setup process failed:" + e.getMessage());
+			logError("Failure, Code: 4");
+//			e.printStackTrace();
+			throw e;
+		}
+	}
+
+	/**
+	 * Disables SSL certificate verification (for development/testing only)
+	 */
+	private void disableSSL() throws Exception {
+		try {
+			TrustManager[] trustAllCerts = new TrustManager[] { new X509TrustManager() {
+				public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+					return null;
+				}
+
+				public void checkClientTrusted(java.security.cert.X509Certificate[] certs, String authType) {
+				}
+
+				public void checkServerTrusted(java.security.cert.X509Certificate[] certs, String authType) {
+				}
+			} };
+
+			SSLContext sc = SSLContext.getInstance("SSL");
+			sc.init(null, trustAllCerts, new java.security.SecureRandom());
+			HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
+			HttpsURLConnection.setDefaultHostnameVerifier((hostname, session) -> true);
+
+			logDebug("SSL verification disabled");
+		} catch (Exception e) {
+			logError("Failed to disable SSL: " + e.getMessage());
+			throw e;
+		}
+	}
+
+	/**
+	 * Authenticates user and retrieves access token
+	 */
+	public String authenticate(String baseUrl, String dbName, String username, String password) throws Exception {
+		String authUrl = baseUrl + "/auth/token/";
+		logInfo("Authenticating user: " + username);
+		logDebug("Authentication URL: " + authUrl);
+		logDebug("Database: " + dbName);
+
+		HttpURLConnection conn = null;
+		try {
+			URL url = new URL(authUrl);
+			conn = (HttpURLConnection) url.openConnection();
+			conn.setRequestMethod("POST");
+			conn.setDoOutput(true);
+			conn.setRequestProperty("Content-Type", "application/json");
+			conn.setRequestProperty("Accept", "application/json");
+
+			// Build JSON payload
+			JSONObject body = new JSONObject();
+			body.put("dbName", dbName);
+			body.put("name", username);
+			body.put("password", password);
+			body.put("superUser", true);
+
+			logDebug("Request payload: " + body.toString(2));
+
+			// Send request
+			try (OutputStream os = conn.getOutputStream()) {
+				os.write(body.toString().getBytes(StandardCharsets.UTF_8));
+			}
+
+			int responseCode = conn.getResponseCode();
+			logDebug("Authentication response code: " + responseCode);
+
+			InputStream is = (responseCode >= 200 && responseCode < 300) ? conn.getInputStream()
+					: conn.getErrorStream();
+
+			String responseText = readStream(is);
+			logDebug("Authentication response: " + responseText);
+
+			// Validate response
+			if (responseCode == 200 || responseCode == 201) {
+				if (!responseText.trim().startsWith("{")) {
+					logError("Non-JSON authentication response received");
+					throw new Exception("Server returned non-JSON response");
+				}
+
+				JSONObject jsonResponse = new JSONObject(responseText);
+				if (jsonResponse.has("access")) {
+					String token = jsonResponse.getString("access");
+					logSuccess("Authentication successful");
+					return token;
+				} else {
+					logError("Response does not contain access token");
+					throw new Exception("Access token not found in response");
+				}
+			} else if (responseCode == 401) {
+				logError("Authentication failed: Invalid credentials");
+				throw new Exception("Invalid username or password");
+			} else if (responseCode == 403) {
+				logError("Authentication failed: Access forbidden");
+				throw new Exception("User does not have required permissions");
+			} else {
+				logError("Authentication failed with code: " + responseCode);
+				throw new Exception("Authentication failed: " + responseText);
+			}
+
+		} catch (Exception e) {
+			logError("Exception during authentication: " + e.getMessage());
+			throw e;
+		} finally {
+			if (conn != null) {
+				conn.disconnect();
+			}
+		}
+	}
+
+	/**
+	 * Creates or retrieves existing enterprise repository
+	 */
+	public int handleEnterprise(String enterpriseName, String username, String token) throws Exception {
+		logInfo("Handling enterprise repository: " + enterpriseName);
+
+		// Check if enterprise already exists in database
+		if (rest_api_DBConnection.enterpriseExists(enterpriseName)) {
+			int existingId = rest_api_DBConnection.getEnterpriseId(enterpriseName);
+			logWarn("Enterprise already exists in database with ID: " + existingId);
+			return existingId;
+		}
+
+		logInfo("Creating new enterprise repository...");
+		HttpsURLConnection conn = null;
+
+		try {
+			URL url = new URL(BASE_URL + "/datamanagement/repositories/");
+			conn = (HttpsURLConnection) url.openConnection();
+			conn.setRequestMethod("POST");
+			conn.setRequestProperty("Authorization", "Bearer " + token);
+			conn.setRequestProperty("Content-Type", "application/json");
+			conn.setRequestProperty("Accept", "application/json");
+			conn.setDoOutput(true);
+
+			long volumeQuota = 10737418240L; // 10GB in bytes
+
+			// Prepare JSON payload
+			JSONObject payload = new JSONObject();
+			payload.put("name", enterpriseName);
+			payload.put("mode", "archiving");
+			payload.put("comment", "Repository for " + enterpriseName);
+			payload.put("volumeQuota", volumeQuota);
+
+			JSONObject owner = new JSONObject();
+			owner.put("name", "root");
+			payload.put("owner", owner);
+
+			JSONObject organization = new JSONObject();
+			organization.put("name", "_Archiving");
+			payload.put("organization", organization);
+
+			logDebug("Enterprise creation payload: " + payload.toString(2));
+
+			// Send request
+			try (OutputStream os = conn.getOutputStream()) {
+				os.write(payload.toString().getBytes(StandardCharsets.UTF_8));
+				os.flush();
+			}
+
+			int responseCode = conn.getResponseCode();
+			String response = readResponse(conn);
+
+			logDebug("Enterprise creation response code: " + responseCode);
+			logDebug("Enterprise creation response: " + response);
+
+			// Handle response
+			if (responseCode == 201) {
+				JSONObject json = new JSONObject(response);
+				int enterpriseId = json.has("id") ? json.getInt("id") : -1;
+
+				if (enterpriseId == -1) {
+					throw new RuntimeException("Enterprise ID not found in response");
+				}
+
+				// Save to database
+				rest_api_DBConnection.insertEnterprise(enterpriseName, enterpriseId, "", "");
+				logSuccess("Enterprise created successfully with ID: " + enterpriseId);
+
+				return enterpriseId;
+
+			} else if (responseCode == 409) {
+				logWarn("Enterprise already exists on server (conflict)");
+				throw new RuntimeException("Enterprise name already exists: " + enterpriseName);
+			} else if (responseCode == 401) {
+				logError("Unauthorized: Invalid or expired token");
+				throw new RuntimeException("Authorization failed - please check token");
+			} else {
+				logError("Failed to create enterprise. Response code: " + responseCode);
+				throw new RuntimeException("Enterprise creation failed: " + response);
+			}
+
+		} catch (Exception e) {
+			logError("Exception while handling enterprise: " + e.getMessage());
+			throw e;
+		} finally {
+			if (conn != null) {
+				conn.disconnect();
+			}
+		}
+	}
+
+	/**
+	 * Creates a folder within the enterprise repository
+	 */
+	public void createEnterpriseFolder(int repositoryId, String enterpriseName, String username, String token)
+			throws Exception {
+
+		String folderName = enterpriseName + "-" + username;
+		logInfo("Creating enterprise folder: " + folderName);
+		logDebug("Repository ID: " + repositoryId);
+
+		HttpsURLConnection conn = null;
+
+		try {
+			// Step 1: Get browser handle
+			logDebug("Retrieving browser handle...");
+			String browserUrl = BASE_URL + "/datamanagement/repositories/" + repositoryId + "/browser/?format=json";
+			URL url = new URL(browserUrl);
+			conn = (HttpsURLConnection) url.openConnection();
+			conn.setRequestMethod("GET");
+			conn.setRequestProperty("Authorization", "Bearer " + token);
+			conn.setRequestProperty("Accept", "application/json");
+
+			String browserResponse = readResponse(conn);
+			int responseCode = conn.getResponseCode();
+
+			logDebug("Browser handle response code: " + responseCode);
+
+			if (responseCode != 200) {
+				logError("Failed to get browser handle");
+				throw new RuntimeException(
+						"Failed to retrieve browser handle. Code: " + responseCode + ", Response: " + browserResponse);
+			}
+
+			if (!browserResponse.trim().startsWith("{")) {
+				logError("Invalid JSON response from browser endpoint");
+				throw new RuntimeException(
+						"Non-JSON response: " + browserResponse.substring(0, Math.min(200, browserResponse.length())));
+			}
+
+			JSONObject browserJson = new JSONObject(browserResponse);
+			int browserHandle = browserJson.getInt("browserHandle");
+			logSuccess("Browser handle obtained: " + browserHandle);
+
+			conn.disconnect();
+
+			// Step 2: Create folder
+			logDebug("Creating folder with path: /" + folderName);
+			String folderUrl = BASE_URL + "/datamanagement/repositories/" + repositoryId + "/browse/folder/";
+			url = new URL(folderUrl);
+			conn = (HttpsURLConnection) url.openConnection();
+			conn.setRequestMethod("POST");
+			conn.setRequestProperty("Authorization", "Bearer " + token);
+			conn.setRequestProperty("Accept", "application/json");
+			conn.setRequestProperty("Content-Type", "application/json");
+			conn.setDoOutput(true);
+
+			JSONObject payload = new JSONObject();
+			payload.put("browserHandle", browserHandle);
+			payload.put("path", "/" + folderName);
+
+			logDebug("Folder creation payload: " + payload.toString(2));
+
+			try (OutputStream os = conn.getOutputStream()) {
+				os.write(payload.toString().getBytes(StandardCharsets.UTF_8));
+			}
+
+			String postResponse = readResponse(conn);
+			responseCode = conn.getResponseCode();
+
+			logDebug("Folder creation response code: " + responseCode);
+			logDebug("Folder creation response: " + postResponse);
+
+			if (responseCode == 200 || responseCode == 201) {
+				logSuccess("Folder created successfully: /" + folderName);
+			} else if (responseCode == 409) {
+				logWarn("Folder already exists: /" + folderName);
+			} else if (responseCode == 401) {
+				logError("Unauthorized: Token may be invalid");
+				throw new RuntimeException("Authorization failed during folder creation");
+			} else {
+				logError("Folder creation failed with code: " + responseCode);
+				throw new RuntimeException("Failed to create folder: " + postResponse);
+			}
+
+		} catch (Exception e) {
+			logError("Exception during folder creation: " + e.getMessage());
+			throw e;
+		} finally {
+			if (conn != null) {
+				conn.disconnect();
+			}
+		}
+	}
+	
+	public void createUserFolder(String enterpriseName, String username, String token) throws Exception {
+
+	    int agentId = 2;  // Always Agent 2
+	    String path = "C:\\DemoDirectory\\" + enterpriseName + "\\" + username;
+
+	    logInfo("Creating user folder for Enterprise: " + enterpriseName + ", Username: " + username);
+	    logDebug("Resolved folder path: " + path);
+
+	    HttpsURLConnection conn = null;
+
+	    try {
+	        // -------------------------
+	        // Step 1: Get Browser Handle
+	        // -------------------------
+	        logDebug("Retrieving browser handle...");
+
+	        String browserUrl = BASE_URL + "/infrastructure/agents/" + agentId + "/browser/?format=json";
+	        URL url = new URL(browserUrl);
+	        conn = (HttpsURLConnection) url.openConnection();
+	        conn.setRequestMethod("GET");
+	        conn.setRequestProperty("Authorization", "Bearer " + token);
+	        conn.setRequestProperty("Accept", "application/json");
+
+	        String browserResponse = readResponse(conn);
+	        int responseCode = conn.getResponseCode();
+
+	        logDebug("Browser handle response code: " + responseCode);
+
+	        if (responseCode != 200) {
+	            logError("Failed to retrieve browser handle");
+	            throw new RuntimeException(
+	                "Browser handle failed. Code: " + responseCode + ", Response: " + browserResponse
+	            );
+	        }
+
+	        if (!browserResponse.trim().startsWith("{")) {
+	            logError("Invalid JSON response from browser endpoint");
+	            throw new RuntimeException(
+	                "Non-JSON response: " + browserResponse.substring(0, Math.min(200, browserResponse.length()))
+	            );
+	        }
+
+	        JSONObject browserJson = new JSONObject(browserResponse);
+	        int browserHandle = browserJson.getInt("browserHandle");
+	        logSuccess("Browser handle obtained: " + browserHandle);
+
+	        conn.disconnect();
+
+
+	        // -------------------------
+	        // Step 2: Create User Folder
+	        // -------------------------
+	        logDebug("Creating folder on agent 2 with path: " + path);
+
+	        String folderUrl = BASE_URL + "/infrastructure/agents/" + agentId + "/browse/folder/";
+	        url = new URL(folderUrl);
+	        conn = (HttpsURLConnection) url.openConnection();
+	        conn.setRequestMethod("POST");
+	        conn.setRequestProperty("Authorization", "Bearer " + token);
+	        conn.setRequestProperty("Accept", "application/json");
+	        conn.setRequestProperty("Content-Type", "application/json");
+	        conn.setDoOutput(true);
+
+	        JSONObject payload = new JSONObject();
+	        payload.put("browserHandle", browserHandle);
+	        payload.put("path", path);
+
+	        logDebug("User folder creation payload: " + payload.toString(2));
+
+	        try (OutputStream os = conn.getOutputStream()) {
+	            os.write(payload.toString().getBytes(StandardCharsets.UTF_8));
+	        }
+
+	        String postResponse = readResponse(conn);
+	        responseCode = conn.getResponseCode();
+
+	        logDebug("Folder creation response code: " + responseCode);
+	        logDebug("Folder creation response: " + postResponse);
+
+	        if (responseCode == 200 || responseCode == 201) {
+	            logSuccess("User folder created successfully: " + path);
+	        } else if (responseCode == 409) {
+	            logWarn("User folder already exists: " + path);
+	        } else if (responseCode == 401) {
+	            logError("Unauthorized: Token may be invalid");
+	            throw new RuntimeException("Authorization failed during user folder creation");
+	        } else {
+	            logError("User folder creation failed. Code: " + responseCode);
+	            throw new RuntimeException("Failed to create user folder: " + postResponse);
+	        }
+
+	    } catch (Exception e) {
+	        logError("Exception during user folder creation: " + e.getMessage());
+	        throw e;
+
+	    } finally {
+	        if (conn != null) conn.disconnect();
+	    }
+	}
+
+
+	/**
+	 * Creates archival project for the enterprise
+	 */
+	public void createProject(String enterpriseName, String token) throws Exception {
+		String projectName = enterpriseName + "-Project";
+		logInfo("Creating archival project: " + projectName);
+
+		HttpURLConnection conn = null;
+
+		try {
+			String url = BASE_URL + "/organizations/archiving-projects/";
+			conn = (HttpURLConnection) new URL(url).openConnection();
+			conn.setRequestMethod("POST");
+			conn.setRequestProperty("Authorization", "Bearer " + token);
+			conn.setRequestProperty("Content-Type", "application/json");
+			conn.setRequestProperty("Accept", "application/json");
+			conn.setDoOutput(true);
+
+			JSONObject payload = new JSONObject();
+			payload.put("name", projectName);
+			payload.put("comment", "Archival project for " + enterpriseName);
+
+			logDebug("Project creation payload: " + payload.toString(2));
+
+			try (OutputStream os = conn.getOutputStream()) {
+				os.write(payload.toString().getBytes(StandardCharsets.UTF_8));
+				os.flush();
+			}
+
+			int responseCode = conn.getResponseCode();
+			logDebug("Project creation response code: " + responseCode);
+
+			InputStream is = (responseCode >= 200 && responseCode < 300) ? conn.getInputStream()
+					: conn.getErrorStream();
+
+			String response = readStream(is);
+			logDebug("Project creation response: " + response);
+
+			if (responseCode == 200 || responseCode == 201) {
+				if (response.trim().startsWith("{")) {
+					JSONObject jsonResponse = new JSONObject(response);
+					logSuccess("Archival project created successfully");
+					logInfo("Project ID: " + jsonResponse.getInt("id"));
+					logInfo("Project Name: " + jsonResponse.getString("name"));
+					if (jsonResponse.has("parent")) {
+						logInfo("Parent Organization: " + jsonResponse.getJSONObject("parent").getString("name"));
+					}
+				} else {
+					logWarn("Project may have been created but response is non-JSON");
+				}
+			} else if (responseCode == 409) {
+				logWarn("Project already exists: " + projectName);
+			} else if (responseCode == 401) {
+				logError("Unauthorized: Invalid token");
+				throw new Exception("Authorization failed during project creation");
+			} else {
+				logError("Failed to create project with code: " + responseCode);
+				throw new Exception("Project creation failed: " + response);
+			}
+
+		} catch (Exception e) {
+			logError("Exception during project creation: " + e.getMessage());
+			throw e;
+		} finally {
+			if (conn != null) {
+				conn.disconnect();
+			}
+		}
+	}
+
+	/**
+	 * Creates or retrieves S3 bucket(s) with SMC configuration
+	 */
+	public void handleBucket(String enterpriseName, String username, String password, String bucketNames,
+			String accessKey, String secretKey, String userQuota, String token) throws Exception {
+
+		logInfo("Handling bucket creation for enterprise: " + enterpriseName);
+		String[] buckets = bucketNames.split(",");
+		logInfo("Number of buckets to process: " + buckets.length);
+
+		for (int i = 0; i < buckets.length; i++) {
+			String bucket = buckets[i].trim();
+
+			logInfo("----------------------------------------");
+			logInfo("Processing bucket " + (i + 1) + " of " + buckets.length + ": " + bucket);
+			logInfo("----------------------------------------");
+
+			// Construct SMC displayName and alias
+			String displayName = enterpriseName + "-" + username + "-" + bucket + "-SourceSMC";
+			String alias = enterpriseName + "-" + username + "-" + bucket + "-SourceSMCPN";
+
+			logDebug("Display Name: " + displayName);
+			logDebug("Alias: " + alias);
+
+			HttpsURLConnection conn = null;
+
+			try {
+				// Step 1: Check if bucket already exists
+				logDebug("Checking existing buckets...");
+				URL getUrl = new URL(BASE_URL + "/infrastructure/object-storages/4/buckets/");
+				conn = (HttpsURLConnection) getUrl.openConnection();
+				conn.setRequestMethod("GET");
+				conn.setRequestProperty("Authorization", "Bearer " + token);
+				conn.setRequestProperty("Accept", "application/json");
+
+				int getResponseCode = conn.getResponseCode();
+				String getResponse = readResponse(conn);
+
+				logDebug("Get buckets response code: " + getResponseCode);
+
+				if (getResponseCode != 200) {
+					logError("Failed to retrieve existing buckets");
+					conn.disconnect();
+					continue;
+				}
+
+				JSONObject json = new JSONObject(getResponse);
+				JSONArray results = json.getJSONArray("results");
+				logDebug("Found " + results.length() + " existing buckets");
+
+				boolean exists = false;
+				for (int j = 0; j < results.length(); j++) {
+					JSONObject obj = results.getJSONObject(j);
+					String existingDisplayName = obj.getString("displayName");
+
+					if (existingDisplayName.equals(displayName)) {
+						exists = true;
+						logWarn("Bucket already exists: " + displayName);
+						logInfo("Bucket ID: " + obj.getInt("id"));
+
+						// Insert into database
+						rest_api_DBConnection.insertEnterpriseUserDetail(enterpriseName, username, password, bucket,
+								String.valueOf(obj.getInt("id")), userQuota, existingDisplayName,
+								obj.getJSONObject("useAsSource").getString("alias"), "s3://" + bucket,
+								"C:/DemoDirectory/" + bucket);
+						logSuccess("Bucket info saved to database");
+						break;
+					}
+				}
+
+				conn.disconnect();
+
+				if (!exists) {
+					// Step 2: Create new bucket
+					logInfo("Creating new bucket: " + bucket);
+
+					URL postUrl = new URL(BASE_URL + "/infrastructure/object-storages/4/buckets/");
+					conn = (HttpsURLConnection) postUrl.openConnection();
+					conn.setRequestMethod("POST");
+					conn.setRequestProperty("Authorization", "Bearer " + token);
+					conn.setRequestProperty("Content-Type", "application/json");
+					conn.setRequestProperty("Accept", "application/json");
+					conn.setDoOutput(true);
+
+					// Build payload
+					JSONObject payload = new JSONObject();
+					payload.put("name", bucket);
+					payload.put("nbThreads", 2);
+					payload.put("sendMetadata", true);
+					payload.put("displayName", displayName);
+					payload.put("accessKey", accessKey);
+					payload.put("secretKey", secretKey);
+
+					JSONObject useAsSource = new JSONObject();
+					useAsSource.put("enabled", true);
+					useAsSource.put("alias", alias);
+					payload.put("useAsSource", useAsSource);
+
+					logDebug("Bucket creation payload: " + payload.toString(2));
+
+					try (OutputStream os = conn.getOutputStream()) {
+						os.write(payload.toString().getBytes(StandardCharsets.UTF_8));
+					}
+
+					int postResponseCode = conn.getResponseCode();
+					String postResponse = readResponse(conn);
+
+					logDebug("Bucket creation response code: " + postResponseCode);
+					logDebug("Bucket creation response: " + postResponse);
+
+					if (postResponseCode == 200 || postResponseCode == 201) {
+						JSONObject respJson = new JSONObject(postResponse);
+						logSuccess("Bucket created successfully: " + respJson.getString("displayName"));
+						logInfo("Bucket ID: " + respJson.getInt("id"));
+
+						// Insert into database
+						rest_api_DBConnection.insertEnterpriseUserDetail(enterpriseName, username, password,
+								respJson.getString("name"), String.valueOf(respJson.getInt("id")), userQuota,
+								respJson.getString("displayName"),
+								respJson.getJSONObject("useAsSource").getString("alias"),
+								"s3://" + respJson.getString("name"), "C:/DemoDirectory/" + bucket);
+						logSuccess("Bucket info saved to database");
+
+					} else if (postResponseCode == 409) {
+						logWarn("Bucket already exists on server: " + bucket);
+					} else if (postResponseCode == 401) {
+						logError("Unauthorized: Token may be invalid");
+					} else if (postResponseCode == 400) {
+						logError("Bad request: " + postResponse);
+					} else {
+						logError("Failed to create bucket with code: " + postResponseCode);
+					}
+
+					conn.disconnect();
+				}
+
+			} catch (Exception e) {
+				logError("Exception while handling bucket '" + bucket + "': " + e.getMessage());
+				if (conn != null) {
+					conn.disconnect();
+				}
+				// Continue with next bucket
+			}
+		}
+
+		logSuccess("Bucket handling completed for all buckets");
+	}
+
+	/**
+	 * Creates agent folder for file system access
+	 */
+	public void createAgentFolder(String enterpriseName, String token) throws Exception {
+		logInfo("Creating agent folder for: " + enterpriseName);
+
+		HttpsURLConnection conn = null;
+
+		try {
+			// Step 1: Get browser handle
+			logDebug("Retrieving agent browser handle...");
+			URL url = new URL(BASE_URL + "/infrastructure/agents/2/browser/");
+			conn = (HttpsURLConnection) url.openConnection();
+			conn.setRequestMethod("GET");
+			conn.setRequestProperty("Authorization", "Bearer " + token);
+			conn.setRequestProperty("Accept", "application/json");
+
+			String response = readResponse(conn);
+			int responseCode = conn.getResponseCode();
+
+			logDebug("Agent browser response code: " + responseCode);
+
+			if (responseCode != 200) {
+				logError("Failed to get agent browser handle");
+				throw new Exception("Unable to retrieve agent browser handle. Code: " + responseCode);
+			}
+
+			JSONObject json = new JSONObject(response);
+			int browserHandle = json.getInt("browserHandle");
+			logSuccess("Agent browser handle obtained: " + browserHandle);
+
+			conn.disconnect();
+
+			// Step 2: Create folder
+			String folderPath = "/C:/DemoDirectory/" + enterpriseName;
+			logDebug("Creating agent folder at path: " + folderPath);
+
+			url = new URL(BASE_URL + "/infrastructure/agents/2/browse/folder/");
+			conn = (HttpsURLConnection) url.openConnection();
+			conn.setRequestMethod("POST");
+			conn.setRequestProperty("Authorization", "Bearer " + token);
+			conn.setRequestProperty("Content-Type", "application/json");
+			conn.setRequestProperty("Accept", "application/json");
+			conn.setDoOutput(true);
+
+			JSONObject payload = new JSONObject();
+			payload.put("browserHandle", browserHandle);
+			payload.put("path", folderPath);
+
+			logDebug("Agent folder creation payload: " + payload.toString(2));
+
+			try (OutputStream os = conn.getOutputStream()) {
+				os.write(payload.toString().getBytes(StandardCharsets.UTF_8));
+			}
+
+			response = readResponse(conn);
+			responseCode = conn.getResponseCode();
+
+			logDebug("Agent folder creation response code: " + responseCode);
+			logDebug("Agent folder creation response: " + response);
+
+			if (responseCode == 200 || responseCode == 201) {
+				logSuccess("Agent folder created successfully: " + folderPath);
+			} else if (responseCode == 409) {
+				logWarn("Agent folder already exists: " + folderPath);
+			} else if (responseCode == 401) {
+				logError("Unauthorized: Invalid token");
+				throw new Exception("Authorization failed during agent folder creation");
+			} else {
+				logError("Failed to create agent folder with code: " + responseCode);
+				throw new Exception("Agent folder creation failed: " + response);
+			}
+
+		} catch (Exception e) {
+			logError("Exception during agent folder creation: " + e.getMessage());
+			throw e;
+		} finally {
+			if (conn != null) {
+				conn.disconnect();
+			}
+		}
+	}
+
+	/**
+	 * Creates storage container for the enterprise
+	 */
+	public void createContainer(String enterpriseName, String userName, String token) throws Exception {
+	    logInfo("Creating storage container for: " + enterpriseName);
+
+	    token = token.trim();
+	    HttpsURLConnection conn = null;
+
+	    try {
+	        disableSSL();
+
+	        String url = BASE_URL + "/infrastructure/storage-managers/9/containers/";
+
+	        // Build payload
+	        String containerPath = "/C:/DemoDirectory/" + enterpriseName;
+	        JSONObject payload = new JSONObject();
+	        String containerName = enterpriseName + "-TargetSMC";
+
+	        payload.put("name", containerName);
+	        payload.put("directory", containerPath);
+
+	        logDebug("Container creation payload: " + payload.toString(2));
+	        logDebug("Container path: " + containerPath);
+
+	        conn = (HttpsURLConnection) new URL(url).openConnection();
+	        conn.setRequestMethod("POST");
+	        conn.setRequestProperty("Authorization", "Bearer " + token);
+	        conn.setRequestProperty("Content-Type", "application/json");
+	        conn.setRequestProperty("Accept", "application/json");
+	        conn.setDoOutput(true);
+
+	        try (OutputStream os = conn.getOutputStream()) {
+	            os.write(payload.toString().getBytes(StandardCharsets.UTF_8));
+	            os.flush();
+	        }
+
+	        int responseCode = conn.getResponseCode();
+	        String response = readResponse(conn);
+
+	        logDebug("Container creation response code: " + responseCode);
+	        logDebug("Container creation response: " + response);
+
+	        // SUCCESS
+	        if (responseCode == 200 || responseCode == 201) {
+	            logSuccess("Storage container created successfully: " + enterpriseName);
+
+	            if (response.trim().startsWith("{")) {
+	                JSONObject respJson = new JSONObject(response);
+
+	                // Extract required values
+	                String targetSmcId = respJson.get("id").toString();
+	                String targetSmcName = respJson.getString("name");
+
+	                logInfo("Extracted Target SMC ID: " + targetSmcId);
+	                logInfo("Extracted Target SMC Name: " + targetSmcName);
+
+	                // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+	                //      SAVE INTO DATABASE (your new requirement)
+	                // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+	                boolean updated = rest_api_DBConnection.updateTargetSMC(
+	                        enterpriseName,
+	                        userName,
+	                        targetSmcId,
+	                        targetSmcName
+	                );
+
+	                if (updated) {
+	                    logSuccess("DB Updated: Target_SMC_id=" + targetSmcId +
+	                               " Target_SMC_name=" + targetSmcName);
+	                } else {
+	                    logError("DB Update FAILED for user: " + userName);
+	                }
+	                // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+	            }
+	        }
+
+	        // ALREADY EXISTS
+	        else if (responseCode == 412) {
+	            logWarn("Storage container already exists: " + enterpriseName);
+	        }
+
+	        // TOKEN BAD
+	        else if (responseCode == 401) {
+	            logError("Unauthorized (401): Token invalid or expired");
+	            throw new Exception("Authorization failed during container creation");
+	        }
+
+	        // BAD REQUEST
+	        else if (responseCode == 400) {
+	            logError("Bad Request (400): " + response);
+	            throw new Exception("Invalid container request: " + response);
+	        }
+
+	        // NOT FOUND
+	        else if (responseCode == 404) {
+	            logError("Not Found (404): Storage manager missing");
+	            throw new Exception("Storage manager not found");
+	        }
+
+	        // OTHER ERRORS
+	        else {
+	            logError("Container creation failed. Code: " + responseCode);
+	            logError("Response: " + response);
+	            throw new Exception("Failed to create container: " + response);
+	        }
+
+	    } catch (Exception e) {
+	        logError("Exception during container creation: " + e.getMessage());
+	        throw e;
+
+	    } finally {
+	        if (conn != null) {
+	            conn.disconnect();
+	        }
+	    }
+	}
+
+
+	/**
+	 * Creates archival policy for the enterprise
+	 */
+	public void createPolicy(String enterpriseName, String token) throws Exception {
+	    String policyName = enterpriseName + "-Policy";
+	    String containerName = enterpriseName + "-TargetSMC";
+
+	    logInfo("Creating policy: " + policyName);
+	    logDebug("Target container: " + containerName);
+
+	    HttpsURLConnection conn = null;
+
+	    try {
+	        URL url = new URL(BASE_URL + "/datamanagement/policies/");
+	        conn = (HttpsURLConnection) url.openConnection();
+	        conn.setRequestMethod("POST");
+	        conn.setRequestProperty("Authorization", "Bearer " + token);
+	        conn.setRequestProperty("Content-Type", "application/json");
+	        conn.setRequestProperty("Accept", "application/json");
+	        conn.setDoOutput(true);
+
+	        // Build payload
+	        JSONObject payload = new JSONObject();
+	        payload.put("name", policyName);
+	        payload.put("comment", "Archival policy for " + enterpriseName);
+
+	        JSONObject retention = new JSONObject();
+	        retention.put("name", "Permanent Retention");
+	        payload.put("retention", retention);
+
+	        payload.put("reduceImpactOnSource", false);
+
+	        // Storage container list
+	        JSONArray storageContainerList = new JSONArray();
+	        JSONObject containerObj = new JSONObject();
+
+	        JSONObject storageContainer = new JSONObject();
+	        storageContainer.put("name", containerName);
+
+	        JSONObject innerRetention = new JSONObject();
+	        innerRetention.put("name", "Permanent Retention");
+
+	        containerObj.put("storageContainer", storageContainer);
+	        containerObj.put("retention", innerRetention);
+
+	        storageContainerList.put(containerObj);
+	        payload.put("storageContainerList", storageContainerList);
+
+	        logDebug("Policy creation payload: " + payload.toString(2));
+
+	        // Send request
+	        try (OutputStream os = conn.getOutputStream()) {
+	            os.write(payload.toString().getBytes(StandardCharsets.UTF_8));
+	            os.flush();
+	        }
+
+	        int responseCode = conn.getResponseCode();
+	        String response = readResponse(conn);
+
+	        logDebug("Policy creation response code: " + responseCode);
+	        logDebug("Policy creation response: " + response);
+
+	        JSONObject respJson = null;
+
+	        // Handle response codes
+	        if (responseCode == 200 || responseCode == 201) {
+	            logSuccess("Policy created successfully: " + policyName);
+
+	            if (response.trim().startsWith("{")) {
+	                respJson = new JSONObject(response);
+
+	                if (respJson.has("id")) {
+	                    logInfo("Policy ID: " + respJson.getInt("id"));
+	                }
+	                if (respJson.has("name")) {
+	                    logInfo("Policy Name: " + respJson.getString("name"));
+	                }
+	            }
+
+	        } else if (responseCode == 409) {
+	            logWarn("Policy already exists: " + policyName);
+	            return;
+
+	        } else if (responseCode == 401) {
+	            logError("Unauthorized: Token is invalid or expired");
+	            throw new Exception("Authorization failed during policy creation");
+
+	        } else if (responseCode == 400) {
+	            logError("Bad Request: Invalid policy configuration");
+	            logError("Response: " + response);
+	            throw new Exception("Invalid policy configuration: " + response);
+
+	        } else if (responseCode == 404) {
+	            logError("Not Found: Storage container may not exist");
+	            throw new Exception("Storage container not found: " + containerName);
+
+	        } else {
+	            logError("Policy creation failed with code: " + responseCode);
+	            logError("Response body: " + response);
+	            throw new Exception("Failed to create policy: " + response);
+	        }
+
+	   
+	        // AUTO-INTEGRATED STEP: UPDATE archivePolicyUnix
+	        
+	        if (respJson != null) {
+	            logInfo("Updating archivePolicyUnix for newly created policy...");
+
+	            updateArchivePolicyUnix(respJson, token);
+	        }
+
+	    } catch (Exception e) {
+	        logError("Exception during policy creation: " + e.getMessage());
+	        throw e;
+
+	    } finally {
+	        if (conn != null) {
+	            conn.disconnect();
+	        }
+	    }
+	}
+
+	public void updateArchivePolicyUnix(JSONObject createPolicyResponse, String token) throws Exception {
+
+	    String setting = "archivePolicyUnix";
+	    HttpsURLConnection conn = null;
+
+	    try {
+	        // ---------------------------------------------------
+	        // Step 1: Extract required values from createPolicy()
+	        // ---------------------------------------------------
+	        if (!createPolicyResponse.has("id") || !createPolicyResponse.has("name")) {
+	            logError("Invalid policy response: Missing required fields (id/name)");
+	            throw new RuntimeException("createPolicy() did not return required fields");
+	        }
+
+	        int repositoryId = createPolicyResponse.getInt("id");
+	        String policyName = createPolicyResponse.getString("name");
+
+	        logInfo("Updating archivePolicyUnix for Repository ID: " + repositoryId);
+	        logDebug("Setting: " + setting);
+	        logDebug("Policy Name to apply: " + policyName);
+
+
+	        // ---------------------------------------------------
+	        // Step 2: Prepare PUT request
+	        // ---------------------------------------------------
+	        String urlStr = BASE_URL + "/datamanagement/repositories/" + repositoryId + "/settings/" + setting + "/";
+	        URL url = new URL(urlStr);
+
+	        conn = (HttpsURLConnection) url.openConnection();
+	        conn.setRequestMethod("PUT");
+	        conn.setRequestProperty("Authorization", "Bearer " + token);
+	        conn.setRequestProperty("Accept", "application/json");
+	        conn.setRequestProperty("Content-Type", "application/json");
+	        conn.setDoOutput(true);
+
+	        JSONObject payload = new JSONObject();
+	        payload.put("value", policyName);
+
+	        logDebug("archivePolicyUnix update payload:\n" + payload.toString(2));
+
+	        try (OutputStream os = conn.getOutputStream()) {
+	            os.write(payload.toString().getBytes(StandardCharsets.UTF_8));
+	        }
+
+
+	        // ---------------------------------------------------
+	        // Step 3: Read Response
+	        // ---------------------------------------------------
+	        String putResponse = readResponse(conn);
+	        int responseCode = conn.getResponseCode();
+
+	        logDebug("archivePolicyUnix PUT response code: " + responseCode);
+	        logDebug("archivePolicyUnix PUT response: " + putResponse);
+
+	        if (!putResponse.trim().startsWith("{")) {
+	            logError("Non-JSON response received");
+	            throw new RuntimeException("Invalid response: " + putResponse);
+	        }
+
+	        JSONObject json = new JSONObject(putResponse);
+
+
+	        // ---------------------------------------------------
+	        // Step 4: Success / Failure Evaluation
+	        // ---------------------------------------------------
+	        if (responseCode == 200) {
+	            if (json.has(setting) && json.getString(setting).equals(policyName)) {
+
+	                logSuccess("archivePolicyUnix updated successfully to: " + json.getString(setting));
+	            } else {
+	                logWarn("PUT succeeded but unexpected response body");
+	            }
+
+	        } else if (responseCode == 401) {
+	            logError("Unauthorized: Token may be invalid");
+	            throw new RuntimeException("Authorization failed for archivePolicyUnix update");
+
+	        } else {
+	            logError("archivePolicyUnix update failed. Code: " + responseCode);
+	            throw new RuntimeException("archivePolicyUnix update failed: " + putResponse);
+	        }
+
+	    } catch (Exception e) {
+	        logError("Exception during archivePolicyUnix update: " + e.getMessage());
+	        throw e;
+
+	    } finally {
+	        if (conn != null) conn.disconnect();
+	    }
+	}
+
+
+	/**
+	 * Reads response from HttpsURLConnection (handles both success and error
+	 * streams)
+	 */
+	private String readResponse(HttpsURLConnection conn) throws IOException {
+		int code = conn.getResponseCode();
+		InputStream is;
+
+		if (code >= 400) {
+			is = conn.getErrorStream();
+			if (is == null) {
+				is = conn.getInputStream();
+			}
+		} else {
+			is = conn.getInputStream();
+		}
+
+		return readStream(is);
+	}
+
+	/**
+	 * Reads input stream and converts to string
+	 */
+	private static String readStream(InputStream is) throws IOException {
+		if (is == null) {
+			return "";
+		}
+
+		StringBuilder sb = new StringBuilder();
+		try (BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+			String line;
+			while ((line = br.readLine()) != null) {
+				sb.append(line);
+			}
+		}
+
+		return sb.toString();
+	}
+
+	// ==================== LOGGING METHODS ====================
+
+	/**
+	 * Logs informational messages
+	 */
+	private void logInfo(String message) {
+		System.out.println(getTimestamp() + " " + LOG_PREFIX_INFO + " " + message);
+	}
+
+	/**
+	 * Logs debug messages (detailed technical information)
+	 */
+	private void logDebug(String message) {
+		System.out.println(getTimestamp() + " " + LOG_PREFIX_DEBUG + " " + message);
+	}
+
+	/**
+	 * Logs success messages
+	 */
+	private void logSuccess(String message) {
+		System.out.println(getTimestamp() + " " + LOG_PREFIX_SUCCESS + " " + message);
+	}
+
+	/**
+	 * Logs error messages
+	 */
+	private void logError(String message) {
+		System.err.println(getTimestamp() + " " + LOG_PREFIX_ERROR + " " + message);
+	}
+
+	/**
+	 * Logs warning messages
+	 */
+	private void logWarn(String message) {
+		System.out.println(getTimestamp() + " " + LOG_PREFIX_WARN + " " + message);
+	}
+
+	/**
+	 * Gets current timestamp for logging
+	 */
+	private String getTimestamp() {
+		return "[" + LocalDateTime.now().format(TIME_FORMATTER) + "]";
+	}
+}

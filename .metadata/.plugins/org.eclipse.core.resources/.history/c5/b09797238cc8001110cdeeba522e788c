@@ -1,0 +1,1508 @@
+package delete_process_v1;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Pattern;
+
+/**
+ * DeleteParserService
+ *
+ * PK-driven DELETE synchronizer between MySQL trigger tables and
+ * PostgreSQL target tables.
+ *
+ * Processing model:
+ *
+ *  1. Pick configuration rows with Status = INIT.
+ *  2. Read / establish maxSno for the configured trigger table.
+ *  3. Start from lastSno.
+ *  4. Process trigger sno ranges of RANGE_SIZE.
+ *  5. Inside each range, fetch records in batchSize chunks.
+ *  6. Use only primary_columns_name + primary_columns_value.
+ *  7. DELETE the corresponding PostgreSQL target row.
+ *  8. Do not inspect or update trigger sync_status.
+ *  9. Update Records_Deleted once per processing batch.
+ * 10. Advance lastSno only when the complete range succeeds.
+ * 11. Continue until lastSno == maxSno.
+ * 12. Update configuration Status as processing completes or fails.
+ *
+ * IMPORTANT:
+ *
+ *  - where_clause is NEVER read.
+ *  - insert_clause is NEVER read.
+ *  - The 220/source business table is NEVER queried.
+ *  - primary_columns_value is the ONLY source value used for deletion.
+ *  - All runtime values are bound through PreparedStatement.
+ *  - SQL identifiers are validated before being embedded in SQL.
+ *  - This class does NOT open or close DB connections.
+ */
+public class delete_process_methods {
+
+    /*
+     * Range/checkpoint size.
+     *
+     * Example:
+     *
+     * 0        -> 100000
+     * 100000   -> 200000
+     * 200000   -> 300000
+     *
+     * batchSize remains independent and controls how many matching
+     * trigger records are held in memory per fetch.
+     */
+    private static final long RANGE_SIZE = 100000L;
+
+    /*
+     * Allow:
+     *
+     * document_id
+     * metadata
+     * kyc.documents
+     *
+     * Do not allow arbitrary SQL expressions.
+     */
+    private static final Pattern SAFE_IDENTIFIER =
+            Pattern.compile(
+                    "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?$"
+            );
+
+    /*
+     * JSONB key is deliberately more restrictive.
+     */
+    private static final Pattern SAFE_JSONB_KEY =
+            Pattern.compile("^[A-Za-z0-9_]+$");
+
+    private final Logger logger;
+
+    public delete_process_methods(Logger logger) {
+        this.logger = logger;
+    }
+
+    // =====================================================================
+    // CONFIGURATION
+    // =====================================================================
+
+    /**
+     * Load configurations and retain their configuration Status.
+     */
+    public List<ParserConfig> loadEligibleConfigurations(
+            Connection mysqlConn,
+            String configTable) throws SQLException {
+
+        validateIdentifier(configTable, "config_table");
+
+        String sql =
+                "SELECT "
+                        + "sno, "
+                        + "Psql_Table_name, "
+                        + "`220_Table_name`, "
+                        + "`220_PK`, "
+                        + "Psql_PK, "
+                        + "Status, "
+                        + "Records_Deleted, "
+                        + "Trigger_Table, "
+                        + "maxSno, "
+                        + "lastSno "
+                        + "FROM " + configTable + " "
+                        + "ORDER BY sno";
+
+        List<ParserConfig> configs = new ArrayList<>();
+
+        try (PreparedStatement ps = mysqlConn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+
+            while (rs.next()) {
+
+                ParserConfig cfg = new ParserConfig();
+
+                cfg.sno = rs.getLong("sno");
+                cfg.psqlTableName = rs.getString("Psql_Table_name");
+                cfg.sourceTableName = rs.getString("220_Table_name");
+                cfg.sourcePk = rs.getString("220_PK");
+                cfg.psqlPk = rs.getString("Psql_PK");
+                cfg.status = rs.getString("Status");
+                cfg.recordsDeleted = rs.getLong("Records_Deleted");
+                cfg.triggerTable = rs.getString("Trigger_Table");
+                cfg.maxSno = rs.getLong("maxSno");
+                cfg.lastSno = rs.getLong("lastSno");
+
+                configs.add(cfg);
+            }
+        }
+
+        logger.log(
+                "INFO",
+                "CONFIG_SELECTED",
+                "Eligible_Configs=" + configs.size()
+        );
+
+        return configs;
+    }
+
+    /**
+     * Update configuration status.
+     */
+    public void updateConfigStatus(
+            Connection mysqlConn,
+            String configTable,
+            long configSno,
+            String newStatus) throws SQLException {
+
+        validateIdentifier(configTable, "config_table");
+
+        String sql =
+                "UPDATE " + configTable
+                        + " SET Status = ? "
+                        + "WHERE sno = ?";
+
+        try (PreparedStatement ps = mysqlConn.prepareStatement(sql)) {
+
+            ps.setString(1, newStatus);
+            ps.setLong(2, configSno);
+
+            ps.executeUpdate();
+        }
+
+        logger.log(
+                "INFO",
+                "CONFIG_STATUS_UPDATED",
+                "Config_Sno=" + configSno
+                        + " Status=" + newStatus
+        );
+    }
+
+    /**
+     * Persist Records_Deleted.
+     */
+    public void updateRecordsDeleted(
+            Connection mysqlConn,
+            String configTable,
+            long configSno,
+            long recordsDeleted) throws SQLException {
+
+        validateIdentifier(configTable, "config_table");
+
+        String sql =
+                "UPDATE " + configTable
+                        + " SET Records_Deleted = ? "
+                        + "WHERE sno = ?";
+
+        try (PreparedStatement ps = mysqlConn.prepareStatement(sql)) {
+
+            ps.setLong(1, recordsDeleted);
+            ps.setLong(2, configSno);
+
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * Persist maxSno snapshot.
+     */
+    public void updateMaxSno(
+            Connection mysqlConn,
+            String configTable,
+            long configSno,
+            long maxSno) throws SQLException {
+
+        validateIdentifier(configTable, "config_table");
+
+        String sql =
+                "UPDATE " + configTable
+                        + " SET maxSno = ? "
+                        + "WHERE sno = ?";
+
+        try (PreparedStatement ps = mysqlConn.prepareStatement(sql)) {
+
+            ps.setLong(1, maxSno);
+            ps.setLong(2, configSno);
+
+            ps.executeUpdate();
+        }
+
+        logger.log(
+                "INFO",
+                "MAX_SNO_SNAPSHOT",
+                "Config_Sno=" + configSno
+                        + " Max_Sno=" + maxSno
+        );
+    }
+
+    /**
+     * Persist lastSno checkpoint.
+     */
+    public void updateLastSno(
+            Connection mysqlConn,
+            String configTable,
+            long configSno,
+            long lastSno) throws SQLException {
+
+        validateIdentifier(configTable, "config_table");
+
+        String sql =
+                "UPDATE " + configTable
+                        + " SET lastSno = ? "
+                        + "WHERE sno = ?";
+
+        try (PreparedStatement ps = mysqlConn.prepareStatement(sql)) {
+
+            ps.setLong(1, lastSno);
+            ps.setLong(2, configSno);
+
+            ps.executeUpdate();
+        }
+
+        logger.log(
+                "INFO",
+                "CHECKPOINT_UPDATED",
+                "Config_Sno=" + configSno
+                        + " Last_Sno=" + lastSno
+        );
+    }
+
+    // =====================================================================
+    // MAX SNO / CHECKPOINT
+    // =====================================================================
+
+    /**
+     * Read MAX(sno) from the configured trigger table.
+     *
+     * This is used only to establish the upper snapshot boundary.
+     */
+    public long getTriggerMaxSno(
+            Connection mysqlConn,
+            String triggerTable) throws SQLException {
+
+        validateIdentifier(triggerTable, "trigger_table");
+
+        String sql =
+                "SELECT COALESCE(MAX(sno), 0) "
+                        + "FROM " + triggerTable;
+
+        try (PreparedStatement ps = mysqlConn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+
+            if (rs.next()) {
+                return rs.getLong(1);
+            }
+        }
+
+        return 0L;
+    }
+
+    /**
+     * Establish maxSno only when it has not already been captured.
+     *
+     * This guarantees that a currently running configuration keeps
+     * the same snapshot boundary even when new trigger rows arrive.
+     */
+    public long initializeMaxSno(
+            Connection mysqlConn,
+            String configTable,
+            ParserConfig config) throws SQLException {
+
+        if (config.maxSno > 0) {
+            return config.maxSno;
+        }
+
+        long maxSno =
+                getTriggerMaxSno(
+                        mysqlConn,
+                        config.triggerTable
+                );
+
+        updateMaxSno(
+                mysqlConn,
+                configTable,
+                config.sno,
+                maxSno
+        );
+
+        config.maxSno = maxSno;
+
+        return maxSno;
+    }
+
+    // =====================================================================
+    // TRIGGER FETCH
+    // =====================================================================
+
+    /**
+     * Fetch a batch within a fixed sno range.
+     *
+     * IMPORTANT:
+     *
+     * sno > cursorSno
+     * sno <= rangeEnd
+     *
+     * This means MySQL only works inside the current bounded range.
+     *
+     * Trigger sync_status is intentionally ignored.
+     *
+     * The query intentionally DOES NOT select where_clause.
+     */
+    public List<TriggerRow> fetchDeleteTriggerBatch(
+            Connection mysqlConn,
+            String triggerTable,
+            String sourceTableName,
+            long cursorSno,
+            long rangeEnd,
+            int batchSize) throws SQLException {
+
+        validateIdentifier(triggerTable, "trigger_table");
+
+        String sql =
+                "SELECT "
+                        + "sno, "
+                        + "record_time, "
+                        + "table_name, "
+                        + "primary_columns_name, "
+                        + "primary_columns_value, "
+                        + "type_of_operation "
+                        + "FROM " + triggerTable + " "
+                        + "WHERE sno > ? "
+                        + "AND sno <= ? "
+                        + "AND table_name = ? "
+                        + "AND type_of_operation = 'DELETE' "
+                        + "ORDER BY sno "
+                        + "LIMIT ?";
+
+        List<TriggerRow> rows = new ArrayList<>();
+
+        try (PreparedStatement ps = mysqlConn.prepareStatement(sql)) {
+
+            ps.setLong(1, cursorSno);
+            ps.setLong(2, rangeEnd);
+            ps.setString(3, sourceTableName);
+            ps.setInt(4, batchSize);
+
+            try (ResultSet rs = ps.executeQuery()) {
+
+                while (rs.next()) {
+
+                    TriggerRow row = new TriggerRow();
+
+                    row.sno = rs.getLong("sno");
+                    row.recordTime = rs.getTimestamp("record_time");
+                    row.tableName = rs.getString("table_name");
+                    row.primaryColumnsName =
+                            rs.getString("primary_columns_name");
+                    row.primaryColumnsValue =
+                            rs.getString("primary_columns_value");
+                    row.typeOfOperation =
+                            rs.getString("type_of_operation");
+
+                    rows.add(row);
+                }
+            }
+        }
+
+        return rows;
+    }
+
+    // =====================================================================
+    // PK VALIDATION
+    // =====================================================================
+
+    /**
+     * Trigger PK name must match configured 220_PK.
+     *
+     * where_clause is never consulted.
+     */
+    public boolean validatePkMapping(
+            TriggerRow row,
+            ParserConfig config) {
+
+        return config.sourcePk != null
+                && row.primaryColumnsName != null
+                && config.sourcePk.equalsIgnoreCase(
+                        row.primaryColumnsName.trim()
+                );
+    }
+
+    // =====================================================================
+    // POSTGRESQL TARGET MAPPING
+    // =====================================================================
+
+    static final class ResolvedTarget {
+
+        final boolean jsonb;
+        final String jsonbColumn;
+        final String jsonbKey;
+        final String plainColumn;
+
+        private ResolvedTarget(
+                boolean jsonb,
+                String jsonbColumn,
+                String jsonbKey,
+                String plainColumn) {
+
+            this.jsonb = jsonb;
+            this.jsonbColumn = jsonbColumn;
+            this.jsonbKey = jsonbKey;
+            this.plainColumn = plainColumn;
+        }
+
+        static ResolvedTarget plain(String column) {
+            return new ResolvedTarget(
+                    false,
+                    null,
+                    null,
+                    column
+            );
+        }
+
+        static ResolvedTarget jsonb(
+                String column,
+                String key) {
+
+            return new ResolvedTarget(
+                    true,
+                    column,
+                    key,
+                    null
+            );
+        }
+    }
+
+    /**
+     * Supported:
+     *
+     * document_id
+     *
+     * metadata.krl_id
+     */
+    public ResolvedTarget resolvePsqlPk(
+            String psqlPk) {
+
+        if (psqlPk == null || psqlPk.trim().isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Psql_PK is empty"
+            );
+        }
+
+        String trimmed = psqlPk.trim();
+
+        int dotIndex = trimmed.indexOf('.');
+
+        if (dotIndex < 0) {
+
+            validateIdentifier(
+                    trimmed,
+                    "Psql_PK"
+            );
+
+            return ResolvedTarget.plain(trimmed);
+        }
+
+        String column =
+                trimmed.substring(0, dotIndex);
+
+        String key =
+                trimmed.substring(dotIndex + 1);
+
+        if (column.isEmpty()
+                || key.isEmpty()
+                || key.indexOf('.') >= 0) {
+
+            throw new IllegalArgumentException(
+                    "Unsupported Psql_PK shape: "
+                            + psqlPk
+            );
+        }
+
+        validateIdentifier(
+                column,
+                "Psql_PK jsonb column"
+        );
+
+        validateJsonbKey(key);
+
+        return ResolvedTarget.jsonb(
+                column,
+                key
+        );
+    }
+
+    // =====================================================================
+    // POSTGRESQL DELETE
+    // =====================================================================
+
+    /**
+     * Execute one target DELETE.
+     *
+     * Returns:
+     *
+     * > 0  = actual target row deleted
+     * 0    = target not found
+     */
+    public int executeTargetDelete(
+            Connection psqlConn,
+            ParserConfig config,
+            TriggerRow row) throws SQLException {
+
+        validateIdentifier(
+                config.psqlTableName,
+                "Psql_Table_name"
+        );
+
+        ResolvedTarget target =
+                resolvePsqlPk(config.psqlPk);
+
+        String sql;
+
+        if (target.jsonb) {
+
+            /*
+             * JSONB ->> always returns text.
+             *
+             * Example:
+             *
+             * metadata ->> 'krl_id' = ?
+             *
+             * Therefore the parameter must be bound as String.
+             */
+            sql =
+                    "DELETE FROM "
+                            + config.psqlTableName
+                            + " WHERE "
+                            + target.jsonbColumn
+                            + " ->> '"
+                            + target.jsonbKey
+                            + "' = ?";
+
+        } else {
+
+            /*
+             * Normal PostgreSQL column.
+             *
+             * We deliberately do NOT assume BIGINT here.
+             * The actual parameter type is determined by PostgreSQL
+             * through ParameterMetaData after the statement is prepared.
+             */
+            sql =
+                    "DELETE FROM "
+                            + config.psqlTableName
+                            + " WHERE "
+                            + target.plainColumn
+                            + " = ?";
+        }
+
+        int rowsAffected;
+
+        try (PreparedStatement ps =
+                     psqlConn.prepareStatement(sql)) {
+
+            /*
+             * JSONB ->> returns text, so always bind as String.
+             */
+            if (target.jsonb) {
+
+                ps.setString(
+                        1,
+                        row.primaryColumnsValue
+                );
+
+            } else {
+
+                /*
+                 * Let PostgreSQL/JDBC tell us what type the
+                 * parameter is expected to be.
+                 *
+                 * Examples:
+                 *
+                 * document_id BIGINT
+                 *     -> Types.BIGINT
+                 *
+                 * proof_id INTEGER
+                 *     -> Types.INTEGER
+                 *
+                 * some_code VARCHAR
+                 *     -> Types.VARCHAR
+                 *
+                 * uuid column
+                 *     -> Types.OTHER
+                 */
+                int jdbcType;
+
+                try {
+
+                    jdbcType =
+                            ps.getParameterMetaData()
+                                    .getParameterType(1);
+
+                } catch (SQLException metadataEx) {
+
+                    /*
+                     * Parameter metadata is database-driver dependent.
+                     * If unavailable, fall back to VARCHAR.
+                     *
+                     * The exception is not hidden; it is logged for
+                     * diagnosis, but deletion can still proceed for
+                     * string-compatible columns.
+                     */
+                    logger.log(
+                            "WARN",
+                            "PARAMETER_TYPE_FALLBACK",
+                            "Config_Sno=" + config.sno
+                                    + " Trigger_Sno=" + row.sno
+                                    + " Target_Table=" + config.psqlTableName
+                                    + " Target_PK=" + config.psqlPk
+                                    + " Parameter_Type_Metadata_Unavailable"
+                                    + " Error=" + metadataEx.getMessage()
+                    );
+
+                    jdbcType = java.sql.Types.VARCHAR;
+                }
+
+                String value = row.primaryColumnsValue;
+
+                if (value == null) {
+
+                    throw new SQLException(
+                            "Primary key value is NULL. "
+                                    + "Config_Sno=" + config.sno
+                                    + " Trigger_Sno=" + row.sno
+                                    + " Source_PK=" + row.primaryColumnsName
+                                    + " Target_PK=" + config.psqlPk
+                    );
+                }
+
+                switch (jdbcType) {
+
+                    case java.sql.Types.BIGINT:
+
+                        try {
+
+                            ps.setLong(
+                                    1,
+                                    Long.parseLong(value.trim())
+                            );
+
+                        } catch (NumberFormatException ex) {
+
+                            throw new SQLException(
+                                    "Invalid BIGINT PK value. "
+                                            + "Config_Sno=" + config.sno
+                                            + " Trigger_Sno=" + row.sno
+                                            + " Target_Table=" + config.psqlTableName
+                                            + " Target_PK=" + config.psqlPk
+                                            + " Value=" + value,
+                                    ex
+                            );
+                        }
+
+                        break;
+
+                    case java.sql.Types.INTEGER:
+
+                        try {
+
+                            ps.setInt(
+                                    1,
+                                    Integer.parseInt(value.trim())
+                            );
+
+                        } catch (NumberFormatException ex) {
+
+                            throw new SQLException(
+                                    "Invalid INTEGER PK value. "
+                                            + "Config_Sno=" + config.sno
+                                            + " Trigger_Sno=" + row.sno
+                                            + " Target_Table=" + config.psqlTableName
+                                            + " Target_PK=" + config.psqlPk
+                                            + " Value=" + value,
+                                    ex
+                            );
+                        }
+
+                        break;
+
+                    case java.sql.Types.SMALLINT:
+
+                        try {
+
+                            ps.setShort(
+                                    1,
+                                    Short.parseShort(value.trim())
+                            );
+
+                        } catch (NumberFormatException ex) {
+
+                            throw new SQLException(
+                                    "Invalid SMALLINT PK value. "
+                                            + "Config_Sno=" + config.sno
+                                            + " Trigger_Sno=" + row.sno
+                                            + " Target_Table=" + config.psqlTableName
+                                            + " Target_PK=" + config.psqlPk
+                                            + " Value=" + value,
+                                    ex
+                            );
+                        }
+
+                        break;
+
+                    case java.sql.Types.TINYINT:
+
+                        try {
+
+                            ps.setByte(
+                                    1,
+                                    Byte.parseByte(value.trim())
+                            );
+
+                        } catch (NumberFormatException ex) {
+
+                            throw new SQLException(
+                                    "Invalid TINYINT PK value. "
+                                            + "Config_Sno=" + config.sno
+                                            + " Trigger_Sno=" + row.sno
+                                            + " Target_Table=" + config.psqlTableName
+                                            + " Target_PK=" + config.psqlPk
+                                            + " Value=" + value,
+                                    ex
+                            );
+                        }
+
+                        break;
+
+                    case java.sql.Types.NUMERIC:
+                    case java.sql.Types.DECIMAL:
+
+                        try {
+
+                            ps.setBigDecimal(
+                                    1,
+                                    new java.math.BigDecimal(
+                                            value.trim()
+                                    )
+                            );
+
+                        } catch (NumberFormatException ex) {
+
+                            throw new SQLException(
+                                    "Invalid NUMERIC/DECIMAL PK value. "
+                                            + "Config_Sno=" + config.sno
+                                            + " Trigger_Sno=" + row.sno
+                                            + " Target_Table=" + config.psqlTableName
+                                            + " Target_PK=" + config.psqlPk
+                                            + " Value=" + value,
+                                    ex
+                            );
+                        }
+
+                        break;
+
+                    case java.sql.Types.REAL:
+
+                        try {
+
+                            ps.setFloat(
+                                    1,
+                                    Float.parseFloat(value.trim())
+                            );
+
+                        } catch (NumberFormatException ex) {
+
+                            throw new SQLException(
+                                    "Invalid REAL PK value. "
+                                            + "Config_Sno=" + config.sno
+                                            + " Trigger_Sno=" + row.sno
+                                            + " Target_Table=" + config.psqlTableName
+                                            + " Target_PK=" + config.psqlPk
+                                            + " Value=" + value,
+                                    ex
+                            );
+                        }
+
+                        break;
+
+                    case java.sql.Types.FLOAT:
+                    case java.sql.Types.DOUBLE:
+
+                        try {
+
+                            ps.setDouble(
+                                    1,
+                                    Double.parseDouble(value.trim())
+                            );
+
+                        } catch (NumberFormatException ex) {
+
+                            throw new SQLException(
+                                    "Invalid FLOAT/DOUBLE PK value. "
+                                            + "Config_Sno=" + config.sno
+                                            + " Trigger_Sno=" + row.sno
+                                            + " Target_Table=" + config.psqlTableName
+                                            + " Target_PK=" + config.psqlPk
+                                            + " Value=" + value,
+                                    ex
+                            );
+                        }
+
+                        break;
+
+                    case java.sql.Types.BOOLEAN:
+                    case java.sql.Types.BIT:
+
+                        ps.setBoolean(
+                                1,
+                                Boolean.parseBoolean(
+                                        value.trim()
+                                )
+                        );
+
+                        break;
+
+                    case java.sql.Types.DATE:
+
+                        try {
+
+                            ps.setDate(
+                                    1,
+                                    java.sql.Date.valueOf(
+                                            value.trim()
+                                    )
+                            );
+
+                        } catch (IllegalArgumentException ex) {
+
+                            throw new SQLException(
+                                    "Invalid DATE PK value. "
+                                            + "Config_Sno=" + config.sno
+                                            + " Trigger_Sno=" + row.sno
+                                            + " Target_Table=" + config.psqlTableName
+                                            + " Target_PK=" + config.psqlPk
+                                            + " Value=" + value,
+                                    ex
+                            );
+                        }
+
+                        break;
+
+                    case java.sql.Types.TIMESTAMP:
+                    case java.sql.Types.TIMESTAMP_WITH_TIMEZONE:
+
+                        /*
+                         * For PKs that are timestamp-based, let PostgreSQL
+                         * receive the textual representation.
+                         */
+                        ps.setString(
+                                1,
+                                value
+                        );
+
+                        break;
+
+                    case java.sql.Types.OTHER:
+
+                        /*
+                         * PostgreSQL UUID and other PostgreSQL-specific
+                         * types commonly appear as OTHER.
+                         *
+                         * Try UUID first. If it isn't a UUID, pass the
+                         * string object through to the PostgreSQL driver.
+                         */
+                        try {
+
+                            java.util.UUID uuid =
+                                    java.util.UUID.fromString(
+                                            value.trim()
+                                    );
+
+                            ps.setObject(
+                                    1,
+                                    uuid
+                            );
+
+                        } catch (IllegalArgumentException ex) {
+
+                            ps.setObject(
+                                    1,
+                                    value
+                            );
+                        }
+
+                        break;
+
+                    case java.sql.Types.CHAR:
+                    case java.sql.Types.VARCHAR:
+                    case java.sql.Types.LONGVARCHAR:
+
+                        ps.setString(
+                                1,
+                                value
+                        );
+
+                        break;
+
+                    default:
+
+                        /*
+                         * Safe generic fallback.
+                         */
+                        ps.setObject(
+                                1,
+                                value
+                        );
+
+                        break;
+                }
+            }
+
+            rowsAffected =
+                    ps.executeUpdate();
+        }
+
+        /*
+         * Log only the useful business result.
+         */
+        if (rowsAffected > 0) {
+
+            logger.log(
+                    "INFO",
+                    "DELETE_SUCCESS",
+                    "Config_Sno=" + config.sno
+                            + " Trigger_Sno=" + row.sno
+                            + " Source_Table=" + row.tableName
+                            + " Source_PK=" + row.primaryColumnsName
+                            + " Source_PK_Value=" + row.primaryColumnsValue
+                            + " Target_Table=" + config.psqlTableName
+                            + " Target_PK=" + config.psqlPk
+                            + " Target_PK_Value=" + row.primaryColumnsValue
+                            + " Rows_Deleted=" + rowsAffected
+            );
+
+        } else {
+
+            logger.log(
+                    "WARN",
+                    "TARGET_NOT_FOUND",
+                    "Config_Sno=" + config.sno
+                            + " Trigger_Sno=" + row.sno
+                            + " Target_Table=" + config.psqlTableName
+                            + " Target_PK=" + config.psqlPk
+                            + " Target_PK_Value=" + row.primaryColumnsValue
+            );
+        }
+
+        return rowsAffected;
+    }
+
+    // =====================================================================
+    // MAIN CONFIGURATION PROCESSING
+    // =====================================================================
+
+    /**
+     * Processes one configuration from lastSno through maxSno.
+     *
+     * RANGE_SIZE:
+     *      100000
+     *
+     * batchSize:
+     *      Number of matching DELETE records fetched at a time.
+     */
+    public void processConfiguration(
+            Connection mysqlConn,
+            Connection psqlConn,
+            String configTable,
+            ParserConfig config,
+            int batchSize) {
+
+        long totalDeleted = config.recordsDeleted;
+
+        try {
+
+            // -------------------------------------------------------------
+            // 1. Establish maxSno snapshot
+            // -------------------------------------------------------------
+
+            long maxSno =
+                    initializeMaxSno(
+                            mysqlConn,
+                            configTable,
+                            config
+                    );
+
+            if (maxSno == 0) {
+
+                logger.log(
+                        "INFO",
+                        "CONFIG_EMPTY",
+                        "Config_Sno=" + config.sno
+                                + " Trigger_Table=" + config.triggerTable
+                                + " No trigger records found"
+                );
+
+                updateConfigStatus(
+                        mysqlConn,
+                        configTable,
+                        config.sno,
+                        "COMPLETED"
+                );
+
+                return;
+            }
+
+            // -------------------------------------------------------------
+            // 2. Check checkpoint
+            // -------------------------------------------------------------
+
+            long lastSno = config.lastSno;
+
+            logger.log(
+                    "INFO",
+                    "CONFIG_START",
+                    "Config_Sno=" + config.sno
+                            + " Source_Table=" + config.sourceTableName
+                            + " Target_Table=" + config.psqlTableName
+                            + " Trigger_Table=" + config.triggerTable
+                            + " Source_PK=" + config.sourcePk
+                            + " Target_PK=" + config.psqlPk
+                            + " Last_Sno=" + lastSno
+                            + " Max_Sno=" + maxSno
+                            + " Range_Size=" + RANGE_SIZE
+                            + " Batch_Size=" + batchSize
+            );
+
+            if (lastSno >= maxSno) {
+
+                updateConfigStatus(
+                        mysqlConn,
+                        configTable,
+                        config.sno,
+                        "COMPLETED"
+                );
+
+                logger.log(
+                        "INFO",
+                        "CONFIG_ALREADY_COMPLETE",
+                        "Config_Sno=" + config.sno
+                                + " Last_Sno=" + lastSno
+                                + " Max_Sno=" + maxSno
+                );
+
+                return;
+            }
+
+            // -------------------------------------------------------------
+            // 3. Mark configuration IN_PROCESS
+            // -------------------------------------------------------------
+
+            updateConfigStatus(
+                    mysqlConn,
+                    configTable,
+                    config.sno,
+                    "IN_PROCESS"
+            );
+
+            // -------------------------------------------------------------
+            // 4. Range loop
+            // -------------------------------------------------------------
+
+            while (lastSno < maxSno) {
+
+                long rangeEnd =
+                        Math.min(
+                                lastSno + RANGE_SIZE,
+                                maxSno
+                        );
+
+                logger.log(
+                        "INFO",
+                        "RANGE_START",
+                        "Config_Sno=" + config.sno
+                                + " Range_Start=" + lastSno
+                                + " Range_End=" + rangeEnd
+                );
+
+                long cursorSno = lastSno;
+
+                long rangeTriggerCount = 0;
+                long rangeDeletedCount = 0;
+                long rangeNotFoundCount = 0;
+                long rangeFailedCount = 0;
+
+                boolean rangeFailed = false;
+
+                // ---------------------------------------------------------
+                // 5. Batch loop inside range
+                // ---------------------------------------------------------
+
+                while (true) {
+
+                    List<TriggerRow> batch =
+                            fetchDeleteTriggerBatch(
+                                    mysqlConn,
+                                    config.triggerTable,
+                                    config.sourceTableName,
+                                    cursorSno,
+                                    rangeEnd,
+                                    batchSize
+                            );
+
+                    if (batch.isEmpty()) {
+                        break;
+                    }
+
+                    long batchDeleted = 0;
+
+                    for (TriggerRow row : batch) {
+
+                        rangeTriggerCount++;
+
+                        /*
+                         * Cursor advances using trigger sno, regardless of
+                         * success/failure, so a failed row is not processed
+                         * repeatedly in the same run.
+                         */
+                        cursorSno = row.sno;
+
+                        try {
+
+                            if (!validatePkMapping(
+                                    row,
+                                    config
+                            )) {
+
+                                rangeFailedCount++;
+                                rangeFailed = true;
+
+                                logger.log(
+                                        "ERROR",
+                                        "PK_MAPPING_FAILED",
+                                        "Config_Sno=" + config.sno
+                                                + " Trigger_Sno=" + row.sno
+                                                + " Expected_PK=" + config.sourcePk
+                                                + " Actual_PK=" + row.primaryColumnsName
+                                                + " PK_Value=" + row.primaryColumnsValue
+                                );
+
+                                continue;
+                            }
+
+                            int deleted =
+                                    executeTargetDelete(
+                                            psqlConn,
+                                            config,
+                                            row
+                                    );
+
+                            if (deleted > 0) {
+
+                                batchDeleted += deleted;
+                                rangeDeletedCount += deleted;
+                                totalDeleted += deleted;
+                            } else {
+
+                                rangeNotFoundCount++;
+                            }
+
+                            /*
+                             * TARGET_NOT_FOUND is considered successfully
+                             * reconciled because the target is already absent.
+                             */
+
+                        } catch (SQLException rowEx) {
+
+                            rangeFailedCount++;
+                            rangeFailed = true;
+
+                            logger.log(
+                                    "ERROR",
+                                    "TRIGGER_FAILED",
+                                    "Config_Sno=" + config.sno
+                                            + " Trigger_Sno=" + row.sno
+                                            + " Source_Table=" + row.tableName
+                                            + " PK=" + row.primaryColumnsName
+                                            + " PK_Value=" + row.primaryColumnsValue
+                                            + " Error=" + rowEx.getMessage()
+                            );
+                        }
+                    }
+
+                    /*
+                     * Persist deleted counter once per batch, not once per
+                     * individual DELETE.
+                     */
+                    if (batchDeleted > 0) {
+
+                        updateRecordsDeleted(
+                                mysqlConn,
+                                configTable,
+                                config.sno,
+                                totalDeleted
+                        );
+                    }
+
+                    logger.log(
+                            "INFO",
+                            "BATCH_COMPLETED",
+                            "Config_Sno=" + config.sno
+                                    + " Range_End=" + rangeEnd
+                                    + " Batch_Records=" + batch.size()
+                                    + " Batch_Deleted=" + batchDeleted
+                                    + " Cursor_Sno=" + cursorSno
+                    );
+                }
+
+                // ---------------------------------------------------------
+                // 6. Range completion / checkpoint
+                // ---------------------------------------------------------
+
+                if (rangeFailed) {
+
+                    /*
+                     * DO NOT advance checkpoint.
+                     *
+                     * The next execution will start again from the same
+                     * lastSno and retry all uncompleted/failed trigger rows.
+                     */
+                    updateConfigStatus(
+                            mysqlConn,
+                            configTable,
+                            config.sno,
+                            "INIT"
+                    );
+
+                    logger.log(
+                            "ERROR",
+                            "RANGE_FAILED",
+                            "Config_Sno=" + config.sno
+                                    + " Range_Start=" + lastSno
+                                    + " Range_End=" + rangeEnd
+                                    + " Trigger_Records=" + rangeTriggerCount
+                                    + " Rows_Deleted=" + rangeDeletedCount
+                                    + " Target_Not_Found=" + rangeNotFoundCount
+                                    + " Failed=" + rangeFailedCount
+                                    + " Last_Sno_Remains=" + lastSno
+                    );
+
+                    return;
+                }
+
+                /*
+                 * Entire range completed.
+                 * Only now move the persistent checkpoint.
+                 */
+                updateLastSno(
+                        mysqlConn,
+                        configTable,
+                        config.sno,
+                        rangeEnd
+                );
+
+                config.lastSno = rangeEnd;
+                lastSno = rangeEnd;
+
+                logger.log(
+                        "INFO",
+                        "RANGE_COMPLETED",
+                        "Config_Sno=" + config.sno
+                                + " Range_End=" + rangeEnd
+                                + " Trigger_Records=" + rangeTriggerCount
+                                + " Rows_Deleted=" + rangeDeletedCount
+                                + " Target_Not_Found=" + rangeNotFoundCount
+                                + " Failed=" + rangeFailedCount
+                                + " Last_Sno=" + lastSno
+                );
+            }
+
+            // -------------------------------------------------------------
+            // 7. Configuration completed
+            // -------------------------------------------------------------
+
+            updateRecordsDeleted(
+                    mysqlConn,
+                    configTable,
+                    config.sno,
+                    totalDeleted
+            );
+
+            updateConfigStatus(
+                    mysqlConn,
+                    configTable,
+                    config.sno,
+                    "COMPLETED"
+            );
+
+            logger.log(
+                    "INFO",
+                    "CONFIG_COMPLETED",
+                    "Config_Sno=" + config.sno
+                            + " Last_Sno=" + lastSno
+                            + " Max_Sno=" + maxSno
+                            + " Total_Deleted=" + totalDeleted
+            );
+
+        } catch (SQLException ex) {
+
+            /*
+             * Fatal configuration-level DB error.
+             * Do not move checkpoint beyond the last known successful range.
+             */
+            logger.log(
+                    "ERROR",
+                    "CONFIG_FAILED",
+                    "Config_Sno=" + config.sno
+                            + " Last_Sno=" + config.lastSno
+                            + " Max_Sno=" + config.maxSno
+                            + " Total_Deleted=" + totalDeleted
+                            + " Error=" + ex.getMessage()
+            );
+
+            safeMarkConfigFailed(
+                    mysqlConn,
+                    configTable,
+                    config.sno
+            );
+
+        } catch (RuntimeException ex) {
+
+            logger.log(
+                    "ERROR",
+                    "CONFIG_FAILED",
+                    "Config_Sno=" + config.sno
+                            + " Last_Sno=" + config.lastSno
+                            + " Max_Sno=" + config.maxSno
+                            + " Error=" + ex.getMessage()
+            );
+
+            safeMarkConfigFailed(
+                    mysqlConn,
+                    configTable,
+                    config.sno
+            );
+        }
+    }
+
+    // =====================================================================
+    // SAFE FAILURE HELPERS
+    // =====================================================================
+
+    private void safeMarkConfigFailed(
+            Connection mysqlConn,
+            String configTable,
+            long configSno) {
+
+        try {
+
+            updateConfigStatus(
+                    mysqlConn,
+                    configTable,
+                    configSno,
+                    "FAILED"
+            );
+
+        } catch (SQLException ex) {
+
+            logger.log(
+                    "ERROR",
+                    "CONFIG_STATUS_ERROR",
+                    "Config_Sno=" + configSno
+                            + " Status=FAILED"
+                            + " Error=" + ex.getMessage()
+            );
+        }
+    }
+
+    // =====================================================================
+    // IDENTIFIER VALIDATION
+    // =====================================================================
+
+    private void validateIdentifier(
+            String identifier,
+            String fieldLabel) {
+
+        if (identifier == null
+                || !SAFE_IDENTIFIER.matcher(
+                        identifier.trim()
+                ).matches()) {
+
+            throw new IllegalArgumentException(
+                    "Unsafe or invalid SQL identifier for "
+                            + fieldLabel
+                            + ": "
+                            + identifier
+            );
+        }
+    }
+
+    private void validateJsonbKey(String key) {
+
+        if (key == null
+                || !SAFE_JSONB_KEY.matcher(key).matches()) {
+
+            throw new IllegalArgumentException(
+                    "Unsafe or invalid JSONB key: "
+                            + key
+            );
+        }
+    }
+
+    // =====================================================================
+    // DATA HOLDERS
+    // =====================================================================
+
+    public static final class ParserConfig {
+
+        public long sno;
+
+        public String psqlTableName;
+
+        public String sourceTableName;
+
+        public String sourcePk;
+
+        public String psqlPk;
+
+        public String status;
+
+        public long recordsDeleted;
+
+        public String triggerTable;
+
+        /*
+         * Snapshot upper boundary for this parser run.
+         */
+        public long maxSno;
+
+        /*
+         * Persistent completed-range checkpoint.
+         */
+        public long lastSno;
+    }
+
+    public static final class TriggerRow {
+
+        public long sno;
+
+        public Timestamp recordTime;
+
+        public String tableName;
+
+        public String primaryColumnsName;
+
+        public String primaryColumnsValue;
+
+        public String typeOfOperation;
+
+    }
+
+    // =====================================================================
+    // LOGGER CONTRACT
+    // =====================================================================
+
+    public interface Logger {
+
+        void log(
+                String level,
+                String evtType,
+                String message
+        );
+    }
+}

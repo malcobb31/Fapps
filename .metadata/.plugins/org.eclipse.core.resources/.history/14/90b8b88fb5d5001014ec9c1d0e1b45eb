@@ -1,0 +1,189 @@
+package url_parserV1;
+
+import org.bytedeco.opencv.global.opencv_core;
+import org.bytedeco.opencv.global.opencv_imgcodecs;
+import org.bytedeco.opencv.global.opencv_imgproc;
+import org.bytedeco.opencv.opencv_core.*;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+
+public class url_parser_methods_login {
+
+    static String TESSERACT_PATH = "C:\\Program Files\\Tesseract-OCR\\tesseract.exe";
+
+    public static void main(String[] args) throws Exception {
+
+        String inputFile = "captcha.png";
+        String processedFile = "processed.png";
+
+        // 1. Load CAPTCHA image
+        Mat img = opencv_imgcodecs.imread(inputFile);
+        if (img.empty()) {
+            System.out.println("Image not found!");
+            return;
+        }
+
+        // 2. Resize ×3
+        Mat resized = new Mat();
+        opencv_imgproc.resize(img, resized, new Size(img.cols() * 3, img.rows() * 3));
+
+        // 3. Convert to HSV
+        Mat hsv = new Mat();
+        opencv_imgproc.cvtColor(resized, hsv, opencv_imgproc.COLOR_BGR2HSV);
+
+        Scalar lowerBlue = new Scalar(90, 40, 40, 0);
+        Scalar upperBlue = new Scalar(150, 255, 255, 0);
+
+        Mat mask = new Mat();
+        opencv_core.inRange(hsv, lowerBlue, upperBlue, mask);
+
+        // 4. Smooth noise
+        opencv_imgproc.GaussianBlur(mask, mask, new Size(3, 3), 0);
+
+        // 5. Adaptive threshold
+        opencv_imgproc.adaptiveThreshold(
+                mask,
+                mask,
+                255,
+                opencv_imgproc.ADAPTIVE_THRESH_MEAN_C,
+                opencv_imgproc.THRESH_BINARY,
+                31,
+                10
+        );
+
+        // 6. Dilate + Erode
+        Mat kernel = opencv_imgproc.getStructuringElement(opencv_imgproc.MORPH_RECT, new Size(2, 2));
+        opencv_imgproc.dilate(mask, mask, kernel);
+        opencv_imgproc.erode(mask, mask, kernel);
+
+        // Save processed image
+        opencv_imgcodecs.imwrite(processedFile, mask);
+
+        // 7. Find contours
+        Mat maskCopy = mask.clone();
+        MatVector contours = new MatVector();
+        Mat hierarchy = new Mat();
+
+        opencv_imgproc.findContours(
+                maskCopy,
+                contours,
+                hierarchy,
+                opencv_imgproc.RETR_EXTERNAL,
+                opencv_imgproc.CHAIN_APPROX_SIMPLE
+        );
+
+        // Convert MatVector to List for sorting
+        List<Mat> contourList = new ArrayList<>();
+        for (int i = 0; i < contours.size(); i++) {
+            contourList.add(contours.get(i));
+        }
+
+        contourList.sort(Comparator.comparingInt(c -> opencv_imgproc.boundingRect(c).x()));
+
+        // 8. OCR each character
+        StringBuilder finalCaptcha = new StringBuilder();
+        int index = 0;
+
+        for (Mat contour : contourList) {
+            Rect rect = opencv_imgproc.boundingRect(contour);
+
+            // Ignore noise
+            if (rect.width() < 10 || rect.height() < 20)
+                continue;
+
+            Mat charImg = new Mat(mask, rect);
+
+            // Resize for OCR
+            Mat resizedChar = new Mat();
+            opencv_imgproc.resize(charImg, resizedChar, new Size(200, 200));
+
+            String charFile = "char_" + index + ".png";
+            opencv_imgcodecs.imwrite(charFile, resizedChar);
+
+            String chr = runSingleCharOCR(charFile);
+            finalCaptcha.append(chr);
+            index++;
+        }
+
+        System.out.println("Extracted CAPTCHA: [" + finalCaptcha + "]");
+    }
+
+    private static String runSingleCharOCR(String imgFile) throws Exception {
+        ProcessBuilder pb = new ProcessBuilder(
+                TESSERACT_PATH,
+                imgFile,
+                "stdout",
+                "--psm", "10",
+                "--oem", "3",
+                "-c", "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        );
+
+        pb.redirectErrorStream(true);
+        Process process = pb.start();
+        BufferedReader br = new BufferedReader(new InputStreamReader(process.getInputStream()));
+        String line = br.readLine();
+        process.waitFor();
+        return (line == null ? "" : line.trim());
+    }
+}
+
+
+
+
+//
+//
+//
+//package url_parserV1;
+//
+//import java.io.IOException;
+//import java.nio.file.DirectoryStream;
+//import java.nio.file.Files;
+//import java.nio.file.Path;
+//import java.nio.file.Paths;
+//import java.util.Comparator;
+//import java.util.Optional;
+//import java.util.stream.Stream;
+//
+//public class url_parser_methods_login {
+//
+//    public static void main(String[] args) {
+//
+////        Path downloadDir = Paths.get(System.getProperty("user.home"), "Downloads");
+//      
+//         Path downloadDir = Paths.get("C:\\Users\\User\\Downloads\\NTT");
+//
+//        try {
+//            Optional<Path> latestXlsFileOpt = Files.list(downloadDir)
+//                .filter(p -> p.getFileName().toString().toLowerCase().endsWith(".xls"))
+//                .max(Comparator.comparingLong(p -> {
+//                    try {
+//                        return Files.getLastModifiedTime(p).toMillis();
+//                    } catch (IOException e) {
+//                       
+//                        throw new RuntimeException(e);
+//                    }
+//                }));
+//
+//            if (latestXlsFileOpt.isPresent()) {
+//                Path latestXlsFile = latestXlsFileOpt.get();
+//                Path renamedPath = downloadDir.resolve("123_Blocked.xls");
+//                
+//             
+//                Files.move(latestXlsFile, renamedPath);
+//                
+//                System.out.println("File Renamed To: " + renamedPath.toAbsolutePath());
+//            } else {
+//                System.out.println("No XLS file found in Downloads!");
+//            }
+//
+//        } catch (IOException | RuntimeException e) {
+//            System.err.println("An error occurred during file operation: " + e.getMessage());
+//            e.printStackTrace();
+//        }
+//    }
+//}
+

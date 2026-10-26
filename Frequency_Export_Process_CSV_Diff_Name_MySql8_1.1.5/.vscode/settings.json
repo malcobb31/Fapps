@@ -1,0 +1,9 @@
+{
+    "java.project.sourcePaths": [
+        "src"
+    ],
+    "java.project.outputPath": "bin",
+    "java.project.referencedLibraries": [
+        "d:\\Function APPS\\Fre_EP_FTP\\Fre_EP_FTP\\Frequency_Export_Process_CSV_Diff_Name_MySql8_1.1.5\\lib\\mysql-connector-java-8.0.26.jar"
+    ]
+}

@@ -1,0 +1,928 @@
+package tp3_parser;
+
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * ProcessData - PostgreSQL Boolean Parser
+ * 
+ * Business Logic Flow:
+ * 1. Parse and validate user arguments
+ * 2. Validate source and destination tables exist
+ * 3. Validate column structures
+ * 4. Fetch data from source table
+ * 5. Transform data (direct columns + boolean conversion)
+ * 6. Insert into destination table
+ */
+public class ProcessData {
+    
+    PrintUtilMsg pu = new PrintUtilMsg();
+    
+    /**
+     * Main processing method
+     */
+    public boolean parseAndTransferData(String dbURL,
+                                       String dbUsername,
+                                       String dbPassword,
+                                       String sourceTableName,
+                                       String targetTableName,
+                                       String sourceColumns,
+                                       String targetColumns,
+                                       String sourceCheckColumn,
+                                       String targetBooleanColumn) {
+        
+        boolean status = false;
+        
+        try {
+            // ===== STEP 1: Parse and validate arguments =====
+            pu.sop("parseAndTransferData", "===== STEP 1: Parse and Validate Arguments =====");
+            
+            // Parse source columns
+            String[] sourceColArray = parseCommaSeparated(sourceColumns);
+            pu.sop("parseAndTransferData", "Source columns count: " + sourceColArray.length);
+            for (String col : sourceColArray) {
+                pu.sop("parseAndTransferData", "  Source column: " + col);
+            }
+            
+            // Parse target columns
+            String[] targetColArray = parseCommaSeparated(targetColumns);
+            pu.sop("parseAndTransferData", "Target columns count: " + targetColArray.length);
+            for (String col : targetColArray) {
+                pu.sop("parseAndTransferData", "  Target column: " + col);
+            }
+            
+            // Validate column counts match
+            if (sourceColArray.length != targetColArray.length) {
+                pu.sop("parseAndTransferData", "✗ ERROR: Source columns count (" + sourceColArray.length + 
+                       ") does not match target columns count (" + targetColArray.length + ")");
+                return false;
+            }
+            
+            pu.sop("parseAndTransferData", "Source check column: " + sourceCheckColumn);
+            pu.sop("parseAndTransferData", "Target boolean column: " + targetBooleanColumn);
+            
+            pu.sop("parseAndTransferData", "✓ Arguments parsed and validated successfully");
+            
+            // ===== STEP 2: Validate source table exists =====
+            pu.sop("parseAndTransferData", "===== STEP 2: Validate Source Table =====");
+            
+            if (!validateTableExists(sourceTableName, dbURL, dbUsername, dbPassword)) {
+                pu.sop("parseAndTransferData", "✗ ERROR: Source table '" + sourceTableName + "' does not exist");
+                return false;
+            }
+            
+            pu.sop("parseAndTransferData", "✓ Source table '" + sourceTableName + "' exists");
+            
+            // ===== STEP 3: Validate target table exists =====
+            pu.sop("parseAndTransferData", "===== STEP 3: Validate Target Table =====");
+            
+            if (!validateTableExists(targetTableName, dbURL, dbUsername, dbPassword)) {
+                pu.sop("parseAndTransferData", "✗ ERROR: Target table '" + targetTableName + "' does not exist");
+                return false;
+            }
+            
+            pu.sop("parseAndTransferData", "✓ Target table '" + targetTableName + "' exists");
+            
+            // ===== STEP 4: Validate source table columns =====
+            pu.sop("parseAndTransferData", "===== STEP 4: Validate Source Table Columns =====");
+            
+            HashSet<String> sourceTableColumns = getTableColumns(sourceTableName, dbURL, dbUsername, dbPassword);
+            
+            if (sourceTableColumns == null || sourceTableColumns.size() == 0) {
+                pu.sop("parseAndTransferData", "✗ ERROR: Could not fetch source table columns");
+                return false;
+            }
+            
+            pu.sop("parseAndTransferData", "Source table has " + sourceTableColumns.size() + " columns");
+            
+            // Validate source columns exist
+            for (String col : sourceColArray) {
+                if (!sourceTableColumns.contains(col.toLowerCase())) {
+                    pu.sop("parseAndTransferData", "✗ ERROR: Source column '" + col + "' does not exist in source table");
+                    return false;
+                }
+                pu.sop("parseAndTransferData", "  ✓ Source column '" + col + "' exists");
+            }
+            
+            // Validate source check column exists
+            if (!sourceTableColumns.contains(sourceCheckColumn.toLowerCase())) {
+                pu.sop("parseAndTransferData", "✗ ERROR: Source check column '" + sourceCheckColumn + "' does not exist in source table");
+                return false;
+            }
+            pu.sop("parseAndTransferData", "  ✓ Source check column '" + sourceCheckColumn + "' exists");
+            
+            pu.sop("parseAndTransferData", "✓ All source columns validated successfully");
+            
+            // ===== STEP 5: Validate target table columns =====
+            pu.sop("parseAndTransferData", "===== STEP 5: Validate Target Table Columns =====");
+            
+            HashSet<String> targetTableColumns = getTableColumns(targetTableName, dbURL, dbUsername, dbPassword);
+            
+            if (targetTableColumns == null || targetTableColumns.size() == 0) {
+                pu.sop("parseAndTransferData", "✗ ERROR: Could not fetch target table columns");
+                return false;
+            }
+            
+            pu.sop("parseAndTransferData", "Target table has " + targetTableColumns.size() + " columns");
+            
+            // Validate target columns exist
+            for (String col : targetColArray) {
+                if (!targetTableColumns.contains(col.toLowerCase())) {
+                    pu.sop("parseAndTransferData", "✗ ERROR: Target column '" + col + "' does not exist in target table");
+                    return false;
+                }
+                pu.sop("parseAndTransferData", "  ✓ Target column '" + col + "' exists");
+            }
+            
+            // Validate target boolean column exists
+            if (!targetTableColumns.contains(targetBooleanColumn.toLowerCase())) {
+                pu.sop("parseAndTransferData", "✗ ERROR: Target boolean column '" + targetBooleanColumn + "' does not exist in target table");
+                return false;
+            }
+            pu.sop("parseAndTransferData", "  ✓ Target boolean column '" + targetBooleanColumn + "' exists");
+            
+            pu.sop("parseAndTransferData", "✓ All target columns validated successfully");
+            
+            // ===== STEP 6: Validate data type compatibility =====
+            pu.sop("parseAndTransferData", "===== STEP 6: Validate Data Type Compatibility =====");
+            
+            if (!validateDataTypes(sourceTableName, targetTableName, sourceColArray, targetColArray, 
+                                  targetBooleanColumn, dbURL, dbUsername, dbPassword)) {
+                pu.sop("parseAndTransferData", "✗ ERROR: Data type validation failed");
+                return false;
+            }
+            
+            pu.sop("parseAndTransferData", "✓ Data types validated successfully");
+            
+            // ===== STEP 7: Fetch data from source table =====
+            pu.sop("parseAndTransferData", "===== STEP 7: Fetch Data from Source Table =====");
+            
+            HashMap<String, String[]> sourceData = new SourceData().fetchCSVData(
+                    sourceTableName,
+                    sourceColArray,
+                    sourceCheckColumn,
+                    dbURL,
+                    dbUsername,
+                    dbPassword);
+            
+            if (sourceData == null || sourceData.size() == 0) {
+                pu.sop("parseAndTransferData", "⚠ No data found in source table");
+                return false;
+            }
+            
+            pu.sop("parseAndTransferData", "✓ Source data fetched: " + sourceData.size() + " records");
+            
+            // ===== STEP 8: Insert data into target table =====
+            pu.sop("parseAndTransferData", "===== STEP 8: Insert Data into Target Table =====");
+            
+            boolean inserted = insertDataToTarget(
+                    sourceData,
+                    targetTableName,
+                    targetColArray,
+                    targetBooleanColumn,
+                    dbURL,
+                    dbUsername,
+                    dbPassword,
+                    targetColArray.length);  // TP2: flag is always the last element
+            
+            if (inserted) {
+                pu.sop("parseAndTransferData", "✓ Data inserted successfully into " + targetTableName);
+            } else {
+                pu.sop("parseAndTransferData", "✗ Failed to insert data into target table!");
+                return false;
+            }
+            
+            status = true;
+            
+            pu.sop("parseAndTransferData", "===== PROCESSING COMPLETED SUCCESSFULLY =====");
+            
+        } catch (Exception ex) {
+            System.out.println("EXCEPTION in parseAndTransferData: " + ex.toString());
+            ex.printStackTrace();
+            status = false;
+        }
+        
+        return status;
+    }
+    
+    /**
+     * TP3 entry point: parse CSV file and transfer data to target PostgreSQL table.
+     *
+     * Differences from TP2 parseAndTransferData:
+     *   - Steps 2 and 4 (source table existence + column validation) are SKIPPED - no DB source.
+     *   - Step 6 (data type compatibility against source table) is SKIPPED.
+     *   - Source data is read from CSV via CSVSourceData.
+     *   - flagColumnIndex controls which slot in the record[] array holds the I/A flag value.
+     *
+     * All other validation, logging, batch insert, and boolean conversion logic is UNCHANGED.
+     *
+     * @param dbURL              - Database URL for target DB
+     * @param dbUsername         - Database username
+     * @param dbPassword         - Database password
+     * @param targetTableName    - Target table to insert into
+     * @param sourceColumns      - Comma-separated source CSV column names (direct copy columns)
+     * @param targetColumns      - Comma-separated target column names (must match sourceColumns count)
+     * @param sourceCheckColumn  - CSV header name of the flag column ('I'/'A')
+     * @param targetBooleanColumn - Target column to store TRUE/FALSE
+     * @param csvFilePath        - Absolute path to input CSV file
+     * @param flagColumnIndex    - Index in record[] where flag value lives (typically sourceColArray.length)
+     * @return true if data was successfully inserted, false otherwise
+     */
+    public boolean parseAndTransferDataFromCSV(String dbURL,
+                                               String dbUsername,
+                                               String dbPassword,
+                                               String targetTableName,
+                                               String sourceColumns,
+                                               String targetColumns,
+                                               String sourceCheckColumn,
+                                               String targetBooleanColumn,
+                                               String csvFilePath,
+                                               int flagColumnIndex) {
+
+        boolean status = false;
+
+        try {
+            // ===== STEP 1: Parse and validate arguments =====
+            pu.sop("parseAndTransferDataFromCSV", "===== STEP 1: Parse and Validate Arguments =====");
+
+            String[] sourceColArray = parseCommaSeparated(sourceColumns);
+            pu.sop("parseAndTransferDataFromCSV", "Source columns count: " + sourceColArray.length);
+            for (String col : sourceColArray) {
+                pu.sop("parseAndTransferDataFromCSV", "  Source column: " + col);
+            }
+
+            String[] targetColArray = parseCommaSeparated(targetColumns);
+            pu.sop("parseAndTransferDataFromCSV", "Target columns count: " + targetColArray.length);
+            for (String col : targetColArray) {
+                pu.sop("parseAndTransferDataFromCSV", "  Target column: " + col);
+            }
+
+            if (sourceColArray.length != targetColArray.length) {
+                pu.sop("parseAndTransferDataFromCSV", "✗ ERROR: Source columns count (" + sourceColArray.length +
+                       ") does not match target columns count (" + targetColArray.length + ")");
+                return false;
+            }
+
+            pu.sop("parseAndTransferDataFromCSV", "Source check column: " + sourceCheckColumn);
+            pu.sop("parseAndTransferDataFromCSV", "Target boolean column: " + targetBooleanColumn);
+            pu.sop("parseAndTransferDataFromCSV", "CSV file path: " + csvFilePath);
+            pu.sop("parseAndTransferDataFromCSV", "Flag column index in record[]: " + flagColumnIndex);
+
+            pu.sop("parseAndTransferDataFromCSV", "✓ Arguments parsed and validated successfully");
+
+            // ===== STEP 2: SKIPPED - No source DB table (CSV input) =====
+            pu.sop("parseAndTransferDataFromCSV", "===== STEP 2: Source Table Validation SKIPPED (CSV mode) =====");
+
+            // ===== STEP 3: Validate target table exists =====
+            pu.sop("parseAndTransferDataFromCSV", "===== STEP 3: Validate Target Table =====");
+
+            if (!validateTableExists(targetTableName, dbURL, dbUsername, dbPassword)) {
+                pu.sop("parseAndTransferDataFromCSV", "✗ ERROR: Target table '" + targetTableName + "' does not exist");
+                return false;
+            }
+
+            pu.sop("parseAndTransferDataFromCSV", "✓ Target table '" + targetTableName + "' exists");
+
+            // ===== STEP 4: SKIPPED - No source DB table (CSV input) =====
+            pu.sop("parseAndTransferDataFromCSV", "===== STEP 4: Source Column Validation SKIPPED (CSV mode) =====");
+
+            // ===== STEP 5: Validate target table columns =====
+            pu.sop("parseAndTransferDataFromCSV", "===== STEP 5: Validate Target Table Columns =====");
+
+            HashSet<String> targetTableColumns = getTableColumns(targetTableName, dbURL, dbUsername, dbPassword);
+
+            if (targetTableColumns == null || targetTableColumns.size() == 0) {
+                pu.sop("parseAndTransferDataFromCSV", "✗ ERROR: Could not fetch target table columns");
+                return false;
+            }
+
+            pu.sop("parseAndTransferDataFromCSV", "Target table has " + targetTableColumns.size() + " columns");
+
+            for (String col : targetColArray) {
+                if (!targetTableColumns.contains(col.toLowerCase())) {
+                    pu.sop("parseAndTransferDataFromCSV", "✗ ERROR: Target column '" + col + "' does not exist in target table");
+                    return false;
+                }
+                pu.sop("parseAndTransferDataFromCSV", "  ✓ Target column '" + col + "' exists");
+            }
+
+            if (!targetTableColumns.contains(targetBooleanColumn.toLowerCase())) {
+                pu.sop("parseAndTransferDataFromCSV", "✗ ERROR: Target boolean column '" + targetBooleanColumn + "' does not exist in target table");
+                return false;
+            }
+            pu.sop("parseAndTransferDataFromCSV", "  ✓ Target boolean column '" + targetBooleanColumn + "' exists");
+
+            pu.sop("parseAndTransferDataFromCSV", "✓ All target columns validated successfully");
+
+            // ===== STEP 6: SKIPPED - No source DB table for type compatibility check =====
+            pu.sop("parseAndTransferDataFromCSV", "===== STEP 6: Data Type Compatibility SKIPPED (CSV mode) =====");
+
+            // ===== STEP 7: Fetch data from CSV file =====
+            pu.sop("parseAndTransferDataFromCSV", "===== STEP 7: Fetch Data from CSV File =====");
+
+            HashMap<String, String[]> sourceData = new SourceData().fetchCSVData(
+                    csvFilePath,
+                    sourceColArray,
+                    sourceCheckColumn);
+
+            if (sourceData == null || sourceData.size() == 0) {
+                pu.sop("parseAndTransferDataFromCSV", "⚠ No data found in CSV file");
+                return false;
+            }
+
+            pu.sop("parseAndTransferDataFromCSV", "✓ Source data fetched from CSV: " + sourceData.size() + " records");
+
+            // ===== STEP 8: Insert data into target table =====
+            pu.sop("parseAndTransferDataFromCSV", "===== STEP 8: Insert Data into Target Table =====");
+
+            boolean inserted = insertDataToTarget(
+                    sourceData,
+                    targetTableName,
+                    targetColArray,
+                    targetBooleanColumn,
+                    dbURL,
+                    dbUsername,
+                    dbPassword,
+                    flagColumnIndex);
+
+            if (inserted) {
+                pu.sop("parseAndTransferDataFromCSV", "✓ Data inserted successfully into " + targetTableName);
+            } else {
+                pu.sop("parseAndTransferDataFromCSV", "✗ Failed to insert data into target table!");
+                return false;
+            }
+
+            status = true;
+
+            pu.sop("parseAndTransferDataFromCSV", "===== PROCESSING COMPLETED SUCCESSFULLY =====");
+
+        } catch (Exception ex) {
+            System.out.println("EXCEPTION in parseAndTransferDataFromCSV: " + ex.toString());
+            ex.printStackTrace();
+            status = false;
+        }
+
+        return status;
+    }
+
+    /**
+     * Parse comma-separated string into array
+     */
+    private String[] parseCommaSeparated(String input) {
+        if (input == null || input.trim().isEmpty()) {
+            return new String[0];
+        }
+        
+        String[] parts = input.split(",");
+        for (int i = 0; i < parts.length; i++) {
+            parts[i] = parts[i].trim();
+        }
+        
+        return parts;
+    }
+    
+    /**
+     * Validate if table exists
+     */
+    private boolean validateTableExists(String tableName, String dbURL, String dbUser, String dbPass) {
+        
+        Connection conn = null;
+        boolean exists = false;
+        
+        try {
+            conn = new PostgreSQLConnection().getConnection(dbURL, dbUser, dbPass);
+            DatabaseMetaData metaData = conn.getMetaData();
+            
+            // Handle schema-qualified table names (e.g., schema.table_name)
+            String schemaName = null;
+            String actualTableName = tableName;
+            
+            if (tableName.contains(".")) {
+                String[] parts = tableName.split("\\.");
+                schemaName = parts[0].toLowerCase();
+                actualTableName = parts[1].toLowerCase();
+            } else {
+                actualTableName = tableName.toLowerCase();
+            }
+            
+            pu.sop("validateTableExists", "Checking table - Schema: " + schemaName + ", Table: " + actualTableName);
+            
+            // PostgreSQL stores table names in lowercase by default
+            ResultSet rs = metaData.getTables(null, schemaName, actualTableName, new String[]{"TABLE"});
+            
+            if (rs.next()) {
+                exists = true;
+            }
+            
+            rs.close();
+            
+        } catch (Exception ex) {
+            System.out.println("EXCEPTION in validateTableExists: " + ex.toString());
+            ex.printStackTrace();
+            exists = false;
+        } finally {
+            try {
+                if (conn != null) {
+                    conn.close();
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+        
+        return exists;
+    }
+    
+    /**
+     * Get all columns of a table
+     */
+    private HashSet<String> getTableColumns(String tableName, String dbURL, String dbUser, String dbPass) {
+        
+        Connection conn = null;
+        HashSet<String> columns = new HashSet<>();
+        
+        try {
+            conn = new PostgreSQLConnection().getConnection(dbURL, dbUser, dbPass);
+            DatabaseMetaData metaData = conn.getMetaData();
+            
+            // Handle schema-qualified table names
+            String schemaName = null;
+            String actualTableName = tableName;
+            
+            if (tableName.contains(".")) {
+                String[] parts = tableName.split("\\.");
+                schemaName = parts[0].toLowerCase();
+                actualTableName = parts[1].toLowerCase();
+            } else {
+                actualTableName = tableName.toLowerCase();
+            }
+            
+            pu.sop("getTableColumns", "Getting columns - Schema: " + schemaName + ", Table: " + actualTableName);
+            
+            // PostgreSQL stores table names in lowercase by default
+            ResultSet rs = metaData.getColumns(null, schemaName, actualTableName, null);
+            
+            while (rs.next()) {
+                String columnName = rs.getString("COLUMN_NAME");
+                columns.add(columnName.toLowerCase());
+                pu.sop("getTableColumns", "  Column: " + columnName);
+            }
+            
+            rs.close();
+            
+        } catch (Exception ex) {
+            System.out.println("EXCEPTION in getTableColumns: " + ex.toString());
+            ex.printStackTrace();
+            columns = null;
+        } finally {
+            try {
+                if (conn != null) {
+                    conn.close();
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+        
+        return columns;
+    }
+    
+    /**
+     * Validate data types compatibility
+     */
+    private boolean validateDataTypes(String sourceTableName,
+                                      String targetTableName,
+                                      String[] sourceColumns,
+                                      String[] targetColumns,
+                                      String targetBooleanColumn,
+                                      String dbURL,
+                                      String dbUser,
+                                      String dbPass) {
+        
+        Connection conn = null;
+        boolean valid = true;
+        
+        try {
+            conn = new PostgreSQLConnection().getConnection(dbURL, dbUser, dbPass);
+            DatabaseMetaData metaData = conn.getMetaData();
+            
+            // Check direct columns in both tables
+            for (int i = 0; i < sourceColumns.length; i++) {
+                String sourceCol = sourceColumns[i];
+                String targetCol = targetColumns[i];
+                
+                // Check source
+                String sourceType = getColumnType(metaData, sourceTableName.toLowerCase(), sourceCol.toLowerCase());
+                if (sourceType == null) {
+                    pu.sop("validateDataTypes", "✗ ERROR: Could not determine type for source column '" + sourceCol + "'");
+                    valid = false;
+                    continue;
+                }
+                
+                // Check target
+                String targetType = getColumnType(metaData, targetTableName.toLowerCase(), targetCol.toLowerCase());
+                if (targetType == null) {
+                    pu.sop("validateDataTypes", "✗ ERROR: Could not determine type for target column '" + targetCol + "'");
+                    valid = false;
+                    continue;
+                }
+                
+                pu.sop("validateDataTypes", "  ✓ Column mapping: " + sourceCol + " (" + sourceType + ") -> " + 
+                       targetCol + " (" + targetType + ")");
+            }
+            
+            // Check target boolean column type
+            String booleanColType = getColumnType(metaData, targetTableName.toLowerCase(), targetBooleanColumn.toLowerCase());
+            if (booleanColType == null) {
+                pu.sop("validateDataTypes", "✗ ERROR: Could not determine type for target boolean column '" + targetBooleanColumn + "'");
+                valid = false;
+            } else {
+                pu.sop("validateDataTypes", "  ✓ Target boolean column '" + targetBooleanColumn + "' type: " + booleanColType);
+                
+                // Check if it's boolean or text type
+                String type = booleanColType.toLowerCase();
+                if (!type.contains("bool") && !type.contains("char") && !type.contains("text")) {
+                    pu.sop("validateDataTypes", "  ⚠ WARNING: Target boolean column type '" + booleanColType + 
+                           "' is neither boolean nor text - will attempt string conversion");
+                }
+            }
+            
+        } catch (Exception ex) {
+            System.out.println("EXCEPTION in validateDataTypes: " + ex.toString());
+            ex.printStackTrace();
+            valid = false;
+        } finally {
+            try {
+                if (conn != null) {
+                    conn.close();
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+        
+        return valid;
+    }
+    
+    /**
+     * Get column data type
+     */
+    private String getColumnType(DatabaseMetaData metaData, String tableName, String columnName) throws Exception {
+        
+        // Handle schema-qualified table names
+        String schemaName = null;
+        String actualTableName = tableName;
+        
+        if (tableName.contains(".")) {
+            String[] parts = tableName.split("\\.");
+            schemaName = parts[0].toLowerCase();
+            actualTableName = parts[1].toLowerCase();
+        } else {
+            actualTableName = tableName.toLowerCase();
+        }
+        
+        ResultSet rs = metaData.getColumns(null, schemaName, actualTableName, columnName);
+        
+        String type = null;
+        if (rs.next()) {
+            type = rs.getString("TYPE_NAME");
+        }
+        
+        rs.close();
+        
+        return type;
+    }
+    
+    /**
+     * Insert data into target table
+     */
+    private boolean insertDataToTarget(HashMap<String, String[]> sourceData,
+                                       String targetTableName,
+                                       String[] targetColumns,
+                                       String targetBooleanColumn,
+                                       String dbURL,
+                                       String dbUser,
+                                       String dbPass,
+                                       int flagColumnIndex) {
+        
+        Connection conn = null;
+        PreparedStatement ps = null;
+        boolean status = false;
+        int batchSize = 200;
+        int rowCount = 0;
+        int successCount = 0;
+        int skipCount = 0;
+        List<String> skippedRows = new ArrayList<>();
+        
+        try {
+            conn = new PostgreSQLConnection().getConnection(dbURL, dbUser, dbPass);
+            
+            // Get column types for target table
+            HashMap<String, String> columnTypes = getTargetColumnTypes(targetTableName, targetColumns, 
+                                                                       targetBooleanColumn, conn);
+            
+            if (columnTypes == null || columnTypes.size() == 0) {
+                pu.sop("insertDataToTarget", "✗ ERROR: Could not fetch target column types");
+                return false;
+            }
+            
+            // Build INSERT query
+            StringBuilder insertQuery = new StringBuilder("INSERT INTO " + targetTableName + " (");
+            
+            // Add target columns
+            for (int i = 0; i < targetColumns.length; i++) {
+                insertQuery.append(targetColumns[i]);
+                insertQuery.append(", ");
+            }
+            
+            // Add boolean column
+            insertQuery.append(targetBooleanColumn);
+            insertQuery.append(") VALUES (");
+            
+            // Add placeholders
+            int totalColumns = targetColumns.length + 1; // +1 for boolean column
+            for (int i = 0; i < totalColumns; i++) {
+                insertQuery.append("?");
+                if (i < totalColumns - 1) {
+                    insertQuery.append(", ");
+                }
+            }
+            
+            insertQuery.append(")");
+            
+            pu.sop("insertDataToTarget", "Insert Query: " + insertQuery.toString());
+            
+            conn.setAutoCommit(false);
+            ps = conn.prepareStatement(insertQuery.toString());
+            
+            // Process each row
+            for (Map.Entry<String, String[]> entry : sourceData.entrySet()) {
+                String rowKey = entry.getKey();
+                String[] record = entry.getValue();
+                
+                try {
+                    int paramIndex = 1;
+                    
+                    // Set direct column values with proper type casting
+                    for (int i = 0; i < targetColumns.length; i++) {
+                        String columnName = targetColumns[i].toLowerCase();
+                        String value = record[i];
+                        String columnType = columnTypes.get(columnName);
+                        
+                        setParameterByType(ps, paramIndex, value, columnType, columnName);
+                        paramIndex++;
+                    }
+                    
+                    // Set boolean value from check column
+                    String checkValue = record[flagColumnIndex]; // Index of flag column in source record array
+                    String booleanColType = columnTypes.get(targetBooleanColumn.toLowerCase());
+                    
+                    // Validate and convert I/A to TRUE/FALSE
+                    if (checkValue == null || checkValue.trim().isEmpty()) {
+                        pu.sop("insertDataToTarget", "⚠ WARNING: Row " + rowKey + " - Check column value is NULL/empty. Logging and skipping.");
+                        skippedRows.add("Row " + rowKey + ": Check column value is NULL/empty");
+                        skipCount++;
+                        continue;
+                    }
+                    
+                    String normalizedValue = checkValue.trim().toUpperCase();
+                    
+                    if (normalizedValue.equals("I")) {
+                        // I -> FALSE
+                        setBooleanParameter(ps, paramIndex, false, booleanColType);
+                    } else if (normalizedValue.equals("A")) {
+                        // A -> TRUE
+                        setBooleanParameter(ps, paramIndex, true, booleanColType);
+                    } else {
+                        // Invalid value - log detailed info and skip
+                        pu.sop("insertDataToTarget", "⚠ WARNING: Row " + rowKey + " - Invalid check column value: '" + 
+                               checkValue + "'. Expected 'I', 'i', 'A', or 'a'. Logging and skipping.");
+                        skippedRows.add("Row " + rowKey + ": Invalid check column value = '" + checkValue + "'");
+                        skipCount++;
+                        continue;
+                    }
+                    
+                    ps.addBatch();
+                    rowCount++;
+                    successCount++;
+                    
+                    if (rowCount % batchSize == 0) {
+                        ps.executeBatch();
+                        pu.sop("insertDataToTarget", "Batch executed - Rows processed: " + rowCount);
+                    }
+                    
+                } catch (Exception rowEx) {
+                    pu.sop("insertDataToTarget", "⚠ WARNING: Row " + rowKey + " - Exception during processing: " + rowEx.getMessage());
+                    skippedRows.add("Row " + rowKey + ": Exception = " + rowEx.getMessage());
+                    skipCount++;
+                    continue;
+                }
+            }
+            
+            // Execute remaining batch
+            if (conn != null && ps != null && rowCount > 0) {
+                ps.executeBatch();
+                conn.commit();
+                status = true;
+                
+                pu.sop("insertDataToTarget", "===== DATA INSERTION SUMMARY =====");
+                pu.sop("insertDataToTarget", "Total rows processed: " + (successCount + skipCount));
+                pu.sop("insertDataToTarget", "Successfully inserted: " + successCount);
+                pu.sop("insertDataToTarget", "Skipped rows: " + skipCount);
+                
+                if (skipCount > 0) {
+                    pu.sop("insertDataToTarget", "===== SKIPPED ROWS DETAILS =====");
+                    for (String skipped : skippedRows) {
+                        pu.sop("insertDataToTarget", "  " + skipped);
+                    }
+                }
+                
+                pu.sop("insertDataToTarget", "===== INSERTION COMPLETED =====");
+            } else if (skipCount > 0 && successCount == 0) {
+                pu.sop("insertDataToTarget", "✗ ERROR: All rows were skipped. No data inserted.");
+                pu.sop("insertDataToTarget", "===== SKIPPED ROWS DETAILS =====");
+                for (String skipped : skippedRows) {
+                    pu.sop("insertDataToTarget", "  " + skipped);
+                }
+                status = false;
+            }
+            
+        } catch (Exception ex) {
+            System.out.println("EXCEPTION in insertDataToTarget: " + ex.toString());
+            ex.printStackTrace();
+            
+            try {
+                if (conn != null) conn.rollback();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+            
+            status = false;
+            
+        } finally {
+            try {
+                if (conn != null) {
+                    if (ps != null) ps.close();
+                    conn.close();
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+        
+        return status;
+    }
+    
+    /**
+     * Get target column types
+     */
+    private HashMap<String, String> getTargetColumnTypes(String tableName, String[] targetColumns, 
+                                                          String booleanColumn, Connection conn) {
+        
+        HashMap<String, String> columnTypes = new HashMap<>();
+        
+        try {
+            DatabaseMetaData metaData = conn.getMetaData();
+            
+            // Handle schema-qualified table names
+            String schemaName = null;
+            String actualTableName = tableName;
+            
+            if (tableName.contains(".")) {
+                String[] parts = tableName.split("\\.");
+                schemaName = parts[0].toLowerCase();
+                actualTableName = parts[1].toLowerCase();
+            } else {
+                actualTableName = tableName.toLowerCase();
+            }
+            
+            // Get all columns we need
+            String[] allColumns = new String[targetColumns.length + 1];
+            System.arraycopy(targetColumns, 0, allColumns, 0, targetColumns.length);
+            allColumns[targetColumns.length] = booleanColumn;
+            
+            for (String colName : allColumns) {
+                ResultSet rs = metaData.getColumns(null, schemaName, actualTableName, colName.toLowerCase());
+                
+                if (rs.next()) {
+                    String dataType = rs.getString("TYPE_NAME");
+                    columnTypes.put(colName.toLowerCase(), dataType);
+                    pu.sop("getTargetColumnTypes", "Column: " + colName + " -> Type: " + dataType);
+                }
+                
+                rs.close();
+            }
+            
+        } catch (Exception ex) {
+            System.out.println("EXCEPTION in getTargetColumnTypes: " + ex.toString());
+            ex.printStackTrace();
+            return null;
+        }
+        
+        return columnTypes;
+    }
+    
+    /**
+     * Set PreparedStatement parameter based on column type
+     */
+    private void setParameterByType(PreparedStatement ps, int paramIndex, String value, 
+                                    String columnType, String columnName) throws Exception {
+        
+        if (value == null || value.trim().isEmpty()) {
+            // Handle null values based on type
+            if (columnType != null) {
+                String type = columnType.toLowerCase();
+                if (type.contains("int") || type.contains("serial")) {
+                    ps.setNull(paramIndex, java.sql.Types.BIGINT);
+                } else if (type.contains("timestamp") || type.contains("date") || type.contains("time")) {
+                    ps.setNull(paramIndex, java.sql.Types.TIMESTAMP);
+                } else if (type.contains("numeric") || type.contains("decimal") || type.contains("float") || type.contains("double")) {
+                    ps.setNull(paramIndex, java.sql.Types.NUMERIC);
+                } else if (type.contains("bool")) {
+                    ps.setNull(paramIndex, java.sql.Types.BOOLEAN);
+                } else {
+                    ps.setNull(paramIndex, java.sql.Types.VARCHAR);
+                }
+            } else {
+                ps.setNull(paramIndex, java.sql.Types.VARCHAR);
+            }
+            return;
+        }
+        
+        // Set value based on column type
+        if (columnType != null) {
+            String type = columnType.toLowerCase();
+            
+            try {
+                if (type.contains("bigint") || type.contains("int8")) {
+                    ps.setLong(paramIndex, Long.parseLong(value.trim()));
+                } else if (type.contains("int") || type.contains("serial")) {
+                    ps.setInt(paramIndex, Integer.parseInt(value.trim()));
+                } else if (type.contains("numeric") || type.contains("decimal")) {
+                    ps.setBigDecimal(paramIndex, new java.math.BigDecimal(value.trim()));
+                } else if (type.contains("float") || type.contains("double") || type.contains("real")) {
+                    ps.setDouble(paramIndex, Double.parseDouble(value.trim()));
+                } else if (type.contains("bool")) {
+                    ps.setBoolean(paramIndex, Boolean.parseBoolean(value.trim()));
+                } else if (type.contains("timestamp")) {
+                    try {
+                        java.sql.Timestamp ts = java.sql.Timestamp.valueOf(value.trim());
+                        ps.setTimestamp(paramIndex, ts);
+                    } catch (Exception e) {
+                        ps.setString(paramIndex, value.trim());
+                    }
+                } else if (type.contains("date")) {
+                    try {
+                        java.sql.Date date = java.sql.Date.valueOf(value.trim());
+                        ps.setDate(paramIndex, date);
+                    } catch (Exception e) {
+                        ps.setString(paramIndex, value.trim());
+                    }
+                } else if (type.contains("time")) {
+                    try {
+                        java.sql.Time time = java.sql.Time.valueOf(value.trim());
+                        ps.setTime(paramIndex, time);
+                    } catch (Exception e) {
+                        ps.setString(paramIndex, value.trim());
+                    }
+                } else {
+                    ps.setString(paramIndex, value);
+                }
+            } catch (NumberFormatException e) {
+                pu.sop("setParameterByType", "⚠ WARNING: Could not parse value '" + value + 
+                       "' for column '" + columnName + "' as " + columnType + ", setting as string");
+                ps.setString(paramIndex, value);
+            }
+        } else {
+            ps.setString(paramIndex, value);
+        }
+    }
+    
+    /**
+     * Set boolean parameter based on target column type
+     */
+    private void setBooleanParameter(PreparedStatement ps, int paramIndex, boolean value, String columnType) throws Exception {
+        
+        if (columnType != null) {
+            String type = columnType.toLowerCase();
+            
+            if (type.contains("bool")) {
+                // Target is BOOLEAN type - set as boolean
+                ps.setBoolean(paramIndex, value);
+            } else {
+                // Target is VARCHAR/TEXT type - set as string
+                ps.setString(paramIndex, value ? "TRUE" : "FALSE");
+            }
+        } else {
+            // Default to string
+            ps.setString(paramIndex, value ? "TRUE" : "FALSE");
+        }
+    }
+}

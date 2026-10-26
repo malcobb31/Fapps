@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<launchConfiguration type="org.eclipse.jdt.launching.localJavaApplication">
+<listAttribute key="org.eclipse.debug.core.MAPPED_RESOURCE_PATHS">
+<listEntry value="/Airtel_Recon_Details_1.1/src/recon_detail_v3/recon_details_main_v3.java"/>
+</listAttribute>
+<listAttribute key="org.eclipse.debug.core.MAPPED_RESOURCE_TYPES">
+<listEntry value="1"/>
+</listAttribute>
+<stringAttribute key="org.eclipse.jdt.launching.MAIN_TYPE" value="recon_detail_v3.recon_details_main_v3"/>
+<stringAttribute key="org.eclipse.jdt.launching.PROJECT_ATTR" value="Airtel_Recon_Details_1.1"/>
+</launchConfiguration>

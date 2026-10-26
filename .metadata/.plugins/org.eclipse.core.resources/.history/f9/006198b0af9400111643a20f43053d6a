@@ -1,0 +1,99 @@
+package ktp10_upd_process_v1;
+
+import java.io.Console;
+import java.io.File;
+
+/**
+ * Entry point for the UKM KU-status CSV-to-CSV parser.
+ *
+ * APP DB and KYC DB credentials are collected SEPARATELY, as requested:
+ *   - APP DB: used today for reporting_entity + re_user lookups.
+ *   - KYC DB: accepted and connection-tested today; reserved for the
+ *     unresolved kyc_alphanumeric_id_table.kat_alphanumeric_refno lookup
+ *     (ckyc_reference_no) once that schema/query is confirmed. See
+ *     loadCkycReferenceMap() in ktp10_ukm_update_methods for details.
+ *
+ * Usage:
+ *   java ktp10_update_v2.ktp10_ukm_update_main <inputDir> <archiveDir> <outputDir> [flushSize] [serverIP]
+ *
+ * Credentials are prompted interactively (not passed on the command line)
+ * to avoid leaking secrets via shell history / process listing.
+ */
+public class ktp10_upd_process_main {
+
+    public static void main(String[] args) {
+        if (args.length < 3) {
+            System.err.println("Usage: java ktp10_update_v2.ktp10_ukm_update_main "
+                    + "<inputDir> <archiveDir> <outputDir> [flushSize] [serverIP]");
+            System.exit(1);
+            return;
+        }
+
+        File inputDir = new File(args[0]);
+        File archiveDir = new File(args[1]);
+        File outputDir = new File(args[2]);
+
+        int flushSize = 50000;
+        if (args.length >= 4) {
+            try {
+                flushSize = Integer.parseInt(args[3].trim());
+            } catch (NumberFormatException nfe) {
+                System.err.println("Invalid flushSize '" + args[3] + "', using default " + flushSize);
+            }
+        }
+
+        String serverIP = args.length >= 5 ? args[4] : null;
+
+        Console console = System.console();
+        if (console == null) {
+            System.err.println("No console available. Run this from an interactive terminal "
+                    + "so DB credentials can be entered securely.");
+            System.exit(1);
+            return;
+        }
+
+        // --- APP DB credentials ---
+        System.out.println("=== APP DB credentials (reporting_entity, re_user lookups) ===");
+        String appJdbcUrl = readLine(console, "APP DB JDBC URL: ");
+        String appDbUser = readLine(console, "APP DB Username: ");
+        String appDbPass = readPassword(console, "APP DB Password: ");
+
+        // --- KYC DB credentials (separate, per requirement) ---
+        System.out.println("=== KYC DB credentials (reserved for ckyc_reference_no lookup) ===");
+        System.out.println("(Leave JDBC URL blank to skip KYC DB connection entirely.)");
+        String kycJdbcUrl = readLine(console, "KYC DB JDBC URL [optional]: ");
+        String kycDbUser = null;
+        String kycDbPass = null;
+        if (kycJdbcUrl != null && kycJdbcUrl.trim().length() > 0) {
+            kycDbUser = readLine(console, "KYC DB Username: ");
+            kycDbPass = readPassword(console, "KYC DB Password: ");
+        }
+
+        if (!inputDir.exists()) {
+            System.err.println("Input path does not exist: " + inputDir.getAbsolutePath());
+            System.exit(1);
+            return;
+        }
+
+        ktp10_upd_process_methods.process(
+                inputDir, archiveDir, outputDir,
+                appJdbcUrl, appDbUser, appDbPass,
+                kycJdbcUrl, kycDbUser, kycDbPass,
+                serverIP, flushSize);
+    }
+
+    private static String readLine(Console console, String prompt) {
+        String value = console.readLine("%s", prompt);
+        return value == null ? null : value.trim();
+    }
+
+    private static String readPassword(Console console, String prompt) {
+        char[] chars = console.readPassword("%s", prompt);
+        if (chars == null) {
+            return null;
+        }
+        String value = new String(chars);
+        java.util.Arrays.fill(chars, ' ');
+        return value;
+    }
+}

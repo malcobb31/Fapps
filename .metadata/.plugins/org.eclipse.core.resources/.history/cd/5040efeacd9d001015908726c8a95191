@@ -1,0 +1,32 @@
+package ip_parser_v1;
+
+public class ip_parser_main {
+    public static void main(String[] args) throws Exception {
+        System.out.println("Length of arguments: " + args.length);
+        for (String arg : args) {
+            System.out.println("-------------- " + arg + " ------------");
+        }
+
+        ip_parser_methods parser = new ip_parser_methods();
+        		
+
+        if (args.length == 5) {
+            parser.parseFile(
+                args[0], // file path
+                args[1], // table_name
+                args[2], // db_url
+                args[3], // db_user
+                args[4], // db_pass
+                  // Server_ip
+            );
+
+            System.out.println("============================================================");
+            System.out.println("============= Log parsing & summary complete ==============");
+            System.out.println("============================================================");
+        } else {
+            System.out.println("=================== INVALID ARGUMENTS ======================");
+            System.out.println("Usage:");
+            System.out.println("<file_path> <table_name> <db_url> <db_user> <db_pass> <Server_ip>");
+        }
+    }
+}

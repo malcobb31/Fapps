@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<section name="Workbench">
+	<list key="org.eclipse.ui.internal.wizards.datatransfer.SmartImportRootWizardPage.knownSources">
+		<item value="C:\Users\User\Documents\KNTP4_csv"/>
+		<item value="C:\Users\User\Documents\Outlook Files\Java\Frequency_Export_Process_CSV_Diff_Name_MySql8_1.1.5"/>
+		<item value="C:\Users\User\Documents\Function_APPS_Prakhar\Function APPS\Fre_EP_FTP\Fre_EP_FTP\Frequency_Export_Process_CSV_Diff_Name_MySql8_1.1.5"/>
+		<item value="C:\Users\User\Downloads\Data_Match_Audit_Process_1.5"/>
+		<item value="C:\Users\User\Downloads\All_Table_Data_Audit_Process_1.6"/>
+		<item value="C:\Users\User\Documents\Outlook Files\Java\Frequency_Export_Process_CSV_Diff_Name_MySql8_1.1"/>
+		<item value="C:\Users\User\Documents\Frequency_Export_Process_CSV_Diff_Name_MySql8_1.1\Frequency_Export_Process_CSV_Diff_Name_MySql8_1.1"/>
+		<item value="C:\Users\User\Documents\Frequency_Export_Process_CSV_Diff_Name_MySql8_1.1"/>
+	</list>
+	<section name="CleanDialogSettings">
+		<item value="828" key="DIALOG_WIDTH"/>
+		<item value="true" key="TOGGLE_SELECTED"/>
+		<item value="446" key="DIALOG_HEIGHT"/>
+		<item value="546" key="DIALOG_X_ORIGIN"/>
+		<item value="213" key="DIALOG_Y_ORIGIN"/>
+	</section>
+	<section name="ExternalProjectImportWizard">
+		<item value="true" key="WizardProjectsImportPage.STORE_NESTED_PROJECTS"/>
+		<item value="true" key="WizardProjectsImportPage.STORE_COPY_PROJECT_ID"/>
+		<item value="false" key="WizardProjectsImportPage.STORE_ARCHIVE_SELECTED"/>
+		<list key="WizardProjectsImportPage.STORE_DIRECTORIES">
+			<item value="C:\Users\User\Documents\Frequency_Export_Process_CSV_Diff_Name_MySql8_1.1"/>
+		</list>
+		<list key="WizardProjectsImportPage.STORE_ARCHIVES">
+			<item value=""/>
+		</list>
+	</section>
+	<section name="NewWizardAction">
+		<item value="org.eclipse.jdt.ui.wizards.JavaProjectWizard" key="NewWizardSelectionPage.STORE_SELECTED_ID"/>
+		<list key="NewWizardSelectionPage.STORE_EXPANDED_CATEGORIES_ID">
+			<item value="org.eclipse.ui.Basic"/>
+			<item value="org.eclipse.jdt.ui.java"/>
+		</list>
+	</section>
+	<section name="BasicNewProjectResourceWizard">
+	</section>
+</section>

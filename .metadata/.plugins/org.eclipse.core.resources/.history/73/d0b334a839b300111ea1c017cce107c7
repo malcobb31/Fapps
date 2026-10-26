@@ -1,0 +1,147 @@
+package ktp10_process_inc_inst;
+
+
+public class ktp10_process_main_v2 {
+
+    public static void main(String[] args) {
+        if (args == null || args.length < 6) {
+        	ktp10_process_methods.log(
+                    "ERROR",
+                    "fatal_error=invalid_arguments\nusage=inputPath archiveDir jdbcUrl dbUser dbPass serverIP [batchSize]",
+                    null,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        String inputPath = args[0];
+        String archiveDir = args[1];
+        String jdbcUrl = args[2];
+        String dbUser = args[3];
+        String dbPass = args[4];
+        String serverIP = args[5];
+
+        int batchSize = 50000;
+        if (args.length >= 7) {
+            try {
+                batchSize = Integer.parseInt(args[6]);
+                if (batchSize <= 0) {
+                	ktp10_process_methods.log(
+                            "ERROR",
+                            "fatal_error=invalid_batch_size",
+                            serverIP,
+                            "FATAL_ERROR");
+                    return;
+                }
+            } catch (Exception ex) {
+            	ktp10_process_methods.log(
+                        "ERROR",
+                        "fatal_error=invalid_batch_size",
+                        serverIP,
+                        "FATAL_ERROR");
+                return;
+            }
+        }
+
+        if (inputPath == null || inputPath.trim().length() == 0) {
+        	ktp10_process_methods.log(
+                    "ERROR",
+                    "fatal_error=missing_input_path",
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (archiveDir == null || archiveDir.trim().length() == 0) {
+        	ktp10_process_methods.log(
+                    "ERROR",
+                    "fatal_error=missing_archive_dir",
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (jdbcUrl == null || jdbcUrl.trim().length() == 0) {
+        	ktp10_process_methods.log(
+                    "ERROR",
+                    "fatal_error=missing_jdbc_url",
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (dbUser == null || dbUser.trim().length() == 0) {
+        	ktp10_process_methods.log(
+                    "ERROR",
+                    "fatal_error=missing_db_user",
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (dbPass == null || dbPass.trim().length() == 0) {
+        	ktp10_process_methods.log(
+                    "ERROR",
+                    "fatal_error=missing_db_pass",
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        java.io.File input = new java.io.File(inputPath);
+        java.io.File archive = new java.io.File(archiveDir);
+
+        if (!input.exists()) {
+        	ktp10_process_methods.log(
+                    "ERROR",
+                    "fatal_error=input_path_not_found path=" + inputPath,
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (!input.canRead()) {
+        	ktp10_process_methods.log(
+                    "ERROR",
+                    "fatal_error=input_path_not_readable path=" + inputPath,
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (!archive.exists()) {
+        	ktp10_process_methods.log(
+                    "ERROR",
+                    "fatal_error=archive_dir_not_found path=" + archiveDir,
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (!archive.isDirectory()) {
+        	ktp10_process_methods.log(
+                    "ERROR",
+                    "fatal_error=archive_path_not_directory path=" + archiveDir,
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (!archive.canWrite()) {
+        	ktp10_process_methods.log(
+                    "ERROR",
+                    "fatal_error=archive_dir_not_writable path=" + archiveDir,
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        ktp10_process_methods.process(
+                input,
+                archive,
+                jdbcUrl,
+                dbUser,
+                dbPass,
+                serverIP,
+                batchSize);
+    }
+}

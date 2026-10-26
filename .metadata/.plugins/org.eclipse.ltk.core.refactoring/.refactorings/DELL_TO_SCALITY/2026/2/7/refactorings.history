@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename type &apos;dell_scality.migrationV1&apos; to &apos;MigrationV1&apos;&#x0D;&#x0A;- Original project: &apos;DELL_TO_SCALITY&apos;&#x0D;&#x0A;- Original element: &apos;dell_scality.migrationV1&apos;&#x0D;&#x0A;- Renamed element: &apos;dell_scality.MigrationV1&apos;&#x0D;&#x0A;- Update references to refactored element&#x0D;&#x0A;- Update textual occurrences in comments and strings" description="Rename type &apos;migrationV1&apos;" flags="589830" id="org.eclipse.jdt.ui.rename.type" input="/src&lt;dell_scality{migrationV1.java[migrationV1" matchStrategy="1" name="MigrationV1" qualified="false" references="true" similarDeclarations="false" stamp="1770895644194" textual="false" version="1.0"/>
+</session>

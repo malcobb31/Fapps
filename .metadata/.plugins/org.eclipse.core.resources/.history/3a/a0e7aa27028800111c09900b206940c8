@@ -1,0 +1,954 @@
+package ntp12_process_v1;
+
+import java.io.File;
+import java.io.FilenameFilter;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.sql.Timestamp;
+import java.sql.Types;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+
+public class ntp12_process_methods_old {
+
+    private static final String processName = "user-migration-parser";
+    private static final String processVersion = "1.0";
+    private static final boolean debugEnabled = true;
+    private static final DateTimeFormatter logFormat =
+            DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss SSS");
+
+    private static final int BATCH_SIZE = 500;
+    private static final String TARGET_TABLE = "re_mgmt.re_user";
+
+    private static final int SNO_USER_DETAILS = 57;
+    private static final int SNO_USER_ADDRESS = 48;
+    private static final int SNO_KYC_BRANCH_MASTER = 43;
+    private static final int SNO_KYC_REGION_MASTER = 45;
+
+    // source user_master
+    private static final String COL_UM_USER_ID = "user_id";
+    private static final String COL_UM_USER_MODE = "user_mode";
+    private static final String COL_UM_USER_STATUS = "user_status";
+    private static final String COL_UM_USER_CERTIFICATE = "user_certificate";
+    private static final String COL_UM_FI_CODE = "fi_code";
+    private static final String COL_UM_USERNAME = "username";
+    private static final String COL_UM_FIRST_NAME = "first_name";
+    private static final String COL_UM_LAST_NAME = "last_name";
+    private static final String COL_UM_MIDDLE_NAME = "middle_name";
+    private static final String COL_UM_TITLE = "title";
+    private static final String COL_UM_GENDER = "gender";
+    private static final String COL_UM_DOB = "date_of_birth";
+
+    // source user_details
+    private static final String COL_UD_USER_ID = "user_id";
+    private static final String COL_UD_CITIZENSHIP = "citizenship";
+    private static final String COL_UD_DESIGNATION = "designation";
+    private static final String COL_UD_EMPLOYEE_CODE = "employee_code";
+    private static final String COL_UD_ANY_OTHER_INFO = "any_other_info";
+    private static final String COL_UD_DEPARTMENT = "department";
+    private static final String COL_UD_ENTERED_PLACE = "entered_place";
+    private static final String COL_UD_SPECIALISATION = "specialisation";
+
+    // source user_address
+    private static final String COL_UA_USER_ID = "user_id";
+    private static final String COL_UA_EMAIL = "email_id";
+    private static final String COL_UA_LANDLINE = "phone2";
+    private static final String COL_UA_MOBILE = "phone3";
+
+    // pg lookup tables
+    private static final String COL_DSC_CERT = "certificate_no";
+    private static final String COL_DSC_ID = "id";
+
+    private static final String COL_RE_FI_CODE = "fi_code";
+    private static final String COL_RE_ID = "id";
+
+    private static final String COL_KBM_FI_CODE = "fi_code";
+    private static final String COL_KBM_ENTITY_FI_CODE = "entity_fi_code";
+
+    private static final String COL_KRM_FI_CODE = "fi_code";
+    private static final String COL_KRM_ENTITY_FI_CODE = "entity_fi_code";
+
+    private static final String COL_UBR_USER_ID = "user_id";
+    private static final String COL_UBR_FI_CODE = "fi_code";
+
+    private final String pgUrl;
+    private final String pgUser;
+    private final String pgPass;
+
+    private List<Map<String, String>> masterRows;
+    private Map<String, Map<String, String>> detailsByUserId;
+    private Map<String, Map<String, String>> addressByUserId;
+
+    private Map<String, Map<String, String>> branchRegionByUserId;
+
+    private Map<String, String> dscIdByCertificate;
+    private Map<String, String> reportingEntityIdByFiCode;
+    private Map<String, String> kycBranchEntityFiCodeByFiCode;
+    private Map<String, String> kycRegionEntityFiCodeByFiCode;
+
+    private int iaCounter = 0;
+    private int insertedCount = 0;
+    private int skippedCount = 0;
+
+    public ntp12_process_methods_old(String pgUrl, String pgUser, String pgPass) {
+        this.pgUrl = pgUrl;
+        this.pgUser = pgUser;
+        this.pgPass = pgPass;
+    }
+
+    public boolean run(String csvFolderPath) {
+        try {
+            log("INFO", "Loading CSV files from: " + csvFolderPath, null, "DATA_LOAD");
+            loadCSVLookups(csvFolderPath);
+
+            if (masterRows == null || masterRows.isEmpty()) {
+                throw new RuntimeException("user_master CSV not found or has no rows");
+            }
+
+            log("INFO", "CSV load done | user_master rows: " + masterRows.size(), null, "DATA_LOAD");
+
+            log("INFO", "Loading PostgreSQL lookup tables", null, "DATA_LOAD");
+            loadPostgresLookups();
+
+            log("INFO", "PostgreSQL lookup load done | dsc_certificate: "
+                    + dscIdByCertificate.size()
+                    + " | reporting_entity: "
+                    + reportingEntityIdByFiCode.size()
+                    + " | user_branch_region: "
+                    + branchRegionByUserId.size(), null, "DATA_LOAD");
+
+            log("INFO", "Starting ETL | Target table: " + TARGET_TABLE, null, "ETL_START");
+            processAndInsert();
+
+            log("INFO", "ETL done | Inserted: " + insertedCount + " | Skipped: " + skippedCount, null, "ETL_DONE");
+            return true;
+
+        } catch (Exception e) {
+            log("ERROR", "Fatal error in processor | Error: " + e.getMessage(), null, "ETL_ERROR");
+            return false;
+        }
+    }
+
+    private void loadCSVLookups(String csvFolderPath) throws Exception {
+        File folder = new File(csvFolderPath);
+        File[] csvFiles = folder.listFiles(new FilenameFilter() {
+            @Override
+            public boolean accept(File dir, String name) {
+                String lower = name.toLowerCase();
+                return lower.endsWith(".csv") && !lower.contains("history");
+            }
+        });
+
+        if (csvFiles == null || csvFiles.length == 0) {
+            throw new RuntimeException("No CSV files found in folder: " + csvFolderPath);
+        }
+
+        Map<String, List<Map<String, String>>> csvData = new LinkedHashMap<String, List<Map<String, String>>>();
+
+        for (File file : csvFiles) {
+            List<Map<String, String>> rows = CSVUtil.loadCsv(file.getAbsolutePath());
+            csvData.put(file.getName().toLowerCase(), rows);
+            log("INFO", "Loaded CSV: " + file.getName() + " | Rows: " + rows.size(), null, "CSV_LOAD");
+        }
+
+        masterRows = selectCsvByHeaders(
+                csvData,
+                csvFolderPath,
+                "user_master",
+                new String[] {
+                        COL_UM_USER_ID,
+                        COL_UM_USER_MODE,
+                        COL_UM_USER_STATUS,
+                        COL_UM_USER_CERTIFICATE
+                },
+                new String[] {
+                        COL_UD_CITIZENSHIP,
+                        COL_UA_EMAIL,
+                        COL_UA_LANDLINE,
+                        COL_UA_MOBILE
+                }
+        );
+
+        List<Map<String, String>> detailRows = loadCsvBySnoOrHeaders(
+                csvFiles,
+                csvData,
+                SNO_USER_DETAILS,
+                "user_details",
+                new String[] {
+                        COL_UD_USER_ID,
+                        COL_UD_CITIZENSHIP
+                },
+                new String[] {
+                        COL_UA_EMAIL,
+                        COL_UA_LANDLINE,
+                        COL_UA_MOBILE
+                }
+        );
+
+        List<Map<String, String>> addressRows = loadCsvBySnoOrHeaders(
+                csvFiles,
+                csvData,
+                SNO_USER_ADDRESS,
+                "user_address",
+                new String[] {
+                        COL_UA_USER_ID,
+                        COL_UA_EMAIL
+                },
+                new String[] {
+                        COL_UD_CITIZENSHIP,
+                        COL_UM_USER_MODE,
+                        COL_UM_USER_STATUS,
+                        COL_UM_USER_CERTIFICATE
+                }
+        );
+
+        List<Map<String, String>> branchRows = loadCsvBySnoOrHeaders(
+                csvFiles,
+                csvData,
+                SNO_KYC_BRANCH_MASTER,
+                "kyc_branch_master",
+                new String[] {
+                        COL_KBM_FI_CODE,
+                        COL_KBM_ENTITY_FI_CODE
+                },
+                new String[] {
+                        COL_UD_CITIZENSHIP,
+                        COL_UA_EMAIL,
+                        COL_UA_LANDLINE,
+                        COL_UA_MOBILE
+                }
+        );
+
+        List<Map<String, String>> regionRows = loadCsvBySnoOrHeaders(
+                csvFiles,
+                csvData,
+                SNO_KYC_REGION_MASTER,
+                "kyc_region_master",
+                new String[] {
+                        COL_KRM_FI_CODE,
+                        COL_KRM_ENTITY_FI_CODE
+                },
+                new String[] {
+                        COL_UD_CITIZENSHIP,
+                        COL_UA_EMAIL,
+                        COL_UA_LANDLINE,
+                        COL_UA_MOBILE
+                }
+        );
+
+        detailsByUserId = CSVUtil.buildLookup(detailRows, COL_UD_USER_ID);
+        addressByUserId = CSVUtil.buildLookup(addressRows, COL_UA_USER_ID);
+
+        kycBranchEntityFiCodeByFiCode = buildKeyValueLookup(branchRows, COL_KBM_FI_CODE, COL_KBM_ENTITY_FI_CODE);
+        kycRegionEntityFiCodeByFiCode = buildKeyValueLookup(regionRows, COL_KRM_FI_CODE, COL_KRM_ENTITY_FI_CODE);
+
+        log("DEBUG", "user_details keyed: " + detailsByUserId.size(), null, "CSV_LOAD");
+        log("DEBUG", "user_address keyed: " + addressByUserId.size(), null, "CSV_LOAD");
+        log("DEBUG", "kyc_branch_master keyed: " + kycBranchEntityFiCodeByFiCode.size(), null, "CSV_LOAD");
+        log("DEBUG", "kyc_region_master keyed: " + kycRegionEntityFiCodeByFiCode.size(), null, "CSV_LOAD");
+    }
+
+    private Map<String, String> buildKeyValueLookup(List<Map<String, String>> rows, String keyCol, String valueCol) {
+        Map<String, String> lookup = new HashMap<String, String>();
+        if (rows == null) return lookup;
+
+        for (Map<String, String> row : rows) {
+            String key = get(row, keyCol);
+            String value = get(row, valueCol);
+            if (key != null && value != null) {
+                lookup.put(key, value);
+            }
+        }
+        return lookup;
+    }
+
+    private List<Map<String, String>> loadCsvBySnoOrHeaders(
+            File[] csvFiles,
+            Map<String, List<Map<String, String>>> csvData,
+            int sno,
+            String logicalName,
+            String[] requiredHeaders,
+            String[] forbiddenHeaders) {
+
+        File matchedBySno = findCsvBySno(csvFiles, sno);
+        if (matchedBySno != null) {
+            String key = matchedBySno.getName().toLowerCase();
+            List<Map<String, String>> rows = csvData.get(key);
+            if (rows == null) {
+                try {
+                    rows = CSVUtil.loadCsv(matchedBySno.getAbsolutePath());
+                } catch (Exception e) {
+                    log("ERROR", "Failed to load CSV for " + logicalName + " from " + matchedBySno.getName()
+                            + " | Error: " + e.getMessage(), null, "CSV_LOAD");
+                    return new ArrayList<Map<String, String>>();
+                }
+            }
+            log("INFO", "Mapped " + logicalName + " -> " + matchedBySno.getName(), null, "CSV_MAP");
+            return rows;
+        }
+
+        return selectCsvByHeaders(csvData, "", logicalName, requiredHeaders, forbiddenHeaders);
+    }
+
+    private List<Map<String, String>> selectCsvByHeaders(
+            Map<String, List<Map<String, String>>> csvData,
+            String csvFolderPath,
+            String logicalName,
+            String[] requiredHeaders,
+            String[] forbiddenHeaders) {
+
+        for (Map.Entry<String, List<Map<String, String>>> entry : csvData.entrySet()) {
+            List<Map<String, String>> rows = entry.getValue();
+            if (rows == null || rows.isEmpty()) {
+                continue;
+            }
+
+            Map<String, String> firstRow = rows.get(0);
+            if (matchesHeaders(firstRow, requiredHeaders, forbiddenHeaders)) {
+                log("INFO", "Mapped " + logicalName + " -> " + entry.getKey(), null, "CSV_MAP");
+                return rows;
+            }
+        }
+
+        log("WARN", "Could not identify CSV for " + logicalName + " in folder: " + csvFolderPath, null, "CSV_MAP");
+        return new ArrayList<Map<String, String>>();
+    }
+
+    private boolean matchesHeaders(Map<String, String> row, String[] requiredHeaders, String[] forbiddenHeaders) {
+        Set<String> headers = new HashSet<String>();
+        for (String key : row.keySet()) {
+            if (key != null) {
+                headers.add(key.trim().toLowerCase());
+            }
+        }
+
+        for (String required : requiredHeaders) {
+            if (!headers.contains(required.toLowerCase())) {
+                return false;
+            }
+        }
+
+        if (forbiddenHeaders != null) {
+            for (String forbidden : forbiddenHeaders) {
+                if (headers.contains(forbidden.toLowerCase())) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private File findCsvBySno(File[] csvFiles, int sno) {
+        String needle = "_" + sno + "_";
+        for (File file : csvFiles) {
+            String name = file.getName().toLowerCase();
+            if (name.startsWith("raw_") && name.contains(needle) && name.endsWith(".csv")) {
+                return file;
+            }
+        }
+        return null;
+    }
+
+    private void loadPostgresLookups() throws Exception {
+        dscIdByCertificate = new HashMap<String, String>();
+        reportingEntityIdByFiCode = new HashMap<String, String>();
+        branchRegionByUserId = new HashMap<String, Map<String, String>>();
+
+        Connection conn = DBUtil.getPostgresConnection(pgUrl, pgUser, pgPass);
+        if (conn == null) {
+            throw new RuntimeException("PostgreSQL connection failed - cannot load lookup tables");
+        }
+
+        Statement stmt = null;
+        ResultSet rs = null;
+
+        try {
+            stmt = conn.createStatement();
+
+            rs = stmt.executeQuery("SELECT " + COL_DSC_CERT + ", " + COL_DSC_ID + " FROM re_mgmt.dsc_certificate");
+            while (rs.next()) {
+                String cert = rs.getString(COL_DSC_CERT);
+                String id = rs.getString(COL_DSC_ID);
+                if (cert != null && id != null) {
+                    dscIdByCertificate.put(cert.trim(), id.trim());
+                }
+            }
+            rs.close();
+            log("DEBUG", "dsc_certificate loaded: " + dscIdByCertificate.size() + " records", null, "DB_QUERY");
+
+            rs = stmt.executeQuery("SELECT " + COL_RE_FI_CODE + ", " + COL_RE_ID + " FROM re_mgmt.reporting_entity");
+            while (rs.next()) {
+                String fiCode = rs.getString(COL_RE_FI_CODE);
+                String id = rs.getString(COL_RE_ID);
+                if (fiCode != null && id != null) {
+                    reportingEntityIdByFiCode.put(fiCode.trim(), id.trim());
+                }
+            }
+            rs.close();
+            log("DEBUG", "reporting_entity loaded: " + reportingEntityIdByFiCode.size() + " records", null, "DB_QUERY");
+
+            rs = stmt.executeQuery("SELECT " + COL_UBR_USER_ID + ", " + COL_UBR_FI_CODE + " FROM re_mgmt.user_branch_region");
+            while (rs.next()) {
+                String userId = rs.getString(COL_UBR_USER_ID);
+                String fiCode = rs.getString(COL_UBR_FI_CODE);
+                if (userId != null && fiCode != null) {
+                    Map<String, String> row = new HashMap<String, String>();
+                    row.put(COL_UBR_USER_ID, userId.trim());
+                    row.put(COL_UBR_FI_CODE, fiCode.trim());
+                    branchRegionByUserId.put(userId.trim(), row);
+                }
+            }
+            rs.close();
+            log("DEBUG", "user_branch_region loaded: " + branchRegionByUserId.size() + " records", null, "DB_QUERY");
+
+        } finally {
+            try {
+                if (rs != null) rs.close();
+            } catch (Exception ignored) { }
+
+            try {
+                if (stmt != null) stmt.close();
+            } catch (Exception ignored) { }
+
+            try {
+                conn.close();
+            } catch (Exception ignored) { }
+        }
+    }
+
+    private void processAndInsert() throws Exception {
+        String sql = "INSERT INTO " + TARGET_TABLE + " ("
+                + "id, user_id, first_name, last_name, middle_name, title, gender, dob, "
+                + "user_type, citizenship, status, dsc_id, email, landline, mobile, "
+                + "designation, employee_id, key_cloak_user_id, ckyc_no, date_of_authorizarion, "
+                + "reporting_entity_id, pending_actions, metadata, active, created_at, created_by, updated_at, updated_by"
+                + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                + "ON CONFLICT (user_id) DO NOTHING";
+
+        Connection pgConn = DBUtil.getPostgresConnection(pgUrl, pgUser, pgPass);
+        if (pgConn == null) {
+            throw new RuntimeException("PostgreSQL connection failed - cannot insert");
+        }
+
+        log("DEBUG", "Insert SQL: " + sql, null, "SQL_BUILD");
+
+        PreparedStatement ps = null;
+        try {
+            pgConn.setAutoCommit(false);
+            ps = pgConn.prepareStatement(sql);
+            int batchCount = 0;
+
+            for (Map<String, String> masterRow : masterRows) {
+
+                String userId = get(masterRow, COL_UM_USER_ID);
+                String userMode = get(masterRow, COL_UM_USER_MODE);
+
+                if (userId == null) {
+                    log("WARN", "Skipping row with null user_id", null, "ETL_SKIP");
+                    skippedCount++;
+                    continue;
+                }
+
+                String userType = mapUserType(userMode, userId);
+                if (userType == null) {
+                    skippedCount++;
+                    continue;
+                }
+
+                String status = mapStatus(get(masterRow, COL_UM_USER_STATUS), userId);
+
+                Map<String, String> detailRow = detailsByUserId.get(userId);
+                Map<String, String> addrRow = addressByUserId.get(userId);
+
+                String dscId = null;
+                String cert = get(masterRow, COL_UM_USER_CERTIFICATE);
+                if (cert != null) {
+                    dscId = dscIdByCertificate.get(cert);
+                    if (dscId == null) {
+                        log("WARN", "DSC ID not found | certificate: " + cert + " | user_id: " + userId, null, "ETL_WARN");
+                    }
+                }
+
+                String citizenship = detailRow == null ? null : get(detailRow, COL_UD_CITIZENSHIP);
+                String email = addrRow == null ? null : get(addrRow, COL_UA_EMAIL);
+                String landline = addrRow == null ? null : get(addrRow, COL_UA_LANDLINE);
+                String mobile = addrRow == null ? null : get(addrRow, COL_UA_MOBILE);
+
+                String designation = detailRow == null ? null : get(detailRow, COL_UD_DESIGNATION);
+                String employeeId = detailRow == null ? null : get(detailRow, COL_UD_EMPLOYEE_CODE);
+                String keycloakUserId = null;
+                String ckycNo = null;
+                Timestamp dateOfAuthorization = null;
+                Object pendingActions = "{}";
+
+                String fiCode = get(masterRow, COL_UM_FI_CODE);
+                String reportingEntityId = resolveReportingEntityId(userType, userId, fiCode);
+
+                String firstName = get(masterRow, COL_UM_FIRST_NAME);
+                String lastName = get(masterRow, COL_UM_LAST_NAME);
+                String middleName = get(masterRow, COL_UM_MIDDLE_NAME);
+                String title = get(masterRow, COL_UM_TITLE);
+                String gender = get(masterRow, COL_UM_GENDER);
+                java.sql.Date dob = parseSqlDate(get(masterRow, COL_UM_DOB));
+
+                Timestamp createdAt = resolveTimestamp(masterRow,
+                        new String[] { "created_at", "created_date", "user_created_date", "last_updated_date" }, true);
+                Timestamp updatedAt = resolveTimestamp(masterRow,
+                        new String[] { "updated_at", "update_date", "last_updated_date" }, false);
+
+                String createdBy = firstNonBlank(masterRow,
+                        new String[] { "created_by", "user_created_by", "createdby" }, "SYSTEM");
+                String updatedBy = firstNonBlank(masterRow,
+                        new String[] { "updated_by", "last_updated_by", "modified_by" }, "SYSTEM");
+
+                String metadataJson = buildMetadataJson(masterRow, detailRow, addrRow);
+
+                int idx = 1;
+                ps.setObject(idx++, UUID.randomUUID(), Types.OTHER);
+                ps.setString(idx++, userId);
+                setStr(ps, idx++, firstName);
+                setStr(ps, idx++, lastName);
+                setStr(ps, idx++, middleName);
+                setStr(ps, idx++, title);
+                setStr(ps, idx++, gender);
+
+                if (dob == null) {
+                    ps.setNull(idx++, Types.DATE);
+                } else {
+                    ps.setDate(idx++, dob);
+                }
+
+                setStr(ps, idx++, userType);
+                setStr(ps, idx++, citizenship);
+                ps.setString(idx++, status);
+                setUuidLike(ps, idx++, dscId);
+                setStr(ps, idx++, email);
+                setStr(ps, idx++, landline);
+                setStr(ps, idx++, mobile);
+                setStr(ps, idx++, designation);
+                setStr(ps, idx++, employeeId);
+                setStr(ps, idx++, keycloakUserId);
+                setStr(ps, idx++, ckycNo);
+
+                if (dateOfAuthorization == null) {
+                    ps.setNull(idx++, Types.TIMESTAMP);
+                } else {
+                    ps.setTimestamp(idx++, dateOfAuthorization);
+                }
+
+                setUuidLike(ps, idx++, reportingEntityId);
+                ps.setObject(idx++, pendingActions, Types.OTHER);
+                ps.setObject(idx++, metadataJson, Types.OTHER);
+                ps.setBoolean(idx++, true);
+
+                if (createdAt == null) {
+                    createdAt = new Timestamp(System.currentTimeMillis());
+                }
+                ps.setTimestamp(idx++, createdAt);
+                ps.setString(idx++, createdBy);
+
+                if (updatedAt == null) {
+                    updatedAt = createdAt;
+                }
+                ps.setTimestamp(idx++, updatedAt);
+                ps.setString(idx++, updatedBy);
+
+                ps.addBatch();
+                batchCount++;
+
+                if (batchCount >= BATCH_SIZE) {
+                    ps.executeBatch();
+                    pgConn.commit();
+                    ps.clearBatch();
+                    insertedCount += batchCount;
+                    log("INFO", "Batch committed | Total inserted so far: " + insertedCount, null, "ETL_BATCH");
+                    batchCount = 0;
+                }
+            }
+
+            if (batchCount > 0) {
+                ps.executeBatch();
+                pgConn.commit();
+                ps.clearBatch();
+                insertedCount += batchCount;
+                log("INFO", "Final batch committed | Total inserted: " + insertedCount, null, "ETL_BATCH");
+            }
+
+        } catch (Exception e) {
+            log("ERROR", "ETL failed | Rolling back current batch | Error: " + e.getMessage(), null, "ETL_ERROR");
+            try {
+                pgConn.rollback();
+            } catch (Exception ignored) { }
+            throw e;
+        } finally {
+            try {
+                if (ps != null) ps.close();
+            } catch (Exception ignored) { }
+
+            try {
+                pgConn.close();
+            } catch (Exception ignored) { }
+        }
+    }
+
+    private String mapUserType(String userMode, String userId) {
+        if (userMode == null) {
+            log("WARN", "Null user_mode | user_id: " + userId + " | Skipping", null, "ETL_SKIP");
+            return null;
+        }
+
+        String mode = userMode.trim().toUpperCase();
+
+        if ("IA".equals(mode)) {
+            iaCounter++;
+            if (iaCounter == 1) return "IAU_1";
+            if (iaCounter == 2) return "IAU_2";
+
+            log("WARN", "More than 2 IA users detected | user_id: " + userId
+                    + " | IA occurrence count: " + iaCounter + " | Skipping", null, "ETL_SKIP");
+            return null;
+        }
+
+        if ("IBA".equals(mode)) {
+            log("DEBUG", "IBA record skipped (expected) | user_id: " + userId, null, "ETL_SKIP");
+            return null;
+        }
+
+        if ("IBU".equals(mode)) return "IBU";
+        if ("IRA".equals(mode)) return "IRA";
+        if ("IRU".equals(mode)) return "IRU";
+        if ("IAU".equals(mode) || "IU".equals(mode)) return mode;
+
+        log("WARN", "Unknown user_mode: [" + userMode + "] | user_id: " + userId + " | Skipping", null, "ETL_SKIP");
+        return null;
+    }
+
+    private String mapStatus(String userStatus, String userId) {
+        if (userStatus == null) {
+            log("WARN", "Null user_status | user_id: " + userId + " | Defaulting to IN_ACTIVE", null, "ETL_WARN");
+            return "IN_ACTIVE";
+        }
+
+        switch (userStatus.trim()) {
+            case "0":  return "IN_ACTIVE";
+            case "1":  return "TESTBED";
+            case "2":  return "NOT_LOGGED";
+            case "3":  return "DELETED";
+            case "4":  return "LOCKED";
+            case "6":  return "ALREADY_LOGGED";
+            case "7":  return "PENDING_AUTHORIZE";
+            case "8":  return "REJECTED";
+            case "12": return "DIGITAL_CERTIFICATE_REGISTRATION";
+            case "13": return "DELETION_PENDING";
+            case "14": return "ACTIVATION_PENDING";
+            case "15": return "ACTIVATION_REJECTED";
+            case "20": return "TERMS_AND_CONDITIONS";
+            default:
+                log("WARN", "Unknown user_status: [" + userStatus + "] | user_id: " + userId
+                        + " | Defaulting to IN_ACTIVE", null, "ETL_WARN");
+                return "IN_ACTIVE";
+        }
+    }
+
+    private String resolveReportingEntityId(String userType, String userId, String fiCode) {
+        if ("IBU".equals(userType)) {
+            return resolveViaKycBranch(userId);
+        }
+        if ("IRA".equals(userType)) {
+            return resolveViaKycRegion(userId);
+        }
+
+        if (fiCode == null) {
+            log("WARN", "Null fi_code for user_id: " + userId, null, "ETL_WARN");
+            return null;
+        }
+
+        String id = reportingEntityIdByFiCode.get(fiCode);
+        if (id == null) {
+            log("WARN", "No reporting_entity for fi_code: " + fiCode + " | user_id: " + userId, null, "ETL_WARN");
+        }
+        return id;
+    }
+
+    private String resolveViaKycBranch(String userId) {
+        Map<String, String> branchRegion = branchRegionByUserId.get(userId);
+        if (branchRegion == null) {
+            log("WARN", "No user_branch_region for IBU user_id: " + userId, null, "ETL_WARN");
+            return null;
+        }
+
+        String branchFiCode = get(branchRegion, COL_UBR_FI_CODE);
+        if (branchFiCode == null) {
+            log("WARN", "Null fi_code in user_branch_region for IBU user_id: " + userId, null, "ETL_WARN");
+            return null;
+        }
+
+        String entityFiCode = kycBranchEntityFiCodeByFiCode.get(branchFiCode);
+        if (entityFiCode == null) {
+            log("WARN", "No kyc_branch_master for fi_code: " + branchFiCode + " | user_id: " + userId, null, "ETL_WARN");
+            return null;
+        }
+
+        String id = reportingEntityIdByFiCode.get(entityFiCode);
+        if (id == null) {
+            log("WARN", "No reporting_entity for entity_fi_code: " + entityFiCode + " | user_id: " + userId, null, "ETL_WARN");
+        }
+        return id;
+    }
+
+    private String resolveViaKycRegion(String userId) {
+        Map<String, String> branchRegion = branchRegionByUserId.get(userId);
+        if (branchRegion == null) {
+            log("WARN", "No user_branch_region for IRA user_id: " + userId, null, "ETL_WARN");
+            return null;
+        }
+
+        String regionFiCode = get(branchRegion, COL_UBR_FI_CODE);
+        if (regionFiCode == null) {
+            log("WARN", "Null fi_code in user_branch_region for IRA user_id: " + userId, null, "ETL_WARN");
+            return null;
+        }
+
+        String entityFiCode = kycRegionEntityFiCodeByFiCode.get(regionFiCode);
+        if (entityFiCode == null) {
+            log("WARN", "No kyc_region_master for fi_code: " + regionFiCode + " | user_id: " + userId, null, "ETL_WARN");
+            return null;
+        }
+
+        String id = reportingEntityIdByFiCode.get(entityFiCode);
+        if (id == null) {
+            log("WARN", "No reporting_entity for entity_fi_code: " + entityFiCode + " | user_id: " + userId, null, "ETL_WARN");
+        }
+        return id;
+    }
+
+    private String buildMetadataJson(Map<String, String> masterRow, Map<String, String> detailRow, Map<String, String> addrRow) {
+        Map<String, String> meta = new LinkedHashMap<String, String>();
+
+        addMetadataFields(meta, masterRow, exclusionSet(
+                COL_UM_USER_ID,
+                COL_UM_USER_MODE,
+                COL_UM_USER_STATUS,
+                COL_UM_USER_CERTIFICATE,
+                COL_UM_FI_CODE,
+                COL_UM_USERNAME,
+                COL_UM_FIRST_NAME,
+                COL_UM_LAST_NAME,
+                COL_UM_MIDDLE_NAME,
+                COL_UM_TITLE,
+                COL_UM_GENDER,
+                COL_UM_DOB
+        ));
+
+        addMetadataFields(meta, detailRow, exclusionSet(
+                COL_UD_USER_ID,
+                COL_UD_CITIZENSHIP,
+                COL_UD_DESIGNATION,
+                COL_UD_EMPLOYEE_CODE
+        ));
+
+        addMetadataFields(meta, addrRow, exclusionSet(
+                COL_UA_USER_ID,
+                COL_UA_EMAIL,
+                COL_UA_LANDLINE,
+                COL_UA_MOBILE
+        ));
+
+        return toJson(meta);
+    }
+
+    private Set<String> exclusionSet(String... cols) {
+        Set<String> set = new HashSet<String>();
+        if (cols != null) {
+            for (String c : cols) {
+                if (c != null) {
+                    set.add(c.trim().toLowerCase());
+                }
+            }
+        }
+        return set;
+    }
+
+    private void addMetadataFields(Map<String, String> target, Map<String, String> source, Set<String> excludedKeys) {
+        if (source == null) return;
+
+        for (Map.Entry<String, String> entry : source.entrySet()) {
+            String key = entry.getKey();
+            if (key == null) continue;
+
+            String normalized = key.trim().toLowerCase();
+            if (excludedKeys.contains(normalized)) continue;
+
+            if (!target.containsKey(normalized)) {
+                target.put(normalized, emptyToNull(entry.getValue()));
+            }
+        }
+    }
+
+    private String toJson(Map<String, String> map) {
+        StringBuilder json = new StringBuilder("{");
+        int i = 0;
+        for (Map.Entry<String, String> entry : map.entrySet()) {
+            if (i > 0) json.append(",");
+            json.append("\"").append(escapeJson(entry.getKey())).append("\":");
+            if (entry.getValue() == null) {
+                json.append("null");
+            } else {
+                json.append("\"").append(escapeJson(entry.getValue())).append("\"");
+            }
+            i++;
+        }
+        json.append("}");
+        return json.toString();
+    }
+
+    private String escapeJson(String value) {
+        return value.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    private String emptyToNull(String value) {
+        if (value == null) return null;
+        String t = value.trim();
+        return t.isEmpty() ? null : t;
+    }
+
+    private void setStr(PreparedStatement ps, int idx, String value) throws Exception {
+        if (value == null) {
+            ps.setNull(idx, Types.VARCHAR);
+        } else {
+            ps.setString(idx, value);
+        }
+    }
+
+    private void setUuidLike(PreparedStatement ps, int idx, String value) throws Exception {
+        if (value == null) {
+            ps.setNull(idx, Types.OTHER);
+            return;
+        }
+
+        String t = value.trim();
+        if (t.isEmpty()) {
+            ps.setNull(idx, Types.OTHER);
+            return;
+        }
+
+        try {
+            ps.setObject(idx, UUID.fromString(t), Types.OTHER);
+        } catch (IllegalArgumentException ex) {
+            ps.setObject(idx, t, Types.OTHER);
+        }
+    }
+
+    private String firstNonBlank(Map<String, String> row, String[] keys, String defaultValue) {
+        if (row != null && keys != null) {
+            for (String key : keys) {
+                String v = get(row, key);
+                if (v != null) return v;
+            }
+        }
+        return defaultValue;
+    }
+
+    private Timestamp resolveTimestamp(Map<String, String> row, String[] keys, boolean useNowIfMissing) {
+        String raw = firstNonBlank(row, keys, null);
+        if (raw == null) {
+            return useNowIfMissing ? new Timestamp(System.currentTimeMillis()) : null;
+        }
+
+        raw = raw.trim().replace('T', ' ');
+        List<String> patterns = new ArrayList<String>();
+        patterns.add("yyyy-MM-dd HH:mm:ss.SSS");
+        patterns.add("yyyy-MM-dd HH:mm:ss");
+        patterns.add("yyyy/MM/dd HH:mm:ss");
+        patterns.add("dd-MM-yyyy HH:mm:ss");
+        patterns.add("yyyy-MM-dd");
+        patterns.add("dd-MM-yyyy");
+
+        for (String pattern : patterns) {
+            try {
+                SimpleDateFormat sdf = new SimpleDateFormat(pattern);
+                sdf.setLenient(false);
+                Date d = sdf.parse(raw);
+                return new Timestamp(d.getTime());
+            } catch (ParseException ignored) { }
+        }
+
+        return useNowIfMissing ? new Timestamp(System.currentTimeMillis()) : null;
+    }
+
+    private java.sql.Date parseSqlDate(String raw) {
+        if (raw == null || raw.trim().isEmpty()) {
+            return null;
+        }
+
+        raw = raw.trim().replace('T', ' ');
+        List<String> patterns = new ArrayList<String>();
+        patterns.add("yyyy-MM-dd");
+        patterns.add("dd-MM-yyyy");
+        patterns.add("yyyy/MM/dd");
+
+        for (String pattern : patterns) {
+            try {
+                SimpleDateFormat sdf = new SimpleDateFormat(pattern);
+                sdf.setLenient(false);
+                Date d = sdf.parse(raw);
+                return new java.sql.Date(d.getTime());
+            } catch (ParseException ignored) { }
+        }
+
+        return null;
+    }
+
+    private String get(Map<String, String> row, String col) {
+        if (row == null || col == null) return null;
+        String val = row.get(col);
+        if (val == null) {
+            val = row.get(col.trim().toLowerCase());
+        }
+        if (val == null || val.trim().isEmpty()) {
+            return null;
+        }
+        return val.trim();
+    }
+
+    private void log(String level, String message, String serverIP, String evtType) {
+        if ("DEBUG".equalsIgnoreCase(level) && !debugEnabled) return;
+
+        String timestamp = LocalDateTime.now().format(logFormat);
+        StringBuilder logBuilder = new StringBuilder(512);
+
+        logBuilder.append("Time:").append(timestamp)
+                .append(" [").append(capitalize(level)).append("] ")
+                .append("Process_Name: ").append(processName).append(" ");
+
+        if (serverIP != null && !serverIP.isEmpty()) {
+            logBuilder.append("Server_IP: ").append(serverIP).append(" ");
+        }
+
+        logBuilder.append("Process_Version: ").append(processVersion)
+                .append(" Log_Level: EVT_LOG ")
+                .append(" EVT_Type: ").append(evtType != null ? evtType : "NA")
+                .append(" Description: ").append(message != null ? message : "");
+
+        System.out.println(logBuilder.toString().trim());
+    }
+
+    private String capitalize(String s) {
+        if (s == null || s.isEmpty()) return s;
+        return s.substring(0, 1).toUpperCase() + s.substring(1).toLowerCase();
+    }
+}

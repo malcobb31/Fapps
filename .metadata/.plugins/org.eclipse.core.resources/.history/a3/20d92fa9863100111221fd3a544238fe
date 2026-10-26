@@ -1,0 +1,681 @@
+package tp3_parser;
+
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.util.HashMap;
+import java.util.HashSet;
+
+/**
+ * ProcessData - CSV to PostgreSQL Pipeline (TP3)
+ *
+ * Business Logic Flow: 1. Parse and validate user arguments 2. Validate target
+ * table exists 3. Validate target column structures 4. Stream CSV data
+ * row-by-row and insert into target table - Transform flag column values: I
+ * FALSE, A TRUE - Commit per batch (batch size = 200)
+ */
+public class ProcessData {
+
+	PrintUtilMsg pu = new PrintUtilMsg();
+
+	/**
+	 * TP3 entry point: stream CSV file and transfer data to target PostgreSQL
+	 * table.
+	 *
+	 * Steps 2 and 4 (source table existence + column validation) are not
+	 * applicable €” there is no DB source table. Steps 7+8 are combined: CSV is
+	 * streamed row-by-row via insertDataStream() €” no full file load into
+	 * memory.
+	 *
+	 * @param dbURL
+	 *            - Database URL for target DB
+	 * @param dbUsername
+	 *            - Database username
+	 * @param dbPassword
+	 *            - Database password
+	 * @param targetTableName
+	 *            - Target table to insert into
+	 * @param sourceColumns
+	 *            - Comma-separated source CSV column names (direct copy
+	 *            columns)
+	 * @param targetColumns
+	 *            - Comma-separated target column names (must match
+	 *            sourceColumns count)
+	 * @param sourceCheckColumn
+	 *            - CSV header name of the flag column ('I'/'A')
+	 * @param targetBooleanColumn
+	 *            - Target column to store TRUE/FALSE
+	 * @param csvFilePath
+	 *            - Absolute path to input CSV file
+	 * @return true if data was successfully streamed and inserted, false
+	 *         otherwise
+	 */
+	public boolean parseAndTransferDataFromCSV(String dbURL, String dbUsername, String dbPassword,
+			String targetTableName, String sourceColumns, String targetColumns, String sourceCheckColumn,
+			String targetBooleanColumn, String csvFilePath) {
+
+		boolean status = false;
+
+		try {
+			if (csvFilePath == null || csvFilePath.trim().isEmpty()) {
+				pu.sop("parseAndTransferDataFromCSV", "ERROR: CSV file path is empty");
+				return false;
+			}
+			// ===== STEP 1: Parse and validate arguments =====
+			pu.sop("parseAndTransferDataFromCSV", "===== STEP 1: Parse and Validate Arguments =====");
+			pu.sop("parseAndTransferDataFromCSV", "CSV file: " + csvFilePath);
+
+			String[] sourceColArray = parseCommaSeparated(sourceColumns);
+			pu.sop("parseAndTransferDataFromCSV", "Source columns count: " + sourceColArray.length);
+			for (String col : sourceColArray) {
+				pu.sop("parseAndTransferDataFromCSV", "  Source column: " + col);
+			}
+
+			String[] targetColArray = parseCommaSeparated(targetColumns);
+			pu.sop("parseAndTransferDataFromCSV", "Target columns count: " + targetColArray.length);
+			for (String col : targetColArray) {
+				pu.sop("parseAndTransferDataFromCSV", "  Target column: " + col);
+			}
+
+			if (sourceColArray.length != targetColArray.length) {
+				pu.sop("parseAndTransferDataFromCSV", " ERROR: Source columns count (" + sourceColArray.length
+						+ ") does not match target columns count (" + targetColArray.length + ")");
+				return false;
+			}
+
+			pu.sop("parseAndTransferDataFromCSV", "Source check column: " + sourceCheckColumn);
+			pu.sop("parseAndTransferDataFromCSV", "Target boolean column: " + targetBooleanColumn);
+
+			pu.sop("parseAndTransferDataFromCSV", " Arguments parsed and validated successfully");
+
+			// ===== STEP 2: Validate target table exists =====
+			pu.sop("parseAndTransferDataFromCSV", "===== STEP 2: Validate Target Table =====");
+
+			if (!validateTableExists(targetTableName, dbURL, dbUsername, dbPassword)) {
+				pu.sop("parseAndTransferDataFromCSV", " ERROR: Target table '" + targetTableName + "' does not exist");
+				return false;
+			}
+
+			pu.sop("parseAndTransferDataFromCSV", " Target table '" + targetTableName + "' exists");
+
+			// ===== STEP 3: Validate target table columns =====
+			pu.sop("parseAndTransferDataFromCSV", "===== STEP 3: Validate Target Table Columns =====");
+
+			HashSet<String> targetTableColumns = getTableColumns(targetTableName, dbURL, dbUsername, dbPassword);
+
+			if (targetTableColumns == null || targetTableColumns.size() == 0) {
+				pu.sop("parseAndTransferDataFromCSV", " ERROR: Could not fetch target table columns");
+				return false;
+			}
+
+			pu.sop("parseAndTransferDataFromCSV", "Target table has " + targetTableColumns.size() + " columns");
+
+			for (String col : targetColArray) {
+				if (!targetTableColumns.contains(col.toLowerCase())) {
+					pu.sop("parseAndTransferDataFromCSV",
+							" ERROR: Target column '" + col + "' does not exist in target table");
+					return false;
+				}
+				pu.sop("parseAndTransferDataFromCSV", "   Target column '" + col + "' exists");
+			}
+
+			if (!targetTableColumns.contains(targetBooleanColumn.toLowerCase())) {
+				pu.sop("parseAndTransferDataFromCSV",
+						" ERROR: Target boolean column '" + targetBooleanColumn + "' does not exist in target table");
+				return false;
+			}
+			pu.sop("parseAndTransferDataFromCSV", "   Target boolean column '" + targetBooleanColumn + "' exists");
+
+			pu.sop("parseAndTransferDataFromCSV", " All target columns validated successfully");
+
+			// ===== STEP 4: Stream CSV data and insert into target table =====
+			// Streams row-by-row: no full file load into memory. Safe for large
+			// CSV files.
+			pu.sop("parseAndTransferDataFromCSV", "===== STEP 4: Stream CSV and Insert into Target Table =====");
+
+			boolean inserted = insertDataStream(csvFilePath, sourceColArray, sourceCheckColumn, targetTableName,
+					targetColArray, targetBooleanColumn, dbURL, dbUsername, dbPassword);
+
+			if (inserted) {
+				pu.sop("parseAndTransferDataFromCSV", "SUCCESS: Data inserted into " + targetTableName);
+			} else {
+				pu.sop("parseAndTransferDataFromCSV", "ERROR: Failed to insert data into " + targetTableName);
+				return false;
+			}
+
+			status = true;
+
+			pu.sop("parseAndTransferDataFromCSV",
+					"===== PROCESSING COMPLETED SUCCESSFULLY [" + csvFilePath + "] =====");
+
+		} catch (Exception ex) {
+			System.out.println("EXCEPTION in parseAndTransferDataFromCSV [" + csvFilePath + "]: " + ex.toString());
+			ex.printStackTrace();
+			status = false;
+		}
+
+		return status;
+	}
+
+	/**
+	 * Stream CSV file row-by-row and insert into target table.
+	 *
+	 * Design principles: - No full file loaded into memory: safe for CSV files
+	 * with lakhs of rows. - Reuses all existing helpers: setParameterByType,
+	 * setBooleanParameter, getTargetColumnTypes. - Uses CSVSourceData for RFC
+	 * 4180 compliant parsing (package-private in same package). - Commits every
+	 * batchSize (200) rows to bound memory and enable progress visibility. -
+	 * Each skip is logged immediately with file name + line number (no
+	 * accumulation list). - On fatal exception: rolls back current uncommitted
+	 * batch, closes all resources.
+	 *
+	 * @param csvFilePath
+	 *            - Absolute path to CSV input file
+	 * @param sourceColArray
+	 *            - Ordered array of CSV column names to read
+	 * @param sourceCheckColumn
+	 *            - CSV header name of the I/A flag column
+	 * @param targetTableName
+	 *            - Target PostgreSQL table
+	 * @param targetColArray
+	 *            - Ordered target column names (maps 1:1 to sourceColArray)
+	 * @param targetBooleanColumn
+	 *            - Target boolean column name
+	 * @param dbURL
+	 *            - DB connection URL
+	 * @param dbUser
+	 *            - DB username
+	 * @param dbPass
+	 *            - DB password
+	 * @return true if at least one row inserted and all batches committed;
+	 *         false on fatal error or zero inserts
+	 */
+	private boolean insertDataStream(String csvFilePath, String[] sourceColArray, String sourceCheckColumn,
+			String targetTableName, String[] targetColArray, String targetBooleanColumn, String dbURL, String dbUser,
+			String dbPass) {
+
+		Connection conn = null;
+		PreparedStatement ps = null;
+		BufferedReader br = null;
+		boolean status = false;
+
+		int totalRead = 0;
+		int successCount = 0;
+		int skipCount = 0;
+		int lineNumber = 1;
+
+		CSVSourceData csvParser = new CSVSourceData();
+
+		try {
+			pu.sop("insertDataStream", "Opening CSV: " + csvFilePath);
+			br = new BufferedReader(new FileReader(csvFilePath));
+
+			// ===== HEADER =====
+			String headerLine = br.readLine();
+			if (headerLine == null || headerLine.trim().isEmpty()) {
+				pu.sop("insertDataStream", "ERROR: CSV is empty or missing header");
+				return false;
+			}
+
+			String[] headers = csvParser.parseCsvLine(headerLine);
+			// CLEAN HEADERS (REMOVE QUOTES)
+			for (int i = 0; i < headers.length; i++) {
+			    if (headers[i] != null) {
+			        headers[i] = headers[i].trim().replaceAll("^\"|\"$", "");
+			    }
+			}
+
+			int[] sourceColIndices = new int[sourceColArray.length];
+			for (int i = 0; i < sourceColArray.length; i++) {
+				sourceColIndices[i] = csvParser.findColumnIndex(headers, sourceColArray[i]);
+				if (sourceColIndices[i] == -1) {
+					pu.sop("insertDataStream", "ERROR: Column not found: " + sourceColArray[i]);
+					return false;
+				}
+			}
+
+			int checkColIndex = csvParser.findColumnIndex(headers, sourceCheckColumn);
+			if (checkColIndex == -1) {
+				pu.sop("insertDataStream", "ERROR: Flag column not found: " + sourceCheckColumn);
+				return false;
+			}
+
+			int maxRequiredIndex = checkColIndex;
+			for (int idx : sourceColIndices) {
+				if (idx > maxRequiredIndex)
+					maxRequiredIndex = idx;
+			}
+
+			// ===== DB =====
+			conn = new PostgreSQLConnection().getConnection(dbURL, dbUser, dbPass);
+			if (conn == null) {
+				pu.sop("insertDataStream", "ERROR: DB connection failed");
+				return false;
+			}
+
+			conn.setAutoCommit(false);
+
+			HashMap<String, String> columnTypes =
+			        getTargetColumnTypes(targetTableName, targetColArray, targetBooleanColumn, conn);
+
+			if (columnTypes == null || columnTypes.isEmpty()) {
+			    pu.sop("insertDataStream", "ERROR: Failed to fetch column metadata");
+			    return false;
+			}
+
+			StringBuilder insertQuery = new StringBuilder();
+			insertQuery.append("INSERT INTO ").append(targetTableName).append(" (");
+
+			for (int i = 0; i < targetColArray.length; i++) {
+			    insertQuery.append(targetColArray[i]).append(", ");
+			}
+			insertQuery.append(targetBooleanColumn).append(") VALUES (");
+
+			for (int i = 0; i < targetColArray.length + 1; i++) {
+			    insertQuery.append("?");
+			    if (i < targetColArray.length) insertQuery.append(", ");
+			}
+			insertQuery.append(")");
+			ps = conn.prepareStatement(insertQuery.toString());
+
+			// ===== STREAM =====
+			String line;
+			while ((line = br.readLine()) != null) {
+				lineNumber++;
+
+				if (line.trim().isEmpty())
+					continue;
+
+				totalRead++;
+				String[] fields = csvParser.parseCsvLine(line);
+
+				if (fields.length <= maxRequiredIndex) {
+					pu.sop("insertDataStream", "WARNING: Line " + lineNumber + " insufficient columns");
+					skipCount++;
+					continue;
+				}
+
+				try {
+					int paramIndex = 1;
+
+					// direct cols
+					for (int i = 0; i < targetColArray.length; i++) {
+						String val = fields[sourceColIndices[i]];
+						String type = columnTypes.get(targetColArray[i].toLowerCase());
+						setParameterByType(ps, paramIndex++, val, type, targetColArray[i]);
+					}
+
+					// flag
+					String checkVal = fields[checkColIndex];
+					if (checkVal == null || checkVal.trim().isEmpty()) {
+						skipCount++;
+						continue;
+					}
+
+					String normalized = checkVal.trim().toUpperCase();
+					if (normalized.equals("I")) {
+						setBooleanParameter(ps, paramIndex, false, columnTypes.get(targetBooleanColumn.toLowerCase()));
+					} else if (normalized.equals("A")) {
+						setBooleanParameter(ps, paramIndex, true, columnTypes.get(targetBooleanColumn.toLowerCase()));
+					} else {
+						skipCount++;
+						continue;
+					}
+
+					ps.addBatch();
+					successCount++;
+
+				} catch (Exception e) {
+					pu.sop("insertDataStream", "WARNING: Line " + lineNumber + " failed: " + e.getMessage());
+					skipCount++;
+				}
+			}
+
+			// ===== FINAL EXECUTION =====
+			if (successCount == 0) {
+			    pu.sop("insertDataStream", "ERROR: No valid rows to insert");
+			    return false;
+			}
+			ps.executeBatch();
+			conn.commit();
+
+			pu.sop("insertDataStream", "SUCCESS: Full commit completed for file: " + csvFilePath +
+			        " | Inserted: " + successCount + " | Skipped: " + skipCount);
+
+			// ===== STATUS =====
+			if (totalRead == 0) {
+				pu.sop("insertDataStream", "WARNING: No data rows");
+				status = false;
+			} else if (successCount == 0) {
+				pu.sop("insertDataStream", "ERROR: No rows inserted");
+				status = false;
+			} else {
+				status = true;
+			}
+
+		} catch (Exception ex) {
+			ex.printStackTrace();
+			try {
+				if (conn != null) {
+					conn.rollback();
+					pu.sop("insertDataStream", "ERROR: Full rollback executed");
+				}
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+			status = false;
+
+		} finally {
+			try {
+				if (br != null)
+					br.close();
+			} catch (Exception ignored) {
+			}
+			try {
+				if (ps != null)
+					ps.close();
+			} catch (Exception ignored) {
+			}
+			try {
+				if (conn != null)
+					conn.close();
+			} catch (Exception ignored) {
+			}
+		}
+
+		return status;
+	}
+
+	/**
+	 * Parse comma-separated string into array
+	 */
+	private String[] parseCommaSeparated(String input) {
+		if (input == null || input.trim().isEmpty()) {
+			return new String[0];
+		}
+
+		String[] parts = input.split(",");
+		for (int i = 0; i < parts.length; i++) {
+			parts[i] = parts[i].trim();
+		}
+
+		return parts;
+	}
+
+	/**
+	 * Validate if table exists
+	 */
+	private boolean validateTableExists(String tableName, String dbURL, String dbUser, String dbPass) {
+
+		Connection conn = null;
+		boolean exists = false;
+
+		try {
+			conn = new PostgreSQLConnection().getConnection(dbURL, dbUser, dbPass);
+			if (conn == null) {
+				pu.sop("validateTableExists", "ERROR: DB connection failed");
+				return false;
+			}
+
+			DatabaseMetaData metaData = conn.getMetaData();
+
+			// Handle schema-qualified table names (e.g., schema.table_name)
+			String schemaName = null;
+			String actualTableName = tableName;
+
+			if (tableName.contains(".")) {
+				String[] parts = tableName.split("\\.");
+				schemaName = parts[0].toLowerCase();
+				actualTableName = parts[1].toLowerCase();
+			} else {
+				actualTableName = tableName.toLowerCase();
+			}
+
+			pu.sop("validateTableExists", "Checking table - Schema: " + schemaName + ", Table: " + actualTableName);
+
+			// PostgreSQL stores table names in lowercase by default
+			ResultSet rs = metaData.getTables(null, schemaName, actualTableName, new String[] { "TABLE" });
+
+			if (rs.next()) {
+				exists = true;
+			}
+
+			if (rs != null)
+				rs.close();
+
+		} catch (Exception ex) {
+			System.out.println("EXCEPTION in validateTableExists: " + ex.toString());
+			ex.printStackTrace();
+			exists = false;
+		} finally {
+			try {
+				if (conn != null) {
+					conn.close();
+				}
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+		}
+
+		return exists;
+	}
+
+	/**
+	 * Get all columns of a table
+	 */
+	private HashSet<String> getTableColumns(String tableName, String dbURL, String dbUser, String dbPass) {
+
+		Connection conn = null;
+		HashSet<String> columns = new HashSet<>();
+
+		try {
+			conn = new PostgreSQLConnection().getConnection(dbURL, dbUser, dbPass);
+			if (conn == null) {
+				pu.sop("getTableColumns", "ERROR: DB connection failed");
+				return null;
+			}
+			DatabaseMetaData metaData = conn.getMetaData();
+
+			// Handle schema-qualified table names
+			String schemaName = null;
+			String actualTableName = tableName;
+
+			if (tableName.contains(".")) {
+				String[] parts = tableName.split("\\.");
+				schemaName = parts[0].toLowerCase();
+				actualTableName = parts[1].toLowerCase();
+			} else {
+				actualTableName = tableName.toLowerCase();
+			}
+
+			pu.sop("getTableColumns", "Getting columns - Schema: " + schemaName + ", Table: " + actualTableName);
+
+			// PostgreSQL stores table names in lowercase by default
+			ResultSet rs = metaData.getColumns(null, schemaName, actualTableName, null);
+
+			while (rs.next()) {
+				String columnName = rs.getString("COLUMN_NAME");
+				columns.add(columnName.toLowerCase());
+				pu.sop("getTableColumns", "  Column: " + columnName);
+			}
+
+			if (rs != null)
+				rs.close();
+
+		} catch (Exception ex) {
+			System.out.println("EXCEPTION in getTableColumns: " + ex.toString());
+			ex.printStackTrace();
+			columns = null;
+		} finally {
+			try {
+				if (conn != null) {
+					conn.close();
+				}
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+		}
+
+		return columns;
+	}
+
+	/**
+	 * Get target column types
+	 */
+	private HashMap<String, String> getTargetColumnTypes(String tableName, String[] targetColumns, String booleanColumn,
+			Connection conn) {
+
+		HashMap<String, String> columnTypes = new HashMap<>();
+
+		try {
+			if (conn == null) {
+				pu.sop("getTableColumns", "ERROR: DB connection failed");
+				return null;
+			}
+			DatabaseMetaData metaData = conn.getMetaData();
+
+			// Handle schema-qualified table names
+			String schemaName = null;
+			String actualTableName = tableName;
+
+			if (tableName.contains(".")) {
+				String[] parts = tableName.split("\\.");
+				schemaName = parts[0].toLowerCase();
+				actualTableName = parts[1].toLowerCase();
+			} else {
+				actualTableName = tableName.toLowerCase();
+			}
+
+			// Get all columns we need
+			String[] allColumns = new String[targetColumns.length + 1];
+			System.arraycopy(targetColumns, 0, allColumns, 0, targetColumns.length);
+			allColumns[targetColumns.length] = booleanColumn;
+
+			for (String colName : allColumns) {
+				ResultSet rs = metaData.getColumns(null, schemaName, actualTableName, colName.toLowerCase());
+
+				if (rs.next()) {
+					String dataType = rs.getString("TYPE_NAME");
+					columnTypes.put(colName.toLowerCase(), dataType);
+					pu.sop("getTargetColumnTypes", "Column: " + colName + " -> Type: " + dataType);
+				}
+
+				if (rs != null)
+					rs.close();
+			}
+
+		} catch (Exception ex) {
+			System.out.println("EXCEPTION in getTargetColumnTypes: " + ex.toString());
+			ex.printStackTrace();
+			return null;
+		}
+
+		return columnTypes;
+	}
+
+	/**
+	 * Set PreparedStatement parameter based on column type
+	 */
+	private void setParameterByType(PreparedStatement ps, int paramIndex, String value, String columnType,
+			String columnName) throws Exception {
+
+		if (value == null || value.trim().isEmpty()) {
+			if ("NULL".equalsIgnoreCase(value.trim())) {
+			    ps.setNull(paramIndex, java.sql.Types.NULL);
+			    return;
+			}
+			// Handle null values based on type
+			if (columnType != null) {
+				String type = columnType.toLowerCase();
+				if (type.contains("int") || type.contains("serial")) {
+					ps.setNull(paramIndex, java.sql.Types.BIGINT);
+				} else if (type.contains("timestamp") || type.contains("date") || type.contains("time")) {
+					ps.setNull(paramIndex, java.sql.Types.TIMESTAMP);
+				} else if (type.contains("numeric") || type.contains("decimal") || type.contains("float")
+						|| type.contains("double")) {
+					ps.setNull(paramIndex, java.sql.Types.NUMERIC);
+				} else if (type.contains("bool")) {
+					ps.setNull(paramIndex, java.sql.Types.BOOLEAN);
+				} else {
+					ps.setNull(paramIndex, java.sql.Types.VARCHAR);
+				}
+			} else {
+				ps.setNull(paramIndex, java.sql.Types.VARCHAR);
+			}
+			return;
+		}
+
+		// Set value based on column type
+		if (columnType != null) {
+			String type = columnType.toLowerCase();
+
+			try {
+				if (type.contains("bigint") || type.contains("int8")) {
+					ps.setLong(paramIndex, Long.parseLong(value.trim()));
+				} else if (type.contains("int") || type.contains("serial")) {
+					ps.setInt(paramIndex, Integer.parseInt(value.trim()));
+				} else if (type.contains("numeric") || type.contains("decimal")) {
+					ps.setBigDecimal(paramIndex, new java.math.BigDecimal(value.trim()));
+				} else if (type.contains("float") || type.contains("double") || type.contains("real")) {
+					ps.setDouble(paramIndex, Double.parseDouble(value.trim()));
+				} else if (type.contains("bool")) {
+					ps.setBoolean(paramIndex, Boolean.parseBoolean(value.trim()));
+				} else if (type.contains("timestamp")) {
+					try {
+						java.sql.Timestamp ts = java.sql.Timestamp.valueOf(value.trim());
+						ps.setTimestamp(paramIndex, ts);
+					} catch (Exception e) {
+						ps.setString(paramIndex, value.trim());
+					}
+				} else if (type.contains("date")) {
+					try {
+						java.sql.Date date = java.sql.Date.valueOf(value.trim());
+						ps.setDate(paramIndex, date);
+					} catch (Exception e) {
+						ps.setString(paramIndex, value.trim());
+					}
+				} else if (type.contains("time")) {
+					try {
+						java.sql.Time time = java.sql.Time.valueOf(value.trim());
+						ps.setTime(paramIndex, time);
+					} catch (Exception e) {
+						ps.setString(paramIndex, value.trim());
+					}
+				} else {
+					ps.setString(paramIndex, value);
+				}
+			} catch (NumberFormatException e) {
+				pu.sop("setParameterByType", " WARNING: Could not parse value '" + value + "' for column '" + columnName
+						+ "' as " + columnType + ", setting as string");
+				ps.setString(paramIndex, value);
+			}
+		} else {
+			ps.setString(paramIndex, value);
+		}
+	}
+
+	/**
+	 * Set boolean parameter based on target column type
+	 */
+	private void setBooleanParameter(PreparedStatement ps, int paramIndex, boolean value, String columnType)
+			throws Exception {
+
+		if (columnType != null) {
+			String type = columnType.toLowerCase();
+
+			if (type.contains("bool")) {
+				// Target is BOOLEAN type - set as boolean
+				ps.setBoolean(paramIndex, value);
+			} else {
+				// Target is VARCHAR/TEXT type - set as string
+				ps.setString(paramIndex, value ? "TRUE" : "FALSE");
+			}
+		} else {
+			// Default to string
+			ps.setString(paramIndex, value ? "TRUE" : "FALSE");
+		}
+	}
+}

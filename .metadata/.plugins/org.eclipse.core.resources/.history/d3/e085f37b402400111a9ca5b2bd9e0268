@@ -1,0 +1,503 @@
+package opd_parser_final;
+
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.util.HashSet;
+
+/**
+ * OPD_Source - Data Retrieval for OPD Type Classification
+ *
+ * Methods:
+ *  1. deleteCurrentDayData()       - Remove existing rows for processDate from dest table
+ *                                    and reset AUTO_INCREMENT
+ *  2. copySourceData()             - INSERT all rows from source table for processDate
+ *                                    into dest table with OPD_TYPE = 'Natural OPD'
+ *                                    ordered by VISIT_DATE
+ *  3. getMRDSetFromCamp()          - Fetch distinct MRD_NO from Camp_count_detail
+ *                                    where opd_visit = 'Y' for processMonth
+ *  4. getMRDSetFromScreening()     - Fetch distinct MRD_NO from Free_Screening_Count
+ *                                    where opd_visit = 'Y' for processMonth
+ *
+ * All queries use SNORangeFinder binary-search to narrow the scan range,
+ * exactly as TCN_Source does.
+ */
+public class OPD_Source {
+
+    PrintUtilMsg pu = new PrintUtilMsg();
+
+    // =========================================================================
+    // BINARY SEARCH HELPER  (same pattern as TCN_Source)
+    // =========================================================================
+
+    private String[] binarySearch(String binarySearch, String date, String sourceTable,
+                                  String db_url, String db_name, String db_pass) {
+
+        String[] snoRangeReturn = new String[4];
+
+        try {
+            pu.sop("binarySearch", "Is Binary Search? [" + binarySearch + "]");
+
+            if (binarySearch.equalsIgnoreCase("yes")) {
+
+                String[] pull_data_details = date.split("~~");
+                String dateColumn = pull_data_details[0];
+                String dateValue  = pull_data_details[1];
+                String trendType  = pull_data_details[2];
+
+                String[] dates_details = dateValue.split("#");
+                boolean hashExist = dates_details.length > 1;
+
+                String from_date_final = "";
+                String to_date_final   = "";
+                int[]  snoRangeFinal   = new int[2];
+
+                pu.sop("binarySearch", "DateColumn: " + dateColumn
+                        + ", Date: " + dateValue + ", Trend: " + trendType);
+
+                int[] snoRange = new SNORangeFinder().getStartEndIdOfTable(
+                        sourceTable, db_url, db_name, db_pass);
+                pu.sop("binarySearch", "Table MIN [" + snoRange[0] + "], MAX [" + snoRange[1] + "]");
+
+                if (trendType.toLowerCase().equals("monthly")
+                        || (trendType.toLowerCase().equals("daily") && hashExist)) {
+
+                    if (!hashExist) {
+                        from_date_final = dateValue.substring(0, 8) + "01";
+                        to_date_final   = dateValue;
+                    } else if (hashExist && trendType.toLowerCase().equals("monthly")) {
+                        java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd");
+                        java.util.Date shared_date = sdf.parse(dates_details[0]);
+                        java.util.Calendar c = java.util.Calendar.getInstance();
+                        c.setTime(shared_date);
+                        c.add(java.util.Calendar.MONTH, -Integer.parseInt(dates_details[1]));
+                        String from_year_month = sdf.format(c.getTime());
+                        from_date_final = from_year_month.substring(0, 8) + "01";
+                        to_date_final   = dates_details[0].substring(0, 8) + "01";
+                    } else {
+                        int numberOfDays = (Integer.parseInt(dates_details[1])) - 1;
+                        java.util.Date shared_date =
+                                new java.text.SimpleDateFormat("yyyy-MM-dd").parse(dates_details[0]);
+                        java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd");
+                        to_date_final = sdf.format(shared_date);
+                        java.util.Calendar c = java.util.Calendar.getInstance();
+                        c.setTime(shared_date);
+                        c.add(java.util.Calendar.DATE, -numberOfDays);
+                        from_date_final = sdf.format(c.getTime());
+                    }
+
+                    String[] dates = {from_date_final, to_date_final};
+
+                    for (int i = 0; i < dates.length; i++) {
+                        int[] snoRangeToFromDate = new SNORangeFinder().getStartAndEndId(
+                                dates[i], snoRange[0], snoRange[1], sourceTable,
+                                "DATE_FORMAT(" + dateColumn + ",'%Y-%m-%d')",
+                                "daily", "120", false, "sno",
+                                db_url, db_name, db_pass);
+
+                        pu.sop("binarySearch", "FOR DATE [" + dates[i] + "], MinSno["
+                                + snoRangeToFromDate[0] + "], MaxSno[" + snoRangeToFromDate[1] + "]");
+
+                        if (i == 0) snoRangeFinal[0] = snoRangeToFromDate[0];
+                        else        snoRangeFinal[1] = snoRangeToFromDate[1];
+                    }
+
+                    snoRangeReturn[0] = "" + snoRangeFinal[0];
+                    snoRangeReturn[1] = "" + snoRangeFinal[1];
+                    snoRangeReturn[2] = from_date_final;
+                    snoRangeReturn[3] = to_date_final;
+
+                } else {
+                    snoRange = new SNORangeFinder().getStartAndEndId(
+                            dateValue, snoRange[0], snoRange[1], sourceTable,
+                            "DATE_FORMAT(" + dateColumn + ",'%Y-%m-%d')",
+                            trendType.toLowerCase(), "120", false, "sno",
+                            db_url, db_name, db_pass);
+
+                    snoRangeReturn[0] = "" + snoRange[0];
+                    snoRangeReturn[1] = "" + snoRange[1];
+                    snoRangeReturn[2] = "NA";
+                    snoRangeReturn[3] = "NA";
+                }
+            }
+
+        } catch (Exception ex) {
+            System.out.println("EXCEPTION in binarySearch: " + ex.toString());
+            ex.printStackTrace();
+        }
+
+        return snoRangeReturn;
+    }
+
+    // =========================================================================
+    // 1. DELETE CURRENT DAY DATA
+    // =========================================================================
+
+    /**
+     * Delete rows from the destination table where VISIT_DATE = processDate,
+     * then reset AUTO_INCREMENT to MAX(sno)+1 so the sequence stays clean.
+     *
+     * @param destTable    Destination table name
+     * @param processDate  YYYY-MM-DD
+     * @param dbURL        DB URL
+     * @param dbName       DB username
+     * @param dbPass       DB password
+     * @return boolean     true if successful
+     */
+    public boolean deleteCurrentDayData(String destTable, String processDate,
+                                        String dbURL, String dbName, String dbPass) {
+
+        Connection conn   = null;
+        Statement  stmt   = null;
+        boolean isDeleted = false;
+        int deletedRows   = 0;
+
+        String firstDay = processDate.substring(0, 8) + "01";
+
+        String deleteQuery = "DELETE FROM " + destTable
+            + " WHERE STR_TO_DATE(VISIT_DATE, '%Y-%m-%d') >= '" + firstDay + "'"
+            + " AND STR_TO_DATE(VISIT_DATE, '%Y-%m-%d') <= '" + processDate + "'";
+
+        try {
+            pu.sop("deleteCurrentDayData", "Query: " + deleteQuery);
+
+            conn = new MySQLConnection().getConnection(dbURL, dbName, dbPass);
+            stmt = conn.createStatement();
+            deletedRows = stmt.executeUpdate(deleteQuery);
+            conn.commit();
+
+            pu.sop("deleteCurrentDayData", "Rows deleted: " + deletedRows);
+
+            // Reset AUTO_INCREMENT to avoid gaps / collisions
+            String maxSnoQuery = "SELECT COALESCE(MAX(sno), 0) AS maxSno FROM " + destTable;
+            ResultSet rs = stmt.executeQuery(maxSnoQuery);
+            long maxSno = 0;
+            if (rs.next()) {
+                maxSno = rs.getLong("maxSno");
+            }
+            rs.close();
+
+            long nextSno = maxSno + 1;
+            String alterQuery = "ALTER TABLE " + destTable + " AUTO_INCREMENT = " + nextSno;
+            stmt.executeUpdate(alterQuery);
+            conn.commit();
+
+            pu.sop("deleteCurrentDayData", "AUTO_INCREMENT reset to: " + nextSno);
+
+            isDeleted = true;
+
+        } catch (Exception ex) {
+            System.out.println("EXCEPTION in deleteCurrentDayData: " + ex.toString());
+            ex.printStackTrace();
+            isDeleted = false;
+        } finally {
+            try {
+                if (stmt != null) stmt.close();
+                if (conn != null) conn.close();
+            } catch (Exception e) { /* ignore */ }
+        }
+
+        return isDeleted;
+    }
+
+    // =========================================================================
+    // 2. COPY SOURCE DATA TO DEST  (OPD_TYPE = 'Natural OPD')
+    // =========================================================================
+
+    /**
+     * Copy all rows from sourceTable where VISIT_DATE = processDate
+     * into destTable, setting OPD_TYPE = 'Natural OPD'.
+     * Rows are inserted ORDER BY VISIT_DATE so the dest table is pre-sorted.
+     *
+     * Binary search narrows the SNO range on the source table via VISIT_DATE.
+     *
+     * @param sourceTable  Patient_Type_Age_wise_final (or equivalent)
+     * @param destTable    OPD_Tracker_frequency_daily (or equivalent)
+     * @param processDate  YYYY-MM-DD
+     * @param processMonth YYYY-MM
+     * @param dbURL        DB URL
+     * @param dbName       DB username
+     * @param dbPass       DB password
+     * @return int         rows inserted, or -1 on error
+     */
+    public int copySourceData(String sourceTable, String destTable,
+                              String processDate, String processMonth,
+                              String dbURL, String dbName, String dbPass) {
+
+        Connection conn = null;
+        Statement  stmt = null;
+        int rowCount    = -1;
+
+        try {
+            // Binary search: monthly range first, then narrow to processDate
+            String binaryDateMonthly = "VISIT_DATE~~" + processMonth + "-01~~monthly";
+            String[] snoRangeMonthly = binarySearch("yes", binaryDateMonthly,
+                    sourceTable, dbURL, dbName, dbPass);
+
+            String binaryDateDaily = "VISIT_DATE~~" + processDate + "~~daily";
+            String[] snoRangeDaily = binarySearch("yes", binaryDateDaily,
+                    sourceTable, dbURL, dbName, dbPass);
+
+            String snoMin = snoRangeMonthly[0];
+            String snoMax = snoRangeDaily[1];
+
+            pu.sop("copySourceData", "SNO Range: [" + snoMin + " - " + snoMax + "]");
+
+            // INSERT ... SELECT mapping all source columns, OPD_TYPE fixed to 'Natural OPD'
+//            String insertSql =
+          
+//                "INSERT INTO " + destTable + " ("
+//                + "  PATIENT_TYPE, REGISTERED_DATE, APPOINTMENT_TYPE, MRD_NO, PATIENT_NAME,"
+//                + "  LOCATION_CODE, LOCATION, AGE, SEX, SPECIALITY_CODE, SPECIALITY_NAME,"
+//                + "  TREATMENT_CODE, TREATMENT_NAME, ADDRESS1, ADDRESS2, AREA, WARD, CITY,"
+//                + "  PINCODE, state, country, DOCTOR_CD, DOCTOR_NAME, OPTO_NAME,"
+//                + "  APPOINTMENT_SOURCE, PATIENT_CATEGORY, PATIENT_SUBCATEGORY,"
+//                + "  APPT_CreatedUser, REG_CreatedUser, VISIT_DATE, REGISTERED_DATETIME,"
+//                + "  REMARKS, MAILID, MAXID, PatientDepartment, PatientDepartmentName,"
+//                + "  CONTACT_DETAILS, CONTACT_DETAILS1, source, facebook_status,"
+//                + "  google_adwords_status, website_status, whatsapp_status, campaign_name,"
+//                + "  cid, campaign_list, rule_name, filter_query, LOCATION_NAME, cluster,"
+//                + "  Region, OPD_TYPE"
+//                + ") "
+//                + "SELECT"
+//                + "  PATIENT_TYPE, REGISTERED_DATE, APPOINTMENT_TYPE, MRD_NO, PATIENT_NAME,"
+//                + "  LOCATION_CODE, LOCATION, AGE, SEX, SPECIALITY_CODE, SPECIALITY_NAME,"
+//                + "  TREATMENT_CODE, TREATMENT_NAME, ADDRESS1, ADDRESS2, AREA, WARD, CITY,"
+//                + "  PINCODE, state, country, DOCTOR_CD, DOCTOR_NAME, OPTO_NAME,"
+//                + "  APPOINTMENT_SOURCE, PATIENT_CATEGORY, PATIENT_SUBCATEGORY,"
+//                + "  APPT_CreatedUser, REG_CreatedUser, VISIT_DATE, REGISTERED_DATETIME,"
+//                + "  REMARKS, MAILID, MAXID, PatientDepartment, PatientDepartmentName,"
+//                + "  CONTACT_DETAILS, CONTACT_DETAILS1, source, facebook_status,"
+//                + "  google_adwords_status, website_status, whatsapp_status, campaign_name,"
+//                + "  cid, campaign_list, rule_name, filter_query, LOCATION_NAME, cluster,"
+//                + "  Region, 'Natural OPD' AS OPD_TYPE"
+//                + " FROM " + sourceTable
+//                + " WHERE sno >= " + snoMin + " AND sno <= " + snoMax
+//                + "   AND DATE_FORMAT(VISIT_DATE, '%Y-%m-%d') = '" + processDate + "'"
+//                + " ORDER BY VISIT_DATE";
+
+            
+            String insertSql =
+            	    "INSERT INTO " + destTable + " ("
+            	    + "  PATIENT_TYPE, REGISTERED_DATE, APPOINTMENT_TYPE, MRD_NO, PATIENT_NAME,"
+            	    + "  LOCATION_CODE, LOCATION, AGE, SEX, SPECIALITY_CODE, SPECIALITY_NAME,"
+            	    + "  TREATMENT_CODE, TREATMENT_NAME, ADDRESS1, ADDRESS2, AREA, WARD, CITY,"
+            	    + "  PINCODE, state, country, DOCTOR_CD, DOCTOR_NAME, OPTO_NAME,"
+            	    + "  APPOINTMENT_SOURCE, PATIENT_CATEGORY, PATIENT_SUBCATEGORY,"
+            	    + "  APPT_CreatedUser, REG_CreatedUser, VISIT_DATE, REGISTERED_DATETIME,"
+            	    + "  REMARKS, MAILID, MAXID, PatientDepartment, PatientDepartmentName,"
+            	    + "  CONTACT_DETAILS, CONTACT_DETAILS1, source, facebook_status,"
+            	    + "  google_adwords_status, website_status, whatsapp_status, campaign_name,"
+            	    + "  cid, campaign_list, rule_name, filter_query, LOCATION_NAME, cluster,"
+            	    + "  Region, OPD_TYPE"
+            	    + ") "
+            	    + "SELECT"
+            	    + "  PATIENT_TYPE, REGISTERED_DATE, APPOINTMENT_TYPE, MRD_NO, PATIENT_NAME,"
+            	    + "  LOCATION_CODE, LOCATION, AGE, SEX, SPECIALITY_CODE, SPECIALITY_NAME,"
+            	    + "  TREATMENT_CODE, TREATMENT_NAME, ADDRESS1, ADDRESS2, AREA, WARD, CITY,"
+            	    + "  PINCODE, state, country, DOCTOR_CD, DOCTOR_NAME, OPTO_NAME,"
+            	    + "  APPOINTMENT_SOURCE, PATIENT_CATEGORY, PATIENT_SUBCATEGORY,"
+            	    + "  APPT_CreatedUser, REG_CreatedUser,"
+
+            	    //  FIXED VISIT_DATE
+            	    + "  STR_TO_DATE(VISIT_DATE, '%Y-%m-%d') AS VISIT_DATE,"
+
+            	    + "  REGISTERED_DATETIME,"
+            	    + "  REMARKS, MAILID, MAXID, PatientDepartment, PatientDepartmentName,"
+            	    + "  CONTACT_DETAILS, CONTACT_DETAILS1, source, facebook_status,"
+            	    + "  google_adwords_status, website_status, whatsapp_status, campaign_name,"
+            	    + "  cid, campaign_list, rule_name, filter_query, LOCATION_NAME, cluster,"
+            	    + "  Region, 'Natural OPD' AS OPD_TYPE"
+
+            	    + " FROM " + sourceTable
+
+            	    //  CRITICAL FILTER (prevents crash)
+            	    + " WHERE sno >= " + snoMin + " AND sno <= " + snoMax
+            	    + "   AND STR_TO_DATE(VISIT_DATE, '%Y-%m-%d') IS NOT NULL"
+            	    + "   AND STR_TO_DATE(VISIT_DATE, '%Y-%m-%d') = '" + processDate + "'"
+
+            	    + " ORDER BY STR_TO_DATE(VISIT_DATE, '%Y-%m-%d')";
+            pu.sop("copySourceData", "Insert SQL executing...");
+
+            conn     = new MySQLConnection().getConnection(dbURL, dbName, dbPass);
+            stmt     = conn.createStatement();
+            rowCount = stmt.executeUpdate(insertSql);
+            conn.commit();
+
+            pu.sop("copySourceData", "Rows copied: " + rowCount);
+
+        } catch (Exception ex) {
+            System.out.println("EXCEPTION in copySourceData: " + ex.toString());
+            ex.printStackTrace();
+            rowCount = -1;
+            try { if (conn != null) conn.rollback(); } catch (Exception e) { /* ignore */ }
+        } finally {
+            try {
+                if (stmt != null) stmt.close();
+                if (conn != null) conn.close();
+            } catch (Exception e) { /* ignore */ }
+        }
+
+        return rowCount;
+    }
+
+    // =========================================================================
+    // 3. GET MRD SET FROM CAMP  (opd_visit = 'Y')
+    // =========================================================================
+
+    /**
+     * Fetch distinct MRD_NO values from Camp_count_detail for processMonth
+     * where opd_visit = 'Y'.  Used to tag Camp (Out Reach) OPD type.
+     *
+     * Binary search is performed on Registered_date column.
+     *
+     * @param campTable    Camp_count_detail (or equivalent)
+     * @param processDate  YYYY-MM-DD
+     * @param processMonth YYYY-MM
+     * @param dbURL        DB URL
+     * @param dbName       DB username
+     * @param dbPass       DB password
+     * @return HashSet<String>  MRD_NO values, uppercase-trimmed; empty set on error
+     */
+    public HashSet<String> getMRDSetFromCamp(String campTable,
+                                             String processDate, String processMonth,
+                                             String dbURL, String dbName, String dbPass) {
+
+        HashSet<String> mrdSet = new HashSet<String>();
+        Connection conn        = null;
+        Statement  stmt        = null;
+        ResultSet  rs          = null;
+        int rowCount           = 0;
+
+        try {
+            String firstDay = processMonth + "-01";
+
+            String binaryDateM = "Registered_date~~" + firstDay + "~~monthly";
+            String[] snoRangeM = binarySearch("yes", binaryDateM, campTable, dbURL, dbName, dbPass);
+
+            String binaryDateD = "Registered_date~~" + processDate + "~~daily";
+            String[] snoRangeD = binarySearch("yes", binaryDateD, campTable, dbURL, dbName, dbPass);
+
+            pu.sop("getMRDSetFromCamp", "SNO Range: [" + snoRangeM[0] + " - " + snoRangeD[1] + "]");
+
+            String query =
+                "SELECT TRIM(UPPER(MRD_NO)) AS MRD_NO"
+                + " FROM " + campTable
+                + " WHERE sno >= " + snoRangeM[0] + " AND sno <= " + snoRangeD[1]
+                + "   AND DATE_FORMAT(Registered_date, '%Y-%m') = '" + processMonth + "'"
+                + "   AND UPPER(TRIM(opd_visit)) = 'Y'"
+                + "   AND MRD_NO IS NOT NULL AND TRIM(MRD_NO) != ''";
+
+            pu.sop("getMRDSetFromCamp", "Query: " + query);
+
+            conn = new MySQLConnection().getConnection(dbURL, dbName, dbPass);
+            stmt = conn.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+            rs   = stmt.executeQuery(query);
+
+            rs.last();
+            rowCount = rs.getRow();
+            rs.beforeFirst();
+
+            pu.sop("getMRDSetFromCamp", "Total camp MRD records: " + rowCount);
+
+            while (rs.next()) {
+                String mrd = rs.getString("MRD_NO");
+                if (mrd != null && !mrd.trim().isEmpty()) {
+                    mrdSet.add(mrd.trim().toUpperCase());
+                }
+            }
+
+        } catch (Exception ex) {
+            System.out.println("EXCEPTION in getMRDSetFromCamp: " + ex.toString());
+            ex.printStackTrace();
+        } finally {
+            try {
+                if (rs   != null) rs.close();
+                if (stmt != null) stmt.close();
+                if (conn != null) conn.close();
+            } catch (Exception e) { /* ignore */ }
+        }
+
+        return mrdSet;
+    }
+
+    // =========================================================================
+    // 4. GET MRD SET FROM FREE SCREENING  (opd_visit = 'Y')
+    // =========================================================================
+
+    /**
+     * Fetch distinct MRD_NO values from Free_Screening_Count for processMonth
+     * where opd_visit = 'Y'.  Used to tag Attendant Activity OPD type.
+     *
+     * Binary search is performed on Registered_date column.
+     *
+     * @param screeningTable  Free_Screening_Count (or equivalent)
+     * @param processDate     YYYY-MM-DD
+     * @param processMonth    YYYY-MM
+     * @param dbURL           DB URL
+     * @param dbName          DB username
+     * @param dbPass          DB password
+     * @return HashSet<String> MRD_NO values, uppercase-trimmed; empty set on error
+     */
+    public HashSet<String> getMRDSetFromScreening(String screeningTable,
+                                                  String processDate, String processMonth,
+                                                  String dbURL, String dbName, String dbPass) {
+
+        HashSet<String> mrdSet = new HashSet<String>();
+        Connection conn        = null;
+        Statement  stmt        = null;
+        ResultSet  rs          = null;
+        int rowCount           = 0;
+
+        try {
+            String firstDay = processMonth + "-01";
+
+            String binaryDateM = "Registered_date~~" + firstDay + "~~monthly";
+            String[] snoRangeM = binarySearch("yes", binaryDateM, screeningTable, dbURL, dbName, dbPass);
+
+            String binaryDateD = "Registered_date~~" + processDate + "~~daily";
+            String[] snoRangeD = binarySearch("yes", binaryDateD, screeningTable, dbURL, dbName, dbPass);
+
+            pu.sop("getMRDSetFromScreening", "SNO Range: [" + snoRangeM[0] + " - " + snoRangeD[1] + "]");
+
+            String query =
+                "SELECT TRIM(UPPER(MRD_NO)) AS MRD_NO"
+                + " FROM " + screeningTable
+                + " WHERE sno >= " + snoRangeM[0] + " AND sno <= " + snoRangeD[1]
+                + "   AND DATE_FORMAT(Registered_date, '%Y-%m') = '" + processMonth + "'"
+                + "   AND UPPER(TRIM(opd_visit)) = 'Y'"
+                + "   AND MRD_NO IS NOT NULL AND TRIM(MRD_NO) != ''";
+
+            pu.sop("getMRDSetFromScreening", "Query: " + query);
+
+            conn = new MySQLConnection().getConnection(dbURL, dbName, dbPass);
+            stmt = conn.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+            rs   = stmt.executeQuery(query);
+
+            rs.last();
+            rowCount = rs.getRow();
+            rs.beforeFirst();
+
+            pu.sop("getMRDSetFromScreening", "Total screening MRD records: " + rowCount);
+
+            while (rs.next()) {
+                String mrd = rs.getString("MRD_NO");
+                if (mrd != null && !mrd.trim().isEmpty()) {
+                    mrdSet.add(mrd.trim().toUpperCase());
+                }
+            }
+
+        } catch (Exception ex) {
+            System.out.println("EXCEPTION in getMRDSetFromScreening: " + ex.toString());
+            ex.printStackTrace();
+        } finally {
+            try {
+                if (rs   != null) rs.close();
+                if (stmt != null) stmt.close();
+                if (conn != null) conn.close();
+            } catch (Exception e) { /* ignore */ }
+        }
+
+        return mrdSet;
+    }
+}

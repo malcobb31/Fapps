@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename Java project &apos;EP_BETA&apos; to &apos;EP_BETA_SERVER_DATEWISE&apos;&#x0D;&#x0A;- Original element: &apos;EP_BETA&apos;&#x0D;&#x0A;- Renamed element: &apos;EP_BETA&apos;&#x0D;&#x0A;- Update references to refactored element" description="Rename Java project &apos;EP_BETA&apos;" flags="7" id="org.eclipse.jdt.ui.rename.java.project" input="=EP_BETA" name="EP_BETA_SERVER_DATEWISE" references="true" stamp="1778491117842" version="1.0"/>
+</session>

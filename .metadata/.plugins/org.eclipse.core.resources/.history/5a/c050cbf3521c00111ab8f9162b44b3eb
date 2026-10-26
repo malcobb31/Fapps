@@ -1,0 +1,334 @@
+package com.fapps.main;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import com.fapps.db.MySQLConnection;
+import com.fapps.util.PrintUtilMsg;
+
+/**
+ * ProcessTCNData - Main Processing Logic for TCN Call Data
+ *
+ * Business Logic Flow:
+ * -----------------------------------------------------------------------
+ * 1.  Delete current-month data from destination table (same logic as ProcessData)
+ * 2.  Fetch Inbound call records  : Call_Completed_Date, Agent_First_Name, Caller_ID, Result
+ *                                   (from TCN_Inbound_Call)
+ * 3.  Fetch Manual call records   : Call_Completed_Date, Agent_First_Name, TCN_Dialed_Number, Result
+ *                                   (from TCN_Manual_Call_final)
+ * 4.  Merge both lists – phone is the deduplicated key (last 10 digits)
+ * 5.  For each merged phone:
+ *       a) Look up Patient_Type_Age_wise_final → get MRD_NO, Visit_Date
+ *          RULE: Visit_Date >= Call_Completed_Date
+ *       b) Look up TCN_Inbound_Call_tmp_extra2  → get Inbound_Group_Name (same month)
+ * 6.  Insert enriched rows into destination table in batches of 5000
+ * -----------------------------------------------------------------------
+ *
+ * Destination table columns (adjust to your actual DDL):
+ *   sno (auto), Call_Completed_Date, Agent_First_Name, Phone_Number, Result,
+ *   Call_Source, MRD_NO, Visit_Date, Patient_Type, Inbound_Group_Name, Process_Month
+ */
+public class ProcessTCNData {
+
+    PrintUtilMsg pu = new PrintUtilMsg();
+
+    /**
+     * Main entry point – called from TCNMain.
+     *
+     * @param tableInbound      TCN_Inbound_Call
+     * @param tableManual       TCN_Manual_Call_final
+     * @param tableOPD          Patient_Type_Age_wise_final
+     * @param tableExtra2       TCN_Inbound_Call_tmp_extra2
+     * @param destTable         Destination / output table
+     * @param processDate       YYYY-MM-DD  (D-1)
+     * @param processMonth      YYYY-MM
+     * @param dbURL             JDBC URL (e.g. jdbc:mysql://localhost:3306/mydb)
+     * @param dbName            DB username
+     * @param dbPass            DB password
+     * @return boolean          true = success
+     */
+    public boolean processTCNData(String tableInbound,
+                                  String tableManual,
+                                  String tableOPD,
+                                  String tableExtra2,
+                                  String destTable,
+                                  String processDate,
+                                  String processMonth,
+                                  String dbURL,
+                                  String dbName,
+                                  String dbPass) {
+
+        Connection        conn     = null;
+        PreparedStatement ps       = null;
+        boolean           status   = false;
+        int               batchSize = 5000;
+        int               rowCount  = 0;
+
+        try {
+
+            // =================================================================
+            // STEP 1 : Delete current-month data from destination table
+            // =================================================================
+            pu.sop("processTCNData", "===== STEP 1: Delete Current Month Data =====");
+
+            boolean deleted = new TCN_Source().deleteCurrentMonthData(
+                    destTable, processMonth, dbURL, dbName, dbPass);
+
+            if (deleted) {
+                pu.sop("processTCNData", "✓ Current month data deleted successfully");
+            } else {
+                pu.sop("processTCNData", "⚠ No data to delete or deletion skipped");
+            }
+
+            // =================================================================
+            // STEP 2 : Fetch Inbound call records
+            // =================================================================
+            pu.sop("processTCNData", "===== STEP 2: Fetch Inbound Call Data =====");
+
+            HashMap<String, String[]> inboundData = new TCN_Source().getInboundCallData(
+                    tableInbound, processMonth, processDate, dbURL, dbName, dbPass);
+
+            int inboundCount = (inboundData != null) ? inboundData.size() : 0;
+            pu.sop("processTCNData", "✓ Inbound records fetched: " + inboundCount);
+
+            // =================================================================
+            // STEP 3 : Fetch Manual call records
+            // =================================================================
+            pu.sop("processTCNData", "===== STEP 3: Fetch Manual Call Data =====");
+
+            HashMap<String, String[]> manualData = new TCN_Source().getManualCallData(
+                    tableManual, processMonth, processDate, dbURL, dbName, dbPass);
+
+            int manualCount = (manualData != null) ? manualData.size() : 0;
+            pu.sop("processTCNData", "✓ Manual call records fetched: " + manualCount);
+
+            // =================================================================
+            // STEP 4 : Merge both maps  (Inbound + Manual)
+            //          Phone key = last 10 digits.
+            //          Inbound wins on collision (added first).
+            // =================================================================
+            pu.sop("processTCNData", "===== STEP 4: Merge Inbound + Manual =====");
+
+            HashMap<String, String[]> mergedData = new HashMap<String, String[]>();
+
+            if (inboundData != null) {
+                mergedData.putAll(inboundData);
+            }
+            if (manualData != null) {
+                for (Map.Entry<String, String[]> entry : manualData.entrySet()) {
+                    if (!mergedData.containsKey(entry.getKey())) {
+                        mergedData.put(entry.getKey(), entry.getValue());
+                    }
+                }
+            }
+
+            pu.sop("processTCNData", "✓ Merged unique phone records: " + mergedData.size());
+
+            if (mergedData.isEmpty()) {
+                pu.sop("processTCNData", "⚠ No call records found for month: " + processMonth);
+                return false;
+            }
+
+            // =================================================================
+            // STEP 5 : Fetch OPD visit data
+            // =================================================================
+            pu.sop("processTCNData", "===== STEP 5: Fetch OPD Visit Data =====");
+
+            HashMap<String, List<String[]>> opdData = new TCN_Source().getOPDVisitData(
+                    tableOPD, processMonth, processDate, dbURL, dbName, dbPass);
+
+            int opdCount = (opdData != null) ? opdData.size() : 0;
+            pu.sop("processTCNData", "✓ OPD visit phones fetched: " + opdCount);
+
+            // =================================================================
+            // STEP 6 : Fetch Inbound Group Name from extra2 table
+            // =================================================================
+            pu.sop("processTCNData", "===== STEP 6: Fetch Inbound Group Names =====");
+
+            HashMap<String, String> groupNameData = new TCN_Source().getInboundGroupName(
+                    tableExtra2, processMonth, processDate, dbURL, dbName, dbPass);
+
+            int groupCount = (groupNameData != null) ? groupNameData.size() : 0;
+            pu.sop("processTCNData", "✓ Inbound group names fetched: " + groupCount);
+
+            // =================================================================
+            // STEP 7 : Prepare INSERT and iterate merged records
+            // =================================================================
+            pu.sop("processTCNData", "===== STEP 7: Begin Insert Processing =====");
+
+            /*
+             * Destination table expected columns:
+             *   sno                  – AUTO_INCREMENT (not in INSERT)
+             *   Call_Completed_Date  – DATE / DATETIME
+             *   Agent_First_Name     – VARCHAR
+             *   Phone_Number         – VARCHAR  (last-10-digit clean)
+             *   Result               – VARCHAR
+             *   Call_Source          – VARCHAR  ('INBOUND' | 'MANUAL')
+             *   MRD_NO               – VARCHAR  (from OPD, null if no match)
+             *   Visit_Date           – DATE     (from OPD, null if no match)
+             *   Patient_Type         – VARCHAR  (from OPD, null if no match)
+             *   Inbound_Group_Name   – VARCHAR  (from extra2, null if no match)
+             *   Process_Month        – VARCHAR  (YYYY-MM)
+             */
+            String insertQuery = "INSERT INTO " + destTable
+                    + " (Call_Completed_Date, Agent_First_Name, Phone_Number, Result, "
+                    + "Call_Source, MRD_NO, Visit_Date, Patient_Type, "
+                    + "Inbound_Group_Name, Process_Month) "
+                    + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+            conn = new MySQLConnection().getConnection(dbURL, dbName, dbPass);
+            conn.setAutoCommit(false);
+            ps = conn.prepareStatement(insertQuery);
+
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd");
+
+            // Sort merged data into a list for deterministic processing
+            List<Map.Entry<String, String[]>> sortedList =
+                    new ArrayList<Map.Entry<String, String[]>>(mergedData.entrySet());
+
+            // Sort by Call_Completed_Date (index 0) ascending
+            java.util.Collections.sort(sortedList,
+                    new java.util.Comparator<Map.Entry<String, String[]>>() {
+                        public int compare(Map.Entry<String, String[]> e1,
+                                           Map.Entry<String, String[]> e2) {
+                            String d1 = (e1.getValue()[0] != null) ? e1.getValue()[0] : "";
+                            String d2 = (e2.getValue()[0] != null) ? e2.getValue()[0] : "";
+                            return d1.compareTo(d2);
+                        }
+                    });
+
+            for (Map.Entry<String, String[]> entry : sortedList) {
+
+                String   phone    = entry.getKey();
+                String[] callData = entry.getValue();
+
+                // callData indices:
+                //  [0] Call_Completed_Date
+                //  [1] Agent_First_Name
+                //  [2] Original phone column value
+                //  [3] Result
+                //  [4] Call_Source  ("INBOUND" / "MANUAL")
+                //  [5] CleanPhone10
+
+                String callCompletedDate = callData[0];
+                String agentFirstName    = callData[1];
+                String result            = callData[3];
+                String callSource        = callData[4];
+
+                // ----- OPD lookup: Visit_Date >= Call_Completed_Date -----
+                String mrdNo       = null;
+                String visitDate   = null;
+                String patientType = null;
+
+                if (opdData != null && opdData.containsKey(phone)) {
+                    List<String[]> visits = opdData.get(phone);
+
+                    for (String[] visit : visits) {
+                        String vDate = visit[1]; // Visit_Date YYYY-MM-DD
+
+                        if (vDate != null && callCompletedDate != null) {
+                            try {
+                                // Extract date portion only (strip time if present)
+                                String callDateOnly = (callCompletedDate.length() >= 10)
+                                        ? callCompletedDate.substring(0, 10)
+                                        : callCompletedDate;
+
+                                java.util.Date visitDateObj = sdf.parse(vDate);
+                                java.util.Date callDateObj  = sdf.parse(callDateOnly);
+
+                                // Rule: Visit_Date >= Call_Completed_Date
+                                if (!visitDateObj.before(callDateObj)) {
+                                    mrdNo       = visit[0];
+                                    visitDate   = vDate;
+                                    patientType = visit[3];
+                                    break; // Take first qualifying visit
+                                }
+
+                            } catch (Exception dateEx) {
+                                pu.sop("processTCNData",
+                                        "Date parse error for phone [" + phone + "]: " + dateEx.getMessage());
+                            }
+                        }
+                    }
+
+                    if (mrdNo != null) {
+                        pu.sop("Processing", "Phone [" + phone + "] - OPD match found: MRD=" + mrdNo
+                                + ", VisitDate=" + visitDate);
+                    } else {
+                        pu.sop("Processing", "Phone [" + phone + "] - OPD found but Visit_Date < Call_Completed_Date");
+                    }
+
+                } else {
+                    pu.sop("Processing", "Phone [" + phone + "] - No OPD match");
+                }
+
+                // ----- Inbound Group Name lookup -----
+                String inboundGroupName = null;
+                if (groupNameData != null && groupNameData.containsKey(phone)) {
+                    inboundGroupName = groupNameData.get(phone);
+                }
+
+                // ----- Build PreparedStatement -----
+                ps.setString(1,  callCompletedDate);
+                ps.setString(2,  agentFirstName);
+                ps.setString(3,  phone);           // cleaned 10-digit phone
+                ps.setString(4,  result);
+                ps.setString(5,  callSource);
+                ps.setString(6,  mrdNo);           // null if no OPD match
+                ps.setString(7,  visitDate);       // null if no qualifying visit
+                ps.setString(8,  patientType);     // null if no OPD match
+                ps.setString(9,  inboundGroupName);// null if not in extra2
+                ps.setString(10, processMonth);
+
+                ps.addBatch();
+                rowCount++;
+
+                // Execute batch every 5000 rows
+                if (rowCount % batchSize == 0) {
+                    ps.executeBatch();
+                    pu.sop("processTCNData", "Batch executed - Rows processed so far: " + rowCount);
+                }
+            }
+
+            // Execute remaining rows in batch
+            if (rowCount % batchSize != 0) {
+                ps.executeBatch();
+            }
+
+            conn.commit();
+            status = true;
+
+            pu.sop("processTCNData", "===== ALL DATA PROCESSED SUCCESSFULLY =====");
+            pu.sop("processTCNData", "Total rows inserted: " + rowCount);
+
+        } catch (Exception ex) {
+            System.out.println("EXCEPTION in processTCNData: " + ex.toString());
+            ex.printStackTrace();
+
+            try {
+                if (conn != null) conn.rollback();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+
+            status = false;
+
+        } finally {
+            try {
+                if (conn != null) {
+                    if (ps != null) ps.close();
+                    conn.close();
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+
+        return status;
+    }
+}

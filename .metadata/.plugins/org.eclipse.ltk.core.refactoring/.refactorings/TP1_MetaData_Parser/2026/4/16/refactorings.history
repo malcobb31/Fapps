@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename compilation unit &apos;metadata_parser_v1.SourceData.java&apos; to &apos;metadata_parser_source.java&apos;&#x0D;&#x0A;- Original project: &apos;TP1_MetaData_Parser&apos;&#x0D;&#x0A;- Original element: &apos;metadata_parser_v1.SourceData.java&apos;&#x0D;&#x0A;- Renamed element: &apos;metadata_parser_v1.metadata_parser_source.java&apos;" description="Rename compilation unit &apos;SourceData.java&apos;" flags="2" id="org.eclipse.jdt.ui.rename.compilationunit" input="/src&lt;metadata_parser_v1{SourceData.java" name="metadata_parser_source.java" references="false" stamp="1776075992217" version="1.0"/>
+</session>

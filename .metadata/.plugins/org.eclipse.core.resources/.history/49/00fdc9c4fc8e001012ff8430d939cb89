@@ -1,0 +1,1044 @@
+package postgre_ip_v4;
+
+import java.io.*;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.nio.file.*;
+import java.sql.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import org.postgresql.core.BaseConnection;
+
+public class PostgreV4MethodsTest {
+    
+    // Instance variables instead of static
+    private final DateTimeFormatter logFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private final int defaultThreadCount = Math.max(2, Runtime.getRuntime().availableProcessors());
+    private final String processName = "CSV_TO_PSQL";
+    private final String processVersion = "1.0.0";
+    private final boolean debugEnabled = false;
+    
+    // Natural sorting comparator for files
+    private final Comparator<Path> naturalFileComparator = (path1, path2) -> {
+        String name1 = path1.getFileName().toString();
+        String name2 = path2.getFileName().toString();
+        return compareNaturally(name1, name2);
+    };
+    
+    // Natural string comparison for proper file ordering
+    private int compareNaturally(String str1, String str2) {
+        int len1 = str1.length();
+        int len2 = str2.length();
+        int i = 0, j = 0;
+        
+        while (i < len1 && j < len2) {
+            char c1 = str1.charAt(i);
+            char c2 = str2.charAt(j);
+            
+            if (Character.isDigit(c1) && Character.isDigit(c2)) {
+                // Extract numbers and compare numerically
+                StringBuilder num1 = new StringBuilder();
+                StringBuilder num2 = new StringBuilder();
+                
+                while (i < len1 && Character.isDigit(str1.charAt(i))) {
+                    num1.append(str1.charAt(i++));
+                }
+                while (j < len2 && Character.isDigit(str2.charAt(j))) {
+                    num2.append(str2.charAt(j++));
+                }
+                
+                int numCompare = Integer.compare(Integer.parseInt(num1.toString()), 
+                                               Integer.parseInt(num2.toString()));
+                if (numCompare != 0) {
+                    return numCompare;
+                }
+            } else {
+                if (c1 != c2) {
+                    return Character.compare(c1, c2);
+                }
+                i++;
+                j++;
+            }
+        }
+        
+        return Integer.compare(len1, len2);
+    }
+    
+    // Instance-based logging
+    private void log(String level, String message, String pdbHost, String evtType) {
+        if ("DEBUG".equalsIgnoreCase(level) && !debugEnabled) return;
+        
+        String timestamp = LocalDateTime.now().format(logFormat);
+        StringBuilder logBuilder = new StringBuilder(512);
+        logBuilder.append("ALERT - ").append(timestamp).append(" --> ")
+                  .append("Process_Name:").append(processName).append(" ");
+        
+        if (pdbHost != null && !pdbHost.isEmpty()) {
+            logBuilder.append("Server_IP: ").append(pdbHost).append(" ");
+        }
+        
+        logBuilder.append("Process_Version:").append(processVersion).append(" ")
+                  .append("Log_Level:").append(level.toUpperCase()).append(" ")
+                  .append("EVT_Type:").append(evtType != null ? evtType : "NA").append(" ")
+                  .append("Description:").append(message != null ? message : "");
+        
+        String finalLog = logBuilder.toString().replaceAll("\\s+$", "");
+        System.out.println(finalLog);
+    }
+    
+    // Resource monitoring with proper resource cleanup
+    private void logResourceUsage(String phase, String pdbHost) {
+        try {
+        	
+            MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
+            long usedMemory = memoryBean.getHeapMemoryUsage().getUsed();
+            long maxMemory = memoryBean.getHeapMemoryUsage().getMax();
+            double memoryUsage = (double) usedMemory / maxMemory * 100;
+            
+            com.sun.management.OperatingSystemMXBean osBean = 
+                (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+            double systemCpuLoad = osBean.getSystemCpuLoad() * 100;
+            long totalMemory = osBean.getTotalPhysicalMemorySize() / (1024 * 1024);
+            long freeMemory = osBean.getFreePhysicalMemorySize() / (1024 * 1024);
+            
+            log("INFO", String.format(
+                "Process_CPU:%.2f%% System_CPU:%.2f%% Used:%dMB Max:%dMB System_Mem:%dMB Free:%dMB",
+                 getCpuUsage(), systemCpuLoad,
+                usedMemory / (1024 * 1024), maxMemory / (1024 * 1024), totalMemory, freeMemory),
+                pdbHost,"RESOURCE_MONITOR");
+        } catch (Exception e) {
+            log("WARNING", "Failed to get resource usage: " + e.getMessage(), pdbHost, "RESOURCE_ERROR");
+        }
+    }
+    
+    private double getCpuUsage() {
+        try {
+            com.sun.management.OperatingSystemMXBean osBean = 
+                (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+            double cpuLoad = osBean.getProcessCpuLoad();
+            return cpuLoad >= 0 ? cpuLoad * 100 : 0.0;
+        } catch (Exception e) {
+            return 0.0;
+        }
+    }
+    
+    // Configuration classes remain the same but now used with instance
+    public class ProcessConfig {
+        public final String dirPath, processedDirPath, delimiter;
+        public final boolean hasHeader;
+        public final int numTablesToPick, bulkSize, threadCount;
+        public final double maxCpuThreshold, maxMemoryThreshold;
+        public final DatabaseConfig sourceDb, targetDb;
+        public final String configTable, dbType;
+        
+        public ProcessConfig(String dirPath, String processedDirPath, String headerFlag, String delimiter,
+                           String sqldburl, String sdbuser, String sdbpass, String pdbHost, String pdbPort,
+                           String pdbName, String pdbUser, String pdbPass, String destUrl, String destUser,
+                           String destPass, String numTablesToPickStr, String configTable, String maxCpuUtil,
+                           String maxMemUtil, String bulkNumberStr, String dbTypeStr, PostgreV4MethodsTest instance) {
+            
+            this.dirPath = dirPath;
+            this.processedDirPath = processedDirPath;
+            this.hasHeader = "yes".equalsIgnoreCase(headerFlag) || "true".equalsIgnoreCase(headerFlag);
+            this.delimiter = (delimiter == null || delimiter.isEmpty()) ? "," : delimiter;
+            this.numTablesToPick = parseIntOrDefault(numTablesToPickStr, 10);
+            this.bulkSize = parseIntOrDefault(bulkNumberStr, 10000);
+            this.threadCount = Math.min(numTablesToPick, instance.defaultThreadCount);
+            this.maxCpuThreshold = parseDoubleOrDefault(maxCpuUtil, 80.0);
+            this.maxMemoryThreshold = parseDoubleOrDefault(maxMemUtil, 80.0);
+            this.configTable = configTable;
+            this.dbType = (dbTypeStr == null) ? "psql" : dbTypeStr.trim().toLowerCase();
+            
+            instance.log("INFO", String.format(
+                "Configuration initialized - DB_Type:%s Tables_To_Process:%d Bulk_Size:%d Thread_Count:%d CPU_Threshold:%.1f%% Memory_Threshold:%.1f%%",
+                this.dbType, this.numTablesToPick, this.bulkSize, this.threadCount, 
+                this.maxCpuThreshold, this.maxMemoryThreshold), pdbHost, "CONFIG_INIT");
+            
+            this.sourceDb = new DatabaseConfig(sqldburl, sdbuser, sdbpass);
+            
+            if ("psql".equalsIgnoreCase(this.dbType)) {
+                String pgUrl = String.format("jdbc:postgresql://%s:%s/%s", pdbHost, pdbPort, pdbName);
+                this.targetDb = new DatabaseConfig(pgUrl, pdbUser, pdbPass, pdbHost, pdbPort, pdbName);
+                instance.log("INFO", String.format("PostgreSQL target configured - Host:%s Port:%s Database:%s", 
+                           pdbHost, pdbPort, pdbName), pdbHost, "DB_CONFIG");
+            } else {
+                this.targetDb = new DatabaseConfig(destUrl, destUser, destPass);
+                instance.log("INFO", "MySQL target configured", pdbHost, "DB_CONFIG");
+            }
+        }
+        
+        private int parseIntOrDefault(String value, int defaultValue) {
+            try {
+                return (value != null && !value.trim().isEmpty()) ? Integer.parseInt(value.trim()) : defaultValue;
+            } catch (NumberFormatException e) {
+                return defaultValue;
+            }
+        }
+        
+        private double parseDoubleOrDefault(String value, double defaultValue) {
+            try {
+                return (value != null && !value.trim().isEmpty()) ? Double.parseDouble(value.trim()) : defaultValue;
+            } catch (NumberFormatException e) {
+                return defaultValue;
+            }
+        }
+    }
+    
+    public class DatabaseConfig {
+        public final String url, user, password, host, port, database;
+        
+        public DatabaseConfig(String url, String user, String password) {
+            this(url, user, password, null, null, null);
+        }
+        
+        public DatabaseConfig(String url, String user, String password, String host, String port, String database) {
+            this.url = url;
+            this.user = user;
+            this.password = password;
+            this.host = host;
+            this.port = port;
+            this.database = database;
+        }
+    }
+    
+    public  class TableEntry {
+        public final String sno, tableName;
+        
+        public TableEntry(String sno, String tableName) {
+            this.sno = sno;
+            this.tableName = tableName;
+        }
+        
+        
+        public String toString() {
+            return String.format("Table[sno=%s, name=%s]", sno, tableName);
+        }
+    }
+    
+    public class TableProcessResult {
+        public final TableEntry table;
+        public final boolean success;
+        public final int filesProcessed;
+        public final String errorMessage;
+        
+        public TableProcessResult(TableEntry table, boolean success, int filesProcessed, String errorMessage) {
+            this.table = table;
+            this.success = success;
+            this.filesProcessed = filesProcessed;
+            this.errorMessage = errorMessage;
+        }
+    }
+    
+    // Main processing method - now instance-based
+    public void processAllInDirectory(String dirPath, String processedDirPath, String headerFlag, String delimiter,
+                                    String sqldburl, String sdbuser, String sdbpass, String pdbHost, String pdbPort,
+                                    String pdbName, String pdbUser, String pdbPass, String destUrl, String destUser,
+                                    String destPass, String numTablesToPickStr, String configTable, String maxCpuUtil,
+                                    String maxMemUtil, String bulkNumberStr, String dbTypeStr) {
+        
+        log("INFO", "CSV processing started", pdbHost, "PROCESS_START");
+        logResourceUsage("STARTUP", pdbHost);
+        
+        ProcessConfig config = new ProcessConfig(dirPath, processedDirPath, headerFlag, delimiter, sqldburl,
+                                               sdbuser, sdbpass, pdbHost, pdbPort, pdbName, pdbUser, pdbPass,
+                                               destUrl, destUser, destPass, numTablesToPickStr, configTable,
+                                               maxCpuUtil, maxMemUtil, bulkNumberStr, dbTypeStr, this);
+        
+        try {
+            executeProcessing(config, pdbHost);
+            logResourceUsage("COMPLETION", pdbHost);
+            log("INFO", "CSV processing completed successfully", pdbHost, "PROCESS_END");
+        } catch (Exception e) {
+            log("ERROR", "Processing failed: " + e.getMessage(), pdbHost, "PROCESS_ERROR");
+            e.printStackTrace();
+        }
+    }
+    
+    private void executeProcessing(ProcessConfig config, String pdbHost) {
+        
+        
+        if (!validateSystemResources(config.maxCpuThreshold, config.maxMemoryThreshold, pdbHost)) {
+            log("ERROR", "System resources exceed configured thresholds", pdbHost, "RESOURCE_EXCEEDED");
+            return;
+        }
+        
+        if (!validateDirectories(config.dirPath, config.processedDirPath, pdbHost)) {
+            log("ERROR", "Directory validation failed", pdbHost, "DIR_VALIDATION_FAILED");
+            return;
+        }
+        
+        List<Path> csvFiles = discoverCsvFiles(config.dirPath, pdbHost);
+        if (csvFiles.isEmpty()) {
+            log("INFO", "No CSV files found in directory: " + config.dirPath, pdbHost, "NO_FILES_FOUND");
+            return;
+        }
+        
+        List<TableEntry> readyTables = fetchReadyTables(config, pdbHost);
+        if (readyTables.isEmpty()) {
+            log("INFO", "No tables ready for import", pdbHost, "NO_TABLES_READY");
+            return;
+        }
+        
+        Map<String, List<Path>> tableFilesMap = groupFilesByTable(csvFiles, readyTables, pdbHost);
+        log("INFO", String.format("File grouping completed - Tables_With_Files:%d Total_CSV_Files:%d",
+                                tableFilesMap.size(), csvFiles.size()), pdbHost, "FILE_GROUPING");
+        
+        logResourceUsage("PRE_PROCESSING", pdbHost);
+        processTablesInParallel(config, readyTables, tableFilesMap, pdbHost);
+        logResourceUsage("POST_PROCESSING", pdbHost);
+    }
+    
+    private boolean validateSystemResources(double maxCpuThreshold, double maxMemoryThreshold, String pdbHost) {
+        try {
+            MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
+            long usedMemory = memoryBean.getHeapMemoryUsage().getUsed();
+            long maxMemory = memoryBean.getHeapMemoryUsage().getMax();
+            double memoryUsage = (double) usedMemory / maxMemory * 100;
+            double cpuUsage = getCpuUsage();
+            
+            log("INFO", String.format(
+                "Resource validation - CPU:%.2f%% (Threshold:%.2f%%) Memory:%.2f%% (Threshold:%.2f%%)",
+                cpuUsage, maxCpuThreshold, memoryUsage, maxMemoryThreshold), pdbHost, "RESOURCE_CHECK");
+            
+            if (memoryUsage > maxMemoryThreshold) {
+                log("WARNING", String.format("Memory usage %.2f%% exceeds threshold %.2f%%",
+                                           memoryUsage, maxMemoryThreshold), pdbHost, "MEMORY_THRESHOLD_EXCEEDED");
+                return false;
+            }
+            
+            if (cpuUsage > maxCpuThreshold) {
+                log("WARNING", String.format("CPU usage %.2f%% exceeds threshold %.2f%%",
+                                           cpuUsage, maxCpuThreshold), pdbHost, "CPU_THRESHOLD_EXCEEDED");
+                return false;
+            }
+            
+            return true;
+        } catch (Exception e) {
+            log("WARNING", "Could not validate system resources: " + e.getMessage(), pdbHost, "RESOURCE_CHECK_ERROR");
+            return true;
+        }
+    }
+    
+    private boolean validateDirectories(String dirPath, String processedDirPath, String pdbHost) {
+        try {
+            Path sourceDir = Paths.get(dirPath);
+            Path processedDir = Paths.get(processedDirPath);
+            
+            if (!Files.exists(sourceDir) || !Files.isDirectory(sourceDir)) {
+                log("ERROR", "Source directory does not exist: " + dirPath, pdbHost, "DIR_NOT_FOUND");
+                return false;
+            }
+            
+            Files.createDirectories(processedDir);
+            log("INFO", String.format("Directory validation successful - Source:%s Processed:%s",
+                                    dirPath, processedDirPath), pdbHost, "DIR_VALIDATED");
+            return true;
+        } catch (Exception e) {
+            log("ERROR", "Directory validation failed: " + e.getMessage(), pdbHost, "DIR_VALIDATION_ERROR");
+            return false;
+        }
+    }
+    
+    // Fixed file discovery with proper natural sorting
+    private List<Path> discoverCsvFiles(String dirPath, String pdbHost) {
+        try (Stream<Path> stream = Files.list(Paths.get(dirPath))) {
+            List<Path> files = stream
+                .filter(Files::isRegularFile)
+                .filter(p -> {
+                    String fileName = p.getFileName().toString().toLowerCase();
+                    return (fileName.startsWith("raw_") || fileName.startsWith("process_")) && fileName.endsWith(".csv");
+                })
+                .sorted(naturalFileComparator) // Use natural sorting
+                .collect(Collectors.toList());
+            
+            log("INFO", String.format("CSV file discovery completed - Files_Found:%d Directory:%s",
+                                    files.size(), dirPath), pdbHost, "FILE_DISCOVERY");
+            return files;
+        } catch (IOException e) {
+            log("ERROR", "Failed to discover CSV files: " + e.getMessage(), pdbHost, "FILE_DISCOVERY_ERROR");
+            return Collections.emptyList();
+        }
+    }
+    
+    // Fixed resource management - proper connection closing
+    private List<TableEntry> fetchReadyTables(ProcessConfig config, String pdbHost) {
+        List<TableEntry> tables = new ArrayList<>();
+        String query = "SELECT sno, table_name FROM " + config.configTable + 
+                      " WHERE sync_status = 'ready_to_import' LIMIT ?";
+        
+        Connection conn = null;
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        
+        try {
+            conn = DriverManager.getConnection(config.sourceDb.url, config.sourceDb.user, config.sourceDb.password);
+            ps = conn.prepareStatement(query);
+            ps.setInt(1, config.numTablesToPick);
+            rs = ps.executeQuery();
+            
+            while (rs.next()) {
+                TableEntry table = new TableEntry(rs.getString("sno"), rs.getString("table_name"));
+                tables.add(table);
+            }
+            
+            log("INFO", String.format("Ready tables fetched - Count:%d Config_Table:%s",
+                                    tables.size(), config.configTable), pdbHost, "TABLE_FETCH");
+        } catch (SQLException e) {
+            log("ERROR", "Failed to fetch ready tables: " + e.getMessage(), pdbHost, "TABLE_FETCH_ERROR");
+        } finally {
+            // Proper resource cleanup
+            closeQuietly(rs);
+            closeQuietly(ps);
+            closeQuietly(conn);
+        }
+        
+        return tables;
+    }
+    
+    // Utility method for safe resource closing
+    private void closeQuietly(AutoCloseable resource) {
+        if (resource != null) {
+            try {
+                resource.close();
+            } catch (Exception e) {
+                // Log but don't throw - this is cleanup code
+                System.err.println("Warning: Failed to close resource: " + e.getMessage());
+            }
+        }
+    }
+    
+    private Map<String, List<Path>> groupFilesByTable(List<Path> csvFiles, List<TableEntry> readyTables, String pdbHost) {
+        Map<String, List<Path>> tableFilesMap = new HashMap<>();
+        Set<String> readySnoSet = readyTables.stream().map(t -> t.sno).collect(Collectors.toSet());
+        
+        for (Path file : csvFiles) {
+            String fileName = file.getFileName().toString();
+            String[] parts = fileName.split("_");
+            if (parts.length > 4) {
+                String sno = parts[4];
+                if (readySnoSet.contains(sno)) {
+                    tableFilesMap.computeIfAbsent(sno, k -> new ArrayList<>()).add(file);
+                }
+            }
+        }
+        
+        log("INFO", String.format("File grouping completed - Tables_With_Files:%d Total_Files:%d",
+                                tableFilesMap.size(), csvFiles.size()), pdbHost, "FILE_GROUPING");
+        return tableFilesMap;
+    }
+    
+    private void processTablesInParallel(ProcessConfig config, List<TableEntry> readyTables,
+                                       Map<String, List<Path>> tableFilesMap, String pdbHost) {
+        
+        log("INFO", String.format("Parallel processing started - Thread_Count:%d Tables_To_Process:%d",
+                                config.threadCount, readyTables.size()), pdbHost, "PARALLEL_START");
+        
+        ExecutorService executor = Executors.newFixedThreadPool(config.threadCount);
+        List<Future<TableProcessResult>> futures = new ArrayList<>();
+        
+        for (TableEntry table : readyTables) {
+            List<Path> files = tableFilesMap.getOrDefault(table.sno, Collections.emptyList());
+            futures.add(executor.submit(() -> processTable(config, table, files, pdbHost)));
+        }
+        
+        List<TableProcessResult> results = new ArrayList<>();
+        for (Future<TableProcessResult> future : futures) {
+            try {
+                TableProcessResult result = future.get();
+                results.add(result);
+            } catch (Exception e) {
+                log("ERROR", "Thread execution failed: " + e.getMessage(), pdbHost, "THREAD_ERROR");
+            }
+        }
+        
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(30, TimeUnit.MINUTES)) {
+                log("WARNING", "Thread pool timeout - forcing shutdown", pdbHost, "THREAD_TIMEOUT");
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            executor.shutdownNow();
+        }
+        
+        // Log summary
+        long successful = results.stream().mapToLong(r -> r.success ? 1 : 0).sum();
+        int totalFiles = results.stream().mapToInt(r -> r.filesProcessed).sum();
+        
+        log("INFO", String.format("Parallel processing completed - Successful_Tables:%d/%d Total_Files_Processed:%d",
+                                successful, results.size(), totalFiles), pdbHost, "PARALLEL_END");
+        
+        // Log failed tables
+        results.stream()
+               .filter(r -> !r.success)
+               .forEach(r -> log("ERROR", String.format("Table processing failed - Table:%s SNO:%s Error:%s",
+                                                       r.table.tableName, r.table.sno, r.errorMessage), 
+                               pdbHost, "TABLE_FAILED"));
+    }
+    
+    private TableProcessResult processTable(ProcessConfig config, TableEntry table, List<Path> files, String pdbHost) {
+        log("INFO", String.format("Table processing started - Table:%s SNO:%s Files_Count:%d",
+                                table.tableName, table.sno, files.size()), pdbHost, "TABLE_START");
+        
+        try {
+            updateTableStatus(table.sno, "in_process", config, pdbHost);
+            
+            if (files.isEmpty()) {
+                updateTableStatus(table.sno, "init", config, pdbHost);
+                log("INFO", String.format("Table processing completed - Table:%s Files_Processed:0 Status:No_Files",
+                                        table.tableName), pdbHost, "TABLE_END");
+                return new TableProcessResult(table, true, 0, null);
+            }
+            
+            int processedCount = 0;
+            for (Path file : files) {
+                log("INFO", String.format("File processing started - File:%s Table:%s",
+                                        file.getFileName().toString(), table.tableName), pdbHost, "FILE_START");
+                
+                try {
+                    processFile(config, table, file, pdbHost);
+                    processedCount++;
+                    log("INFO", String.format("File processing completed - File:%s Table:%s",
+                                            file.getFileName().toString(), table.tableName), pdbHost, "FILE_END");
+                } catch (Exception e) {
+                    log("ERROR", String.format("File processing failed - File:%s Table:%s Error:%s",
+                                             file.getFileName().toString(), table.tableName, e.getMessage()),
+                        pdbHost, "FILE_ERROR");
+                    throw e;
+                }
+            }
+            
+            updateTableStatus(table.sno, "init", config, pdbHost);
+            log("INFO", String.format("Table processing completed - Table:%s SNO:%s Files_Processed:%d Status:Success",
+                                    table.tableName, table.sno, processedCount), pdbHost, "TABLE_END");
+            return new TableProcessResult(table, true, processedCount, null);
+            
+        } catch (Exception e) {
+            log("ERROR", String.format("Table processing failed - Table:%s SNO:%s Error:%s",
+                                     table.tableName, table.sno, e.getMessage()), pdbHost, "TABLE_ERROR");
+            updateTableStatus(table.sno, "error", config, pdbHost);
+            return new TableProcessResult(table, false, 0, e.getMessage());
+        }
+    }
+    
+    private void processFile(ProcessConfig config, TableEntry table, Path file, String pdbHost) throws Exception {
+        Connection conn = null;
+        try {
+            conn = DriverManager.getConnection(config.targetDb.url, config.targetDb.user, config.targetDb.password);
+            boolean tableExists = tableExists(conn, table.tableName);
+            
+            if (tableExists) {
+                log("INFO", String.format("Table found - Table:%s", table.tableName), pdbHost, "TABLE_FOUND");
+            } else {
+                log("INFO", String.format("Table not found, will be created - Table:%s", table.tableName),
+                    pdbHost, "TABLE_NOT_FOUND");
+            }
+            
+            // Process based on database type
+            if ("psql".equalsIgnoreCase(config.dbType)) {
+                processFilePostgreSQL(config, table, file, pdbHost);
+            } else if ("sql".equals(config.dbType) || "mysql".equals(config.dbType)) {
+                processFileMySQL(config, table, file, pdbHost);
+            } else {
+                throw new IllegalArgumentException("Unsupported database type: " + config.dbType);
+            }
+            
+            // Move file to processed directory
+            moveFileToProcessed(file, Paths.get(config.processedDirPath), pdbHost);
+            
+        } finally {
+            closeQuietly(conn);
+        }
+    }
+    
+    private void processFilePostgreSQL(ProcessConfig config, TableEntry table, Path file, String pdbHost) throws Exception {
+        Connection conn = null;
+        try {
+            conn = DriverManager.getConnection(config.targetDb.url, config.targetDb.user, config.targetDb.password);
+            
+            if (!tableExists(conn, table.tableName)) {
+                createTableUsingPsql(table.tableName, file.toString(), config.delimiter, config.targetDb, pdbHost);
+                log("INFO", String.format("Table created - Table:%s Database:PostgreSQL", table.tableName),
+                    pdbHost, "TABLE_CREATED");
+            }
+        } finally {
+            closeQuietly(conn);
+        }
+        
+        importCSVUsingPsql(file.toString(), config.delimiter, config.hasHeader, table.tableName, config.targetDb, pdbHost);
+    }
+    
+    private void processFileMySQL(ProcessConfig config, TableEntry table, Path file, String pdbHost) throws Exception {
+        Connection conn = null;
+        try {
+            conn = DriverManager.getConnection(config.targetDb.url, config.targetDb.user, config.targetDb.password);
+            conn.setAutoCommit(false);
+            
+            if (!tableExists(conn, table.tableName)) {
+                createTableFromCSV(table.tableName, file.toString(), config.delimiter, conn, pdbHost);
+                log("INFO", String.format("Table created - Table:%s Database:MySQL", table.tableName),
+                    pdbHost, "TABLE_CREATED");
+            }
+            
+            importCSVToMySQL(file.toString(), config.delimiter, config.hasHeader, table.tableName, conn, pdbHost);
+            conn.commit();
+            
+        } catch (Exception e) {
+            if (conn != null) {
+                try {
+                    conn.rollback();
+                } catch (SQLException rollbackEx) {
+                    log("ERROR", "Failed to rollback transaction: " + rollbackEx.getMessage(), pdbHost, "ROLLBACK_ERROR");
+                }
+            }
+            throw e;
+        } finally {
+            if (conn != null) {
+                try {
+                    conn.setAutoCommit(true);
+                } catch (SQLException autoCommitEx) {
+                    log("WARNING", "Failed to reset auto-commit: " + autoCommitEx.getMessage(), pdbHost, "AUTOCOMMIT_WARNING");
+                }
+            }
+            closeQuietly(conn);
+        }
+    }
+    
+    // Updated status update method with proper resource management
+    private void updateTableStatus(String sno, String status, ProcessConfig config, String pdbHost) {
+        String query = "UPDATE " + config.configTable + " SET sync_status = ? WHERE sno = ?";
+        Connection conn = null;
+        PreparedStatement ps = null;
+        
+        try {
+            conn = DriverManager.getConnection(config.sourceDb.url, config.sourceDb.user, config.sourceDb.password);
+            ps = conn.prepareStatement(query);
+            ps.setString(1, status);
+            ps.setString(2, sno);
+            
+            int rowsUpdated = ps.executeUpdate();
+            if (rowsUpdated > 0) {
+                log("INFO", String.format("Table status updated - SNO:%s Status:%s", sno, status), 
+                    pdbHost, "STATUS_UPDATE");
+            } else {
+                log("WARNING", String.format("No rows updated for SNO:%s Status:%s", sno, status), 
+                    pdbHost, "STATUS_UPDATE_WARNING");
+            }
+        } catch (SQLException e) {
+            log("ERROR", String.format("Failed to update table status - SNO:%s Status:%s Error:%s", 
+                                     sno, status, e.getMessage()), pdbHost, "STATUS_UPDATE_ERROR");
+        } finally {
+            closeQuietly(ps);
+            closeQuietly(conn);
+        }
+    }
+    
+    // File moving with proper resource management
+    // File moving with proper resource management
+    private void moveFileToProcessed(Path sourceFile, Path processedDir, String pdbHost) {
+        try {
+            Files.createDirectories(processedDir);
+            Path targetFile = processedDir.resolve(sourceFile.getFileName());
+            //indexing
+            //batching
+            //CPU util
+            // Handle duplicate file names by adding timestamp
+            if (Files.exists(targetFile)) {
+                String fileName = sourceFile.getFileName().toString();
+                String baseName = fileName.substring(0, fileName.lastIndexOf('.'));
+                String extension = fileName.substring(fileName.lastIndexOf('.'));
+                String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+                targetFile = processedDir.resolve(baseName + "_" + timestamp + extension);
+            }
+            
+            Files.move(sourceFile, targetFile, StandardCopyOption.REPLACE_EXISTING);
+            log("INFO", String.format("File moved to processed directory - Source:%s Target:%s", 
+                                    sourceFile.toString(), targetFile.toString()), pdbHost, "FILE_MOVED");
+        } catch (IOException e) {
+            log("ERROR", String.format("Failed to move file - Source:%s Error:%s", 
+                                     sourceFile.toString(), e.getMessage()), pdbHost, "FILE_MOVE_ERROR");
+        }
+    }
+    
+    // Table existence check with proper resource management
+    private boolean tableExists(Connection conn, String tableName) {
+        String query = "SELECT 1 FROM information_schema.tables WHERE table_name = ? LIMIT 1";
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        
+        try {
+            ps = conn.prepareStatement(query);
+            ps.setString(1, tableName);
+            rs = ps.executeQuery();
+            return rs.next();
+        } catch (SQLException e) {
+            log("ERROR", "Failed to check table existence: " + e.getMessage(), null, "TABLE_CHECK_ERROR");
+            return false;
+        } finally {
+            closeQuietly(rs);
+            closeQuietly(ps);
+        }
+    }
+    
+    // PostgreSQL table creation with proper resource management
+    private void createTableUsingPsql(String tableName, String csvFilePath, String delimiter, 
+                                     DatabaseConfig dbConfig, String pdbHost) throws Exception {
+        
+        // First, analyze CSV structure
+        List<String> columnDefinitions = analyzeCSVStructure(csvFilePath, delimiter, pdbHost);
+        
+        if (columnDefinitions.isEmpty()) {
+            throw new Exception("Could not determine CSV structure for table creation");
+        }
+        
+        StringBuilder createTableSQL = new StringBuilder();
+        createTableSQL.append("CREATE TABLE IF NOT EXISTS ").append(tableName).append(" (");
+        createTableSQL.append(String.join(", ", columnDefinitions));
+        createTableSQL.append(")");
+        
+        Connection conn = null;
+        Statement stmt = null;
+        
+        try {
+            conn = DriverManager.getConnection(dbConfig.url, dbConfig.user, dbConfig.password);
+            stmt = conn.createStatement();
+            stmt.executeUpdate(createTableSQL.toString());
+            
+            log("INFO", String.format("PostgreSQL table created - Table:%s Columns:%d", 
+                                    tableName, columnDefinitions.size()), pdbHost, "PSQL_TABLE_CREATED");
+        } finally {
+            closeQuietly(stmt);
+            closeQuietly(conn);
+        }
+    }
+    
+    // MySQL table creation with proper resource management
+    private void createTableFromCSV(String tableName, String csvFilePath, String delimiter, 
+                                   Connection conn, String pdbHost) throws Exception {
+        
+        List<String> columnDefinitions = analyzeCSVStructure(csvFilePath, delimiter, pdbHost);
+        
+        if (columnDefinitions.isEmpty()) {
+            throw new Exception("Could not determine CSV structure for table creation");
+        }
+        
+        StringBuilder createTableSQL = new StringBuilder();
+        createTableSQL.append("CREATE TABLE IF NOT EXISTS ").append(tableName).append(" (");
+        createTableSQL.append(String.join(", ", columnDefinitions));
+        createTableSQL.append(") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        
+        Statement stmt = null;
+        try {
+            stmt = conn.createStatement();
+            stmt.executeUpdate(createTableSQL.toString());
+            
+            log("INFO", String.format("MySQL table created - Table:%s Columns:%d", 
+                                    tableName, columnDefinitions.size()), pdbHost, "MYSQL_TABLE_CREATED");
+        } finally {
+            closeQuietly(stmt);
+        }
+    }
+    
+    // CSV structure analysis with proper resource management
+    private List<String> analyzeCSVStructure(String csvFilePath, String delimiter, String pdbHost) {
+        List<String> columnDefinitions = new ArrayList<>();
+        BufferedReader reader = null;
+        
+        try {
+            reader = Files.newBufferedReader(Paths.get(csvFilePath));
+            String headerLine = reader.readLine();
+            
+            if (headerLine != null) {
+                String[] headers = headerLine.split(Pattern.quote(delimiter));
+                
+                for (int i = 0; i < headers.length; i++) {
+                    String columnName = sanitizeColumnName(headers[i].trim());
+                    if (columnName.isEmpty()) {
+                        columnName = "column_" + (i + 1);
+                    }
+                    columnDefinitions.add(columnName + " TEXT");
+                }
+            }
+            
+            log("INFO", String.format("CSV structure analyzed - File:%s Columns:%d", 
+                                    csvFilePath, columnDefinitions.size()), pdbHost, "CSV_ANALYZED");
+            
+        } catch (IOException e) {
+            log("ERROR", String.format("Failed to analyze CSV structure - File:%s Error:%s", 
+                                     csvFilePath, e.getMessage()), pdbHost, "CSV_ANALYSIS_ERROR");
+        } finally {
+            closeQuietly(reader);
+        }
+        
+        return columnDefinitions;
+    }
+    
+    // Column name sanitization
+    private String sanitizeColumnName(String columnName) {
+        if (columnName == null || columnName.trim().isEmpty()) {
+            return "";
+        }
+        
+        // Remove quotes and special characters, replace spaces with underscores
+        return columnName.replaceAll("[\"'`]", "")
+                        .replaceAll("[^a-zA-Z0-9_]", "_")
+                        .replaceAll("_{2,}", "_")
+                        .replaceAll("^_|_$", "")
+                        .toLowerCase();
+    }
+    
+    // PostgreSQL CSV import with proper resource management
+    private void importCSVUsingPsql(String csvFilePath, String delimiter, boolean hasHeader, 
+                                   String tableName, DatabaseConfig dbConfig, String pdbHost) throws Exception {
+        
+        Connection conn = null;
+        try {
+            conn = DriverManager.getConnection(dbConfig.url, dbConfig.user, dbConfig.password);
+            
+            // Use COPY command for efficient bulk loading
+            String copySQL = String.format(
+                "COPY %s FROM STDIN WITH (FORMAT CSV, DELIMITER '%s', HEADER %s, QUOTE '\"', ESCAPE '\"')",
+                tableName, delimiter, hasHeader ? "true" : "false"
+            );
+            
+            org.postgresql.copy.CopyManager copyManager = 
+                new org.postgresql.copy.CopyManager((BaseConnection) conn);
+            
+            try (FileInputStream fileInputStream = new FileInputStream(csvFilePath)) {
+                long rowsInserted = copyManager.copyIn(copySQL, fileInputStream);
+                log("INFO", String.format("PostgreSQL CSV import completed - Table:%s Rows:%d File:%s", 
+                                        tableName, rowsInserted, csvFilePath), pdbHost, "PSQL_IMPORT_SUCCESS");
+            }
+            
+        } finally {
+            closeQuietly(conn);
+        }
+    }
+    
+    // MySQL CSV import with proper resource management and batching
+    private void importCSVToMySQL(String csvFilePath, String delimiter, boolean hasHeader, 
+                                 String tableName, Connection conn, String pdbHost) throws Exception {
+        
+        BufferedReader reader = null;
+        PreparedStatement ps = null;
+        
+        try {
+            reader = Files.newBufferedReader(Paths.get(csvFilePath));
+            
+            // Skip header if present
+            String line = reader.readLine();
+            if (!hasHeader && line != null) {
+                // Process first line if no header
+                processCSVLine(line, delimiter, tableName, conn, ps, pdbHost);
+            }
+            
+            // Get column count for prepared statement
+            int columnCount = getColumnCount(conn, tableName);
+            if (columnCount == 0) {
+                throw new Exception("Could not determine column count for table: " + tableName);
+            }
+            
+            // Prepare insert statement
+            StringBuilder insertSQL = new StringBuilder("INSERT INTO ").append(tableName).append(" VALUES (");
+            for (int i = 0; i < columnCount; i++) {
+                if (i > 0) insertSQL.append(", ");
+                insertSQL.append("?");
+            }
+            insertSQL.append(")");
+            
+            ps = conn.prepareStatement(insertSQL.toString());
+            
+            int batchCount = 0;
+            int totalRows = 0;
+            final int BATCH_SIZE = 1000;
+            
+            while ((line = reader.readLine()) != null) {
+                String[] values = line.split(Pattern.quote(delimiter), -1);
+                
+                for (int i = 0; i < Math.min(values.length, columnCount); i++) {
+                    String value = values[i].trim();
+                    if (value.isEmpty() || "NULL".equalsIgnoreCase(value)) {
+                        ps.setNull(i + 1, Types.VARCHAR);
+                    } else {
+                        ps.setString(i + 1, value);
+                    }
+                }
+                
+                // Fill remaining columns with NULL if CSV has fewer columns
+                for (int i = values.length; i < columnCount; i++) {
+                    ps.setNull(i + 1, Types.VARCHAR);
+                }
+                
+                ps.addBatch();
+                batchCount++;
+                totalRows++;
+                
+                if (batchCount >= BATCH_SIZE) {
+                    ps.executeBatch();
+                    batchCount = 0;
+                }
+            }
+            
+            // Execute remaining batch
+            if (batchCount > 0) {
+                ps.executeBatch();
+            }
+            
+            log("INFO", String.format("MySQL CSV import completed - Table:%s Rows:%d File:%s", 
+                                    tableName, totalRows, csvFilePath), pdbHost, "MYSQL_IMPORT_SUCCESS");
+            
+        } finally {
+            closeQuietly(ps);
+            closeQuietly(reader);
+        }
+    }
+    
+    // Get column count for a table
+    private int getColumnCount(Connection conn, String tableName) {
+        String query = "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = ?";
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        
+        try {
+            ps = conn.prepareStatement(query);
+            ps.setString(1, tableName);
+            rs = ps.executeQuery();
+            
+            if (rs.next()) {
+                return rs.getInt(1);
+            }
+        } catch (SQLException e) {
+            log("ERROR", "Failed to get column count: " + e.getMessage(), null, "COLUMN_COUNT_ERROR");
+        } finally {
+            closeQuietly(rs);
+            closeQuietly(ps);
+        }
+        
+        return 0;
+    }
+    
+    // Process individual CSV line (helper method)
+    private void processCSVLine(String line, String delimiter, String tableName, Connection conn, 
+                               PreparedStatement ps, String pdbHost) {
+        // Implementation for processing individual CSV lines if needed
+        // This is a placeholder for any special line processing logic
+    }
+//    
+//    // Index creation methods with proper resource management
+//    private void createIndexesFromSource(String tableName, DatabaseConfig sourceDb, DatabaseConfig targetDb, String pdbHost) {
+//        Connection sourceConn = null;
+//        Connection targetConn = null;
+//        PreparedStatement sourcePs = null;
+//        ResultSet rs = null;
+//        
+//        try {
+//            sourceConn = DriverManager.getConnection(sourceDb.url, sourceDb.user, sourceDb.password);
+//            targetConn = DriverManager.getConnection(targetDb.url, targetDb.user, targetDb.password);
+//            
+//            // Query to get indexes from MySQL source
+//            String indexQuery = "SELECT DISTINCT INDEX_NAME, COLUMN_NAME, NON_UNIQUE " +
+//                               "FROM information_schema.STATISTICS " +
+//                               "WHERE TABLE_NAME = ? AND INDEX_NAME != 'PRIMARY' " +
+//                               "ORDER BY INDEX_NAME, SEQ_IN_INDEX";
+//            
+//            sourcePs = sourceConn.prepareStatement(indexQuery);
+//            sourcePs.setString(1, tableName);
+//            rs = sourcePs.executeQuery();
+//            
+//            Map<String, List<String>> indexes = new HashMap<>();
+//            Map<String, Boolean> indexTypes = new HashMap<>();
+//            
+//            while (rs.next()) {
+//                String indexName = rs.getString("INDEX_NAME");
+//                String columnName = rs.getString("COLUMN_NAME");
+//                boolean isUnique = rs.getInt("NON_UNIQUE") == 0;
+//                
+//                indexes.computeIfAbsent(indexName, k -> new ArrayList<>()).add(columnName);
+//                indexTypes.put(indexName, isUnique);
+//            }
+//            
+//            // Create indexes in PostgreSQL
+//            for (Map.Entry<String, List<String>> entry : indexes.entrySet()) {
+//                createIndex(targetConn, tableName, entry.getKey(), entry.getValue(), 
+//                           indexTypes.get(entry.getKey()), pdbHost);
+//            }
+//            
+//            log("INFO", String.format("Indexes created - Table:%s Index_Count:%d", 
+//                                    tableName, indexes.size()), pdbHost, "INDEXES_CREATED");
+//            
+//        } catch (SQLException e) {
+//            log("ERROR", String.format("Failed to create indexes - Table:%s Error:%s", 
+//                                     tableName, e.getMessage()), pdbHost, "INDEX_CREATION_ERROR");
+//        } finally {
+//            closeQuietly(rs);
+//            closeQuietly(sourcePs);
+//            closeQuietly(targetConn);
+//            closeQuietly(sourceConn);
+//        }
+//    }
+//    
+//    // Create individual index
+//    private void createIndex(Connection conn, String tableName, String indexName, List<String> columns, 
+//                           boolean isUnique, String pdbHost) {
+//        Statement stmt = null;
+//        
+//        try {
+//            StringBuilder indexSQL = new StringBuilder();
+//            indexSQL.append("CREATE ");
+//            if (isUnique) {
+//                indexSQL.append("UNIQUE ");
+//            }
+//            indexSQL.append("INDEX IF NOT EXISTS ").append(indexName)
+//                    .append(" ON ").append(tableName)
+//                    .append(" (").append(String.join(", ", columns)).append(")");
+//            
+//            stmt = conn.createStatement();
+//            stmt.executeUpdate(indexSQL.toString());
+//            
+//            log("INFO", String.format("Index created - Table:%s Index:%s Columns:%s Unique:%s", 
+//                                    tableName, indexName, String.join(",", columns), isUnique), 
+//                pdbHost, "INDEX_CREATED");
+//            
+//        } catch (SQLException e) {
+//            log("ERROR", String.format("Failed to create index - Table:%s Index:%s Error:%s", 
+//                                     tableName, indexName, e.getMessage()), pdbHost, "INDEX_ERROR");
+//        } finally {
+//            closeQuietly(stmt);
+//        }
+//    }
+//    
+    // Enhanced BufferedReader closing utility
+    private void closeQuietly(BufferedReader reader) {
+        if (reader != null) {
+            try {
+                reader.close();
+            } catch (IOException e) {
+                System.err.println("Warning: Failed to close BufferedReader: " + e.getMessage());
+            }
+        }
+    }
+    
+    // Enhanced FileInputStream closing utility
+    private void closeQuietly(FileInputStream fis) {
+        if (fis != null) {
+            try {
+                fis.close();
+            } catch (IOException e) {
+                System.err.println("Warning: Failed to close FileInputStream: " + e.getMessage());
+            }
+        }
+    }
+    
+    // Main method for testing - creates instance
+    public void main(String[] args) {
+        
+        
+    }
+}

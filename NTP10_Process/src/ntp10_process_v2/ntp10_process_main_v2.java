@@ -1,0 +1,532 @@
+package ntp10_process_v2;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.Locale;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+public class ntp10_process_main_v2 {
+
+    private static final String            processName    = "address-parser";
+    private static final String            processVersion = "1.0";
+    private static final boolean           debugEnabled   = true;
+    private static final DateTimeFormatter logFormat      =
+            DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss SSS");
+
+    // -------------------------------------------------------------------------
+    // Logging
+    // -------------------------------------------------------------------------
+
+    private static void log(String level, String message, String serverIP, String evtType) {
+        if ("DEBUG".equalsIgnoreCase(level) && !debugEnabled) return;
+
+        String timestamp = LocalDateTime.now().format(logFormat);
+
+        StringBuilder logBuilder = new StringBuilder(512);
+        logBuilder.append("Time:").append(timestamp).append(" [").append(capitalize(level)).append("] ")
+                .append("Process_Name: ").append(processName).append(" ");
+
+        if (serverIP != null && !serverIP.isEmpty()) {
+            logBuilder.append("Server_IP: ").append(serverIP).append(" ");
+        }
+
+        logBuilder.append("Process_Version: ").append(processVersion).append(" Log_Level: EVT_LOG")
+                .append(" EVT_Type: ").append(evtType != null ? evtType : "NA").append(" Description: ")
+                .append(message != null ? message : "");
+
+        System.out.println(logBuilder.toString().trim());
+    }
+
+    private static String capitalize(String s) {
+        if (s == null || s.isEmpty()) return s;
+        return s.substring(0, 1).toUpperCase() + s.substring(1).toLowerCase();
+    }
+
+    // =========================================================================
+    // MAIN
+    // =========================================================================
+
+    public static void main(String[] args) {
+
+        log("INFO", "========================================",             null, "APP_START");
+        log("INFO", "Address CSV to PostgreSQL Parser - STARTED",           null, "APP_START");
+        log("INFO", "========================================",             null, "APP_START");
+
+        if (args.length < 7) {
+            log("ERROR",
+                "Insufficient arguments. Expected at least 7: " +
+                "MySQL URL, MySQL Username, MySQL Password, Config Table Name, " +
+                "PostgreSQL URL, PostgreSQL Username, PostgreSQL Password, " +
+                "(Optional) Destination Table Filter",
+                null, "CONFIG_LOAD");
+            return;
+        }
+
+        String mysqlURL    = args[0];
+        String mysqlUser   = args[1];
+        String mysqlPass   = args[2];
+        String configTable = args[3];
+        String pgURL       = args[4];
+        String pgUser      = args[5];
+        String pgPass      = args[6];
+        String filterTable = (args.length >= 8) ? args[7] : null;
+
+        log("INFO", "------------- ARGUMENTS -------------", null, "CONFIG_LOAD");
+        log("INFO", "MySQL URL       : " + mysqlURL,    null, "CONFIG_LOAD");
+        log("INFO", "MySQL User      : " + mysqlUser,   null, "CONFIG_LOAD");
+        log("INFO", "Config Table    : " + configTable, null, "CONFIG_LOAD");
+        log("INFO", "PostgreSQL URL  : " + pgURL,       null, "CONFIG_LOAD");
+        log("INFO", "PostgreSQL User : " + pgUser,      null, "CONFIG_LOAD");
+        if (filterTable != null) {
+            log("INFO", "Table Filter    : " + filterTable, null, "CONFIG_LOAD");
+        }
+        log("INFO", "-------------------------------------", null, "CONFIG_LOAD");
+
+        try {
+            Connection mysqlConn = new MySQLConnection().getConnection(mysqlURL, mysqlUser, mysqlPass);
+
+            if (mysqlConn == null) {
+                log("ERROR", "Unable to establish MySQL connection - aborting", null, "DB_CONNECT");
+                return;
+            }
+
+            String query =
+                "SELECT source_path, destination_table_name, destination_path " +
+                "FROM " + configTable +
+                " WHERE is_active = 1 AND tm_id = 'NTP10'";
+
+            PreparedStatement ps;
+
+            // FIX: was missing closing brace before else
+            if (filterTable != null) {
+                query += " AND destination_table_name = ?";
+                ps = mysqlConn.prepareStatement(query);
+                ps.setString(1, filterTable);
+            } else {
+                ps = mysqlConn.prepareStatement(query);
+            }
+
+            log("DEBUG", "Executing config query: " + query, null, "DB_QUERY");
+
+            ResultSet rs = ps.executeQuery();
+
+            boolean anyRowFound = false;
+
+           
+
+            while (rs.next()) {
+
+                anyRowFound = true;
+
+                String sourcePath = rs.getString("source_path");
+                String destTable  = rs.getString("destination_table_name");
+                String destPath   = rs.getString("destination_path");
+
+                if (sourcePath == null || sourcePath.trim().isEmpty() ||
+                    destTable  == null || destTable.trim().isEmpty()  ||
+                    destPath   == null || destPath.trim().isEmpty()) {
+
+                    log("WARN",
+                        "Skipping config row - one or more required fields " +
+                        "(source_path, destination_table_name, destination_path) are null or blank",
+                        null, "CONFIG_LOAD");
+                    continue;
+                }
+
+                log("INFO", "=========== CONFIG ROW ===========", null, "CONFIG_LOAD");
+                log("INFO", "Source Path        : " + sourcePath, null, "CONFIG_LOAD");
+                log("INFO", "Destination Table  : " + destTable,  null, "CONFIG_LOAD");
+                log("INFO", "Destination Dir    : " + destPath,   null, "CONFIG_LOAD");
+                log("INFO", "==================================",  null, "CONFIG_LOAD");
+
+                File folder = new File(sourcePath.trim());
+
+                if (!folder.exists() || !folder.isDirectory()) {
+                    log("WARN", "Invalid or missing source directory: " + sourcePath, null, "FILE_PROCESS");
+                    continue;
+                }
+
+                File[] files = folder.listFiles((dir, name) -> name.toLowerCase().endsWith(".csv"));
+
+                if (files == null || files.length == 0) {
+                    log("WARN", "No CSV files found in source directory: " + sourcePath, null, "FILE_PROCESS");
+                    continue;
+                }
+
+                Arrays.sort(files);
+
+                log("INFO",
+                    "Source folder scan complete | Path: " + sourcePath +
+                    " | CSV files found: " + files.length +
+                    " | Destination table: " + destTable,
+                    null, "FILE_PROCESS");
+
+                for (File file : files) {
+
+                    log("INFO", "--- FILE START ---", null, "FILE_PROCESS");
+                    log("INFO",
+                        "Processing file: " + file.getName() +
+                        " | Size: " + file.length() + " bytes" +
+                        " | Path: " + file.getAbsolutePath(),
+                        null, "FILE_PROCESS");
+
+                    // CHANGED: replaced ntp10_process_methods().processFile()
+                    // with importViaPsqlStaging() to use PostgreSQL \COPY path
+                    ntp10_process_methods processor = new ntp10_process_methods();
+
+                    boolean status = processor.processFile(
+                            pgURL,
+                            pgUser,
+                            pgPass,
+                            file.getAbsolutePath(),
+                            destTable);
+                    log("INFO",
+                        "Processing result | File: " + file.getName() + " | Status: " + status,
+                        null, "FILE_PROCESS");
+
+                    try {
+                        Path targetDir = Paths.get(destPath.trim());
+
+                        if (!Files.exists(targetDir)) {
+                            Files.createDirectories(targetDir);
+                            log("INFO", "Created destination directory: " + destPath, null, "FILE_PROCESS");
+                        }
+
+                        if (status) {
+                            log("INFO",
+                                "File processed successfully - moving to: " + destPath,
+                                null, "FILE_PROCESS");
+                            Files.move(file.toPath(),
+                                    targetDir.resolve(file.getName()),
+                                    StandardCopyOption.REPLACE_EXISTING);
+                        } else {
+                            log("WARN",
+                                "File processing failed - file will NOT be moved: " + file.getName(),
+                                null, "FILE_PROCESS");
+                        }
+
+                    } catch (Exception moveEx) {
+                        log("ERROR",
+                            "Failed to move file: " + file.getName() +
+                            " | Error: " + moveEx.getMessage(),
+                            null, "FILE_PROCESS");
+                    }
+
+                    log("INFO", "--- FILE END ---", null, "FILE_PROCESS");
+                }
+            }
+
+            if (!anyRowFound) {
+                log("WARN",
+                    "No active config rows found in table: " + configTable +
+                    (filterTable != null ? " | Filter: " + filterTable : ""),
+                    null, "CONFIG_LOAD");
+            }
+
+            rs.close();
+            ps.close();
+            mysqlConn.close();
+
+            log("INFO", "========================================", null, "APP_END");
+            log("INFO", "PROCESS COMPLETED",                        null, "APP_END");
+            log("INFO", "========================================", null, "APP_END");
+
+        } catch (Exception e) {
+            log("ERROR", "Fatal error in main process: " + e.getMessage(), null, "APP_ERROR");
+        }
+    }
+
+    // =========================================================================
+    // REPLACE METHOD: importViaPsqlStaging
+    // Uses PostgreSQL \COPY via psql CLI to correctly handle quoted CSV fields,
+    // embedded delimiters, and large rows without Java-side parsing.
+    // =========================================================================
+
+    private boolean importViaPsqlStaging(String pgURL, String pgUser, String pgPass,
+                                          String csvFilePath, String destTable) {
+        Process process = null;
+        BufferedReader reader = null;
+
+        try {
+            String[] headers = readCsvHeaders(csvFilePath);
+            if (headers == null || headers.length == 0) {
+                log("WARN", "CSV header missing | File: " + csvFilePath, null, "FILE_PROCESS");
+                return false;
+            }
+
+            boolean isInstitutionMaster =
+                    normalizeCsvHeader(headers[0]).toLowerCase(Locale.ROOT).startsWith("fim_");
+
+            String stagingTable = "tmp_address_stage_" + System.nanoTime();
+
+            String createCols = Arrays.stream(headers)
+                    .map(this::normalizeCsvHeader)
+                    .filter(s -> !s.isEmpty())
+                    .map(h -> quotePgIdent(h) + " TEXT")
+                    .collect(Collectors.joining(", "));
+
+            String copyCols = Arrays.stream(headers)
+                    .map(this::normalizeCsvHeader)
+                    .filter(s -> !s.isEmpty())
+                    .map(this::quotePgIdent)
+                    .collect(Collectors.joining(", "));
+
+            String insertSql = isInstitutionMaster
+                    ? buildInstitutionMasterInsertSql(stagingTable, destTable)
+                    : buildUserAddressInsertSql(stagingTable, destTable);
+
+            // Wrap in explicit transaction so the TEMP TABLE survives across statements.
+            // ON COMMIT DROP fires on COMMIT, after INSERT has already completed.
+            String sql =
+                "BEGIN;\n" +
+                "CREATE TEMP TABLE " + stagingTable + " (" + createCols + ") ON COMMIT DROP;\n" +
+                "\\COPY " + stagingTable + " (" + copyCols + ") " +
+                "FROM '" + csvFilePath.replace("'", "\\'") + "' " +
+                "WITH (FORMAT csv, HEADER true, DELIMITER '|', QUOTE '\"', ESCAPE '\\', NULL '\\N');\n" +
+                insertSql + "\n" +
+                "COMMIT;\n";
+
+            log("INFO",  "CSV Headers        = " + Arrays.toString(headers), null, "CSV_HEADERS");
+            log("INFO",  "Source type        | Mode: " + (isInstitutionMaster ? "INSTITUTION_MASTER" : "USER_ADDRESS"),
+                    null, "FILE_PROCESS");
+            log("DEBUG", "psql SQL block     :\n" + sql, null, "PSQL_COPY_CMD_USED");
+
+            String[] pgParts = parseJdbcUrl(pgURL);
+
+            ProcessBuilder pb = new ProcessBuilder(
+                    "psql", "-h", pgParts[0], "-p", pgParts[1], "-U", pgUser, "-d", pgParts[2]);
+            pb.environment().put("PGPASSWORD", pgPass);
+            pb.redirectErrorStream(true);
+
+            process = pb.start();
+
+            try (OutputStream os = process.getOutputStream();
+                 BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(os, StandardCharsets.UTF_8))) {
+                writer.write(sql);
+                writer.flush();
+            }
+
+            reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8));
+            StringBuilder output = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                output.append(line).append('\n');
+            }
+
+            boolean finished = process.waitFor(60, TimeUnit.MINUTES);
+            if (!finished) {
+                process.destroyForcibly();
+                throw new RuntimeException("PostgreSQL CLI import timed out after 60 minutes");
+            }
+
+            int exitCode = process.exitValue();
+            String outputStr = output.toString();
+
+            log("DEBUG", "psql exit code: " + exitCode + " | Output:\n" + outputStr, null, "PSQL_OUTPUT");
+
+            if (exitCode != 0 || containsPsqlError(outputStr)) {
+                throw new RuntimeException("PostgreSQL CLI failed | ExitCode=" + exitCode +
+                        " | Output=" + outputStr);
+            }
+
+            log("INFO", "PostgreSQL CLI import completed successfully | File: " + csvFilePath,
+                    null, "PSQL_CLI_IMPORT_SUCCESS");
+            return true;
+
+        } catch (Exception e) {
+            log("ERROR",
+                "PostgreSQL CLI import failed | File: " + csvFilePath +
+                " | Error: " + e.getMessage(),
+                null, "PSQL_CLI_IMPORT_ERROR");
+            return false;
+        } finally {
+            closeQuietly(reader);
+            if (process != null) process.destroy();
+        }
+    }
+
+    // =========================================================================
+    // ADD NEW METHOD: buildInstitutionMasterInsertSql
+    // Generates two INSERT ... SELECT statements from the staging table:
+    // one for REGISTERED address, one for CORRESPONDENCE address.
+    // All column names are the normalized (lowercase) versions of the CSV headers.
+    // =========================================================================
+
+    private String buildInstitutionMasterInsertSql(String stagingTable, String destTable) {
+        String cols =
+            " (id, line1, line2, line3, city, country, state, pincode, " +
+            "created_by, updated_by, address_type, same_as_correspondence_address)";
+
+        String registeredSql =
+            "INSERT INTO " + destTable + cols +
+            " SELECT gen_random_uuid()," +
+            "  NULLIF(TRIM(\"fim_reg_off_addr1\"), '')," +
+            "  NULLIF(TRIM(\"fim_reg_off_addr2\"), '')," +
+            "  NULLIF(TRIM(\"fim_reg_off_addr3\"), '')," +
+            "  NULLIF(TRIM(\"fim_reg_off_city\"), '')," +
+            "  NULLIF(TRIM(\"fim_reg_off_country\"), '')," +
+            "  NULLIF(TRIM(\"fim_reg_off_state\"), '')," +
+            "  NULLIF(TRIM(\"fim_reg_off_pin\"), '')," +
+            "  NULLIF(TRIM(\"fim_created_by\"), '')," +
+            "  NULLIF(TRIM(\"fim_created_by\"), '')," +
+            "  'REGISTERED'," +
+            "  NULLIF(TRIM(\"fim_corres_perm_flag\"), '')" +
+            "  FROM " + stagingTable + ";";
+
+        String correspondenceSql =
+            "INSERT INTO " + destTable + cols +
+            " SELECT gen_random_uuid()," +
+            "  NULLIF(TRIM(\"fim_corres_addr1\"), '')," +
+            "  NULLIF(TRIM(\"fim_corres_addr2\"), '')," +
+            "  NULLIF(TRIM(\"fim_corres_addr3\"), '')," +
+            "  NULLIF(TRIM(\"fim_corres_city\"), '')," +
+            "  NULLIF(TRIM(\"fim_corres_country\"), '')," +
+            "  NULLIF(TRIM(\"fim_corres_state\"), '')," +
+            "  NULLIF(TRIM(\"fim_corres_pin\"), '')," +
+            "  NULLIF(TRIM(\"fim_created_by\"), '')," +
+            "  NULLIF(TRIM(\"fim_created_by\"), '')," +
+            "  'CORRESPONDENCE'," +
+            "  NULLIF(TRIM(\"fim_corres_perm_flag\"), '')" +
+            "  FROM " + stagingTable + ";";
+
+        return registeredSql + "\n" + correspondenceSql;
+    }
+
+    // =========================================================================
+    // ADD NEW METHOD: buildUserAddressInsertSql
+    // line3 = concat_ws(' ', address3, address4) - null-safe via NULLIF.
+    // Metadata fields stored as jsonb in the metadata column.
+    // =========================================================================
+
+    private String buildUserAddressInsertSql(String stagingTable, String destTable) {
+        return
+            "INSERT INTO " + destTable +
+            " (id, line1, line2, line3, city, country, updated_at, updated_by, pincode, state, metadata)" +
+            " SELECT gen_random_uuid()," +
+            "  NULLIF(TRIM(address1), '')," +
+            "  NULLIF(TRIM(address2), '')," +
+            "  NULLIF(TRIM(CONCAT_WS(' '," +
+            "    NULLIF(TRIM(address3), '')," +
+            "    NULLIF(TRIM(address4), '')" +
+            "  )), '')," +
+            "  NULLIF(TRIM(city), '')," +
+            "  NULLIF(TRIM(country), '')," +
+            "  CASE WHEN TRIM(last_modified_date) IS NOT NULL" +
+            "            AND TRIM(last_modified_date) <> ''" +
+            "       THEN TRIM(last_modified_date)::TIMESTAMP" +
+            "       ELSE NULL END," +
+            "  NULLIF(TRIM(modified_by), '')," +
+            "  NULLIF(TRIM(pincode), '')," +
+            "  NULLIF(TRIM(state_code), '')," +
+            "  json_build_object(" +
+            "    'email_id',    NULLIF(TRIM(email_id), '')," +
+            "    'fax',         NULLIF(TRIM(fax), '')," +
+            "    'phone1',      NULLIF(TRIM(phone1), '')," +
+            "    'phone2',      NULLIF(TRIM(phone2), '')," +
+            "    'phone3',      NULLIF(TRIM(phone3), '')," +
+            "    'user_id',     NULLIF(TRIM(user_id), '')," +
+            "    'village_code',NULLIF(TRIM(village_code), '')" +
+            "  )::jsonb" +
+            "  FROM " + stagingTable + ";";
+    }
+
+    // =========================================================================
+    // ADD NEW METHOD: readCsvHeaders
+    // Reads only the first line of the CSV to extract header tokens.
+    // Splits on pipe | - safe here because we only need to detect source type,
+    // not parse full data rows.
+    // =========================================================================
+
+    private String[] readCsvHeaders(String filePath) throws Exception {
+        try (java.io.BufferedReader br =
+                     new java.io.BufferedReader(new java.io.FileReader(filePath))) {
+            String line = br.readLine();
+            if (line == null) return null;
+            return line.split("\\|", -1);
+        }
+    }
+
+    // =========================================================================
+    // ADD NEW METHOD: normalizeCsvHeader
+    // Strips quotes, trims, lowercases, and replaces non-identifier characters
+    // so the resulting string is a safe PostgreSQL column name.
+    // =========================================================================
+
+    private String normalizeCsvHeader(String header) {
+        if (header == null) return "";
+        return header.replace("\"", "").trim().toLowerCase(Locale.ROOT)
+                     .replaceAll("[^a-z0-9_]", "_");
+    }
+
+    // =========================================================================
+    // ADD NEW METHOD: quotePgIdent
+    // Double-quotes a PostgreSQL identifier, escaping any embedded double-quotes.
+    // =========================================================================
+
+    private String quotePgIdent(String ident) {
+        return "\"" + ident.replace("\"", "\"\"") + "\"";
+    }
+
+    // =========================================================================
+    // ADD NEW METHOD: parseJdbcUrl
+    // Extracts [host, port, database] from jdbc:postgresql://host:port/database.
+    // =========================================================================
+
+    private String[] parseJdbcUrl(String jdbcUrl) {
+        String stripped = jdbcUrl.replace("jdbc:postgresql://", "");
+        // Strip any query parameters
+        int queryStart = stripped.indexOf('?');
+        if (queryStart != -1) {
+            stripped = stripped.substring(0, queryStart);
+        }
+        String[] hostAndDb = stripped.split("/", 2);
+        String hostPort = hostAndDb[0];
+        String db       = hostAndDb.length > 1 ? hostAndDb[1] : "postgres";
+        String[] hp     = hostPort.split(":", 2);
+        String host     = hp[0];
+        String port     = hp.length > 1 ? hp[1] : "5432";
+        return new String[]{host, port, db};
+    }
+
+    // =========================================================================
+    // ADD NEW METHOD: containsPsqlError
+    // Detects genuine error markers in psql output.
+    // Avoids false positives from success messages like "INSERT 0 5".
+    // =========================================================================
+
+    private boolean containsPsqlError(String output) {
+        if (output == null) return false;
+        String lower = output.toLowerCase(Locale.ROOT);
+        return lower.contains("error:") ||
+               lower.contains("fatal:") ||
+               lower.contains("psql: error") ||
+               lower.contains("invalid input syntax");
+    }
+
+    // =========================================================================
+    // ADD NEW METHOD: closeQuietly
+    // Closes any Closeable silently.
+    // =========================================================================
+
+    private void closeQuietly(java.io.Closeable c) {
+        if (c != null) {
+            try { c.close(); } catch (Exception ignored) {}
+        }
+    }
+}

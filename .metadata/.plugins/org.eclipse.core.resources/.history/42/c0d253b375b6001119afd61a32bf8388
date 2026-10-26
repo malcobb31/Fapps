@@ -1,0 +1,73 @@
+package ftp_logger_v2;
+
+import ftp_logger.ProcessData;
+
+public class logger_main_v2 {
+
+    public static void main(String[] args) throws Exception {
+
+        System.out.println("Length of arguments: " + args.length);
+
+        for (int i = 0; i < args.length; i++) {
+            System.out.println("-------------- arg[" + i + "]: "
+                    + args[i] + " ------------");
+        }
+
+        if (args.length == 8) {
+
+            /*
+             * Arguments:
+             *
+             * args[0] = inputFileName
+             * args[1] = inputFolder
+             * args[2] = outputFolder
+             * args[3] = dbUrl
+             * args[4] = dbUser
+             * args[5] = dbPass
+             * args[6] = tableName
+             * args[7] = sftpOutputFilepath
+             */
+
+            boolean result = ProcessData.process(
+                    args[0],   // inputFileName
+                    args[1],   // inputFolder
+                    args[2],   // outputFolder
+                    args[3],   // dbUrl
+                    args[4],   // dbUser
+                    args[5],   // dbPass
+                    args[6],   // tableName
+                    args[7]    // sftpOutputFilepath
+            );
+
+            System.out.println("============================================================");
+
+            if (result) {
+                System.out.println("============= FTP LOG PROCESSING COMPLETE ==================");
+            } else {
+                System.out.println("============= FTP LOG PROCESSING FAILED ====================");
+            }
+
+            System.out.println("============================================================");
+
+        } else {
+
+            System.out.println("=================== INVALID ARGUMENTS ======================");
+
+            System.out.println("Usage:");
+            System.out.println(
+                    "<inputFileName> " +
+                    "<inputFolder> " +
+                    "<outputFolder> " +
+                    "<dbUrl> " +
+                    "<dbUser> " +
+                    "<dbPass> " +
+                    "<tableName> " +
+                    "<sftpOutputFilepath>"
+            );
+
+            System.out.println();
+            System.out.println("Expected arguments: 8");
+            System.out.println("Received arguments: " + args.length);
+        }
+    }
+}

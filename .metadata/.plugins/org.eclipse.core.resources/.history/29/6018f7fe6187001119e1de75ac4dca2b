@@ -1,0 +1,858 @@
+package ntp20_process_v1;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.sql.BatchUpdateException;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+class ntp20_process_methods {
+
+    private final String processName;
+    private final String processVersion;
+    private final String jdbcUrl;
+    private final String dbUser;
+    private final String dbPassword;
+    private final String delimiter;
+    private final String serverIP;
+    private final boolean debugEnabled;
+    private final DateTimeFormatter logFormat;
+    private final Charset fileCharset;
+
+    private static final int MAX_PARALLEL_FILES = 5;
+    private static final int BATCH_SIZE = 1000;
+    private static final String TARGET_SCHEMA = "re_mgmt";
+    private static final String TARGET_TABLE = "user_branch_region";
+
+    // Only these user_type values are eligible for this table. IAU is explicitly excluded.
+    private static final Set<String> ELIGIBLE_USER_TYPES;
+    static {
+        Set<String> s = new HashSet<String>();
+        s.add("IRA");
+        s.add("IRU");
+        s.add("IBU");
+        ELIGIBLE_USER_TYPES = Collections.unmodifiableSet(s);
+    }
+
+    private static final String INSERT_SQL =
+            "INSERT INTO re_mgmt.user_branch_region (" +
+            "id, user_id, branch_id, region_id, active, version, created_at, created_by, updated_at, updated_by" +
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+    private static final List<String> INSERT_COLUMNS = Collections.unmodifiableList(Arrays.asList(
+            "id",
+            "user_id",
+            "branch_id",
+            "region_id",
+            "active",
+            "version",
+            "created_at",
+            "created_by",
+            "updated_at",
+            "updated_by"
+    ));
+
+    // Query to preload branch lookup: legacy branch id (metadata->>'branch_id') -> branch.id, branch.region_id
+    private static final String BRANCH_LOOKUP_SQL =
+            "SELECT id, region_id, metadata->>'branch_id' AS legacy_branch_id FROM re_mgmt.branch";
+
+    // Source CSV column aliases (user_master file) mapped to logical fields we need.
+    private static final Map<String, List<String>> SOURCE_ALIASES;
+    static {
+        Map<String, List<String>> m = new LinkedHashMap<String, List<String>>();
+        m.put("user_id", Arrays.asList("user_id", "USER_ID"));
+        m.put("user_branch_id", Arrays.asList("user_branch_id", "USER_BRANCH_ID"));
+        m.put("user_type", Arrays.asList("user_type", "USER_TYPE"));
+        m.put("active", Arrays.asList("active", "ACTIVE"));
+        m.put("version", Arrays.asList("version_no", "version", "VERSION_NO", "VERSION"));
+        m.put("created_at", Arrays.asList("user_created_date", "created_at", "CREATED_AT"));
+        m.put("created_by", Arrays.asList("user_created_by", "created_by", "CREATED_BY"));
+        m.put("updated_at", Arrays.asList("user_acti_deacti_maker_time", "last_updated_date", "updated_at", "UPDATED_AT"));
+        m.put("updated_by", Arrays.asList("user_acti_deacti_maker_id", "last_updated_by", "updated_by", "UPDATED_BY"));
+        SOURCE_ALIASES = Collections.unmodifiableMap(m);
+    }
+
+    ntp20_process_methods(String processName, String processVersion, String jdbcUrl, String dbUser, String dbPassword, String delimiter, String serverIP) {
+        this.processName = processName == null ? "NTP20" : processName;
+        this.processVersion = processVersion == null ? "1.0.0" : processVersion;
+        this.jdbcUrl = jdbcUrl;
+        this.dbUser = dbUser;
+        this.dbPassword = dbPassword;
+        this.delimiter = (delimiter == null || delimiter.length() == 0) ? "|" : delimiter;
+        this.serverIP = serverIP;
+        this.debugEnabled = true;
+        this.logFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+        this.fileCharset = StandardCharsets.UTF_8;
+    }
+
+    public void process(File input) {
+        log("INFO", "Process started: " + input.getAbsolutePath(), serverIP, "START");
+
+        Map<String, BranchLookupRow> branchLookup;
+        try {
+            branchLookup = loadBranchLookup();
+        } catch (SQLException e) {
+            log("ERROR", "Fatal error loading branch lookup: " + rootCause(e), serverIP, "FATAL_ERROR");
+            return;
+        }
+        log("INFO", "Branch lookup loaded: " + branchLookup.size() + " rows", serverIP, "LOOKUP_LOADED");
+
+        if (input.isFile()) {
+            DirectorySummary ds = new DirectorySummary();
+            FileSummary fs = processOneFile(input, branchLookup);
+            ds.totalFiles = 1;
+            if (fs != null) {
+                ds.accumulate(fs);
+            }
+            log("INFO", buildDirectorySummary(ds), serverIP, "DIR_SUMMARY");
+            return;
+        }
+
+        File[] files = input.listFiles();
+        if (files == null || files.length == 0) {
+            DirectorySummary ds = new DirectorySummary();
+            log("INFO", buildDirectorySummary(ds), serverIP, "DIR_SUMMARY");
+            return;
+        }
+
+        List<File> csvFiles = new ArrayList<File>();
+        for (File f : files) {
+            if (f != null && f.isFile() && f.getName().toLowerCase(Locale.ENGLISH).endsWith(".csv")) {
+                csvFiles.add(f);
+            }
+        }
+
+        Collections.sort(csvFiles, new Comparator<File>() {
+            @Override
+            public int compare(File a, File b) {
+                return a.getName().compareToIgnoreCase(b.getName());
+            }
+        });
+
+        DirectorySummary ds = new DirectorySummary();
+        ds.totalFiles = csvFiles.size();
+
+        final Map<String, BranchLookupRow> finalBranchLookup = branchLookup;
+        ExecutorService executor = Executors.newFixedThreadPool(Math.min(MAX_PARALLEL_FILES, Math.max(1, csvFiles.size())));
+        List<Future<FileSummary>> futures = new ArrayList<Future<FileSummary>>();
+
+        for (final File file : csvFiles) {
+            futures.add(executor.submit(new Callable<FileSummary>() {
+                @Override
+                public FileSummary call() {
+                    return processOneFile(file, finalBranchLookup);
+                }
+            }));
+        }
+
+        executor.shutdown();
+
+        for (Future<FileSummary> future : futures) {
+            try {
+                FileSummary fs = future.get();
+                if (fs != null) {
+                    ds.accumulate(fs);
+                }
+            } catch (Exception e) {
+                ds.errorFiles++;
+                log("ERROR", "Fatal file execution error: " + rootCause(e), serverIP, "FATAL_ERROR");
+            }
+        }
+
+        log("INFO", buildDirectorySummary(ds), serverIP, "DIR_SUMMARY");
+    }
+
+    /**
+     * Loads re_mgmt.branch once into memory, keyed by the legacy branch id stored in
+     * metadata->>'branch_id'. Each entry carries branch.id (UUID) and branch.region_id (UUID),
+     * since branch.region_id is already the resolved FK into re_mgmt.region -- no second
+     * query against region is required.
+     */
+    private Map<String, BranchLookupRow> loadBranchLookup() throws SQLException {
+        Map<String, BranchLookupRow> map = new HashMap<String, BranchLookupRow>();
+        Connection connection = null;
+        Statement st = null;
+        ResultSet rs = null;
+        try {
+            connection = openConnection();
+            st = connection.createStatement();
+            rs = st.executeQuery(BRANCH_LOOKUP_SQL);
+            while (rs.next()) {
+                String legacyId = rs.getString("legacy_branch_id");
+                if (legacyId == null || legacyId.trim().length() == 0) {
+                    continue;
+                }
+                UUID branchId = (UUID) rs.getObject("id");
+                UUID regionId = (UUID) rs.getObject("region_id");
+                map.put(legacyId.trim(), new BranchLookupRow(branchId, regionId));
+            }
+        } finally {
+            closeQuietly(rs);
+            closeQuietly(st);
+            closeQuietly(connection);
+        }
+        return map;
+    }
+
+    private FileSummary processOneFile(File file, Map<String, BranchLookupRow> branchLookup) {
+        FileSummary summary = new FileSummary(file == null ? "NA" : file.getName());
+        summary.status = "STARTED";
+        summary.effectiveBatchSize = BATCH_SIZE;
+
+        log("INFO", "File start: " + summary.fileName, serverIP, "FILE_START");
+
+        BufferedReader reader = null;
+        Connection connection = null;
+        PreparedStatement ps = null;
+        boolean fatal = false;
+
+        try {
+            if (file == null || !file.exists()) {
+                summary.status = "MISSING";
+                summary.dbFailed++;
+                fatal = true;
+                return summary;
+            }
+
+            reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), fileCharset));
+            String headerLine = reader.readLine();
+            if (headerLine == null) {
+                summary.status = "EMPTY_FILE";
+                summary.emptyFile = true;
+                File moved = moveAfterSuccess(file);
+                summary.moved = moved != null;
+                log("INFO", "File moved: " + summary.fileName + " -> " + (moved != null ? moved.getAbsolutePath() : "NA"), serverIP, "FILE_MOVED");
+                logFileSummary(summary);
+                return summary;
+            }
+
+            List<String> headers = parseCsvLine(headerLine, delimiter.charAt(0));
+            Map<String, Integer> headerIndex = buildHeaderIndex(headers);
+            if (headerIndex.isEmpty()) {
+                summary.status = "HEADER_ONLY";
+                summary.headerOnlyFile = true;
+                File moved = moveAfterSuccess(file);
+                summary.moved = moved != null;
+                log("INFO", "File moved: " + summary.fileName + " -> " + (moved != null ? moved.getAbsolutePath() : "NA"), serverIP, "FILE_MOVED");
+                logFileSummary(summary);
+                return summary;
+            }
+
+            connection = openConnection();
+            connection.setAutoCommit(false);
+            ps = connection.prepareStatement(INSERT_SQL);
+
+            String line;
+            int batchCount = 0;
+
+            while ((line = reader.readLine()) != null) {
+                if (line == null || line.trim().length() == 0) {
+                    summary.blankLines++;
+                    continue;
+                }
+
+                summary.dataRows++;
+
+                List<String> rowTokens = parseCsvLine(line, delimiter.charAt(0));
+                RowBuildResult row = buildRow(rowTokens, headerIndex, branchLookup);
+
+                if (row.skippedType) {
+                    summary.skippedIneligibleType++;
+                    summary.skipped++;
+                    continue;
+                }
+
+                if (!row.ok) {
+                    summary.rowErrors++;
+                    summary.skipped++;
+                    continue;
+                }
+
+                bindRow(ps, row.rowValues);
+                ps.addBatch();
+                batchCount++;
+
+                if (batchCount >= BATCH_SIZE) {
+                    executeBatch(ps, summary, file.getName(), batchCount);
+                    batchCount = 0;
+                }
+            }
+
+            if (batchCount > 0) {
+                executeBatch(ps, summary, file.getName(), batchCount);
+            }
+
+            connection.commit();
+            summary.status = summary.dataRows == 0 ? "HEADER_ONLY" : "SUCCESS";
+            if (summary.dataRows == 0) {
+                summary.headerOnlyFile = true;
+            }
+
+            File moved = moveAfterSuccess(file);
+            summary.moved = moved != null;
+            if (moved != null) {
+                log("INFO", "File moved: " + summary.fileName + " -> " + moved.getAbsolutePath(), serverIP, "FILE_MOVED");
+            } else {
+                log("WARN", "File not moved after commit: " + summary.fileName, serverIP, "FILE_MOVED");
+            }
+
+            logFileSummary(summary);
+        } catch (BatchUpdateException bue) {
+            summary.batchFailures++;
+            summary.dbFailed++;
+            summary.status = "BATCH_FAILURE";
+            fatal = true;
+            log("ERROR", "Batch failure on file " + summary.fileName + ": " + rootCause(bue), serverIP, "BATCH_FAILURE");
+        } catch (SQLException sqle) {
+            summary.dbFailed++;
+            summary.status = "DB_ERROR";
+            fatal = true;
+            log("ERROR", "Database error on file " + summary.fileName + ": " + rootCause(sqle), serverIP, "FATAL_ERROR");
+        } catch (Exception e) {
+            summary.dbFailed++;
+            summary.status = "FATAL_ERROR";
+            fatal = true;
+            log("ERROR", "Fatal error on file " + summary.fileName + ": " + rootCause(e), serverIP, "FATAL_ERROR");
+        } finally {
+            if (fatal) {
+                rollbackQuietly(connection);
+                summary.moved = false;
+                log("WARN", "File retained in source directory: " + summary.fileName, serverIP, "FILE_RETAINED");
+                logFileSummary(summary);
+            }
+            closeQuietly(ps);
+            closeQuietly(connection);
+            closeQuietly(reader);
+        }
+
+        return summary;
+    }
+
+    private Connection openConnection() throws SQLException {
+        return DriverManager.getConnection(jdbcUrl, dbUser, dbPassword);
+    }
+
+    private void executeBatch(PreparedStatement ps, FileSummary summary, String fileName, int batchCount) throws SQLException {
+        try {
+            ps.executeBatch();
+            ps.clearBatch();
+            summary.inserted += batchCount;
+        } catch (BatchUpdateException bue) {
+            summary.batchFailures++;
+            log("ERROR", "Batch execution failure for file " + fileName + ": " + rootCause(bue), serverIP, "BATCH_FAILURE");
+            throw bue;
+        }
+    }
+
+    /**
+     * Builds one target row.
+     *
+     * Rules:
+     *  - user_type must be IRA, IRU, or IBU. Anything else (including IAU) is skipped, not an error.
+     *  - IBU: branch_id is mandatory, resolved via branchLookup.get(user_branch_id).id.
+     *         region_id comes from the same branch row (branch.region_id), since it's already
+     *         the resolved FK -- no separate region query needed. If no branch match, row fails.
+     *  - IRA/IRU: region_id is mandatory, resolved via branchLookup.get(user_branch_id).regionId.
+     *             branch_id stays null. If no branch match, row fails.
+     */
+    private RowBuildResult buildRow(List<String> rowTokens, Map<String, Integer> headerIndex, Map<String, BranchLookupRow> branchLookup) {
+        String userTypeRaw = normalize(getValueFromAliases(rowTokens, headerIndex, "user_type"));
+        String userType = userTypeRaw == null ? null : userTypeRaw.toUpperCase(Locale.ENGLISH);
+
+        if (userType == null || !ELIGIBLE_USER_TYPES.contains(userType)) {
+            return RowBuildResult.skipType();
+        }
+
+        Map<String, Object> values = new LinkedHashMap<String, Object>();
+
+        UUID generatedId = UUID.randomUUID();
+        values.put("id", generatedId);
+
+        String userId = normalize(getValueFromAliases(rowTokens, headerIndex, "user_id"));
+        if (userId == null) {
+            return RowBuildResult.fail("user_id is required");
+        }
+        values.put("user_id", userId);
+
+        String legacyBranchId = normalize(getValueFromAliases(rowTokens, headerIndex, "user_branch_id"));
+        BranchLookupRow matchedBranch = legacyBranchId == null ? null : branchLookup.get(legacyBranchId);
+
+        UUID branchId = null;
+        UUID regionId = null;
+
+        if ("IBU".equals(userType)) {
+            if (matchedBranch == null || matchedBranch.branchId == null) {
+                return RowBuildResult.fail("IBU user_branch_id '" + legacyBranchId + "' not found in branch lookup");
+            }
+            branchId = matchedBranch.branchId;
+            regionId = matchedBranch.regionId;
+        } else {
+            // IRA / IRU
+            if (matchedBranch == null || matchedBranch.regionId == null) {
+                return RowBuildResult.fail("IRA/IRU user_branch_id '" + legacyBranchId + "' has no resolvable region");
+            }
+            regionId = matchedBranch.regionId;
+            branchId = null;
+        }
+
+        values.put("branch_id", branchId);
+        values.put("region_id", regionId);
+
+        values.put("active", parseBoolean(getValueFromAliases(rowTokens, headerIndex, "active"), Boolean.TRUE));
+        values.put("version", parseLong(getValueFromAliases(rowTokens, headerIndex, "version"), Long.valueOf(0L)));
+        values.put("created_at", parseTimestamp(getValueFromAliases(rowTokens, headerIndex, "created_at"), currentTimestamp()));
+
+        String createdBy = normalize(getValueFromAliases(rowTokens, headerIndex, "created_by"));
+        values.put("created_by", createdBy == null ? "SYSTEM" : createdBy);
+
+        values.put("updated_at", parseTimestamp(getValueFromAliases(rowTokens, headerIndex, "updated_at"), currentTimestamp()));
+
+        String updatedBy = normalize(getValueFromAliases(rowTokens, headerIndex, "updated_by"));
+        values.put("updated_by", updatedBy == null ? "SYSTEM" : updatedBy);
+
+        return RowBuildResult.success(values);
+    }
+
+    private void bindRow(PreparedStatement ps, Map<String, Object> rowValues) throws SQLException {
+        int i = 1;
+        for (String column : INSERT_COLUMNS) {
+            Object value = rowValues.get(column);
+
+            if ("id".equals(column) || "branch_id".equals(column) || "region_id".equals(column)) {
+                ps.setObject(i, value);
+            } else if ("active".equals(column)) {
+                if (value == null) {
+                    ps.setNull(i, java.sql.Types.BOOLEAN);
+                } else {
+                    ps.setBoolean(i, ((Boolean) value).booleanValue());
+                }
+            } else if ("version".equals(column)) {
+                if (value == null) {
+                    ps.setNull(i, java.sql.Types.BIGINT);
+                } else {
+                    ps.setLong(i, ((Long) value).longValue());
+                }
+            } else if ("created_at".equals(column) || "updated_at".equals(column)) {
+                if (value == null) {
+                    ps.setTimestamp(i, null);
+                } else {
+                    ps.setTimestamp(i, (Timestamp) value);
+                }
+            } else {
+                ps.setString(i, value == null ? null : String.valueOf(value));
+            }
+
+            i++;
+        }
+    }
+
+    private Map<String, Integer> buildHeaderIndex(List<String> headers) {
+        Map<String, Integer> map = new HashMap<String, Integer>();
+        if (headers == null) {
+            return map;
+        }
+        for (int i = 0; i < headers.size(); i++) {
+            String h = normalizeHeader(headers.get(i));
+            if (h != null && h.length() > 0 && !map.containsKey(h)) {
+                map.put(h, Integer.valueOf(i));
+            }
+        }
+        return map;
+    }
+
+    private String getValueFromAliases(List<String> rowTokens, Map<String, Integer> headerIndex, String targetColumn) {
+        List<String> aliases = SOURCE_ALIASES.get(targetColumn);
+        if (aliases == null) {
+            return null;
+        }
+
+        for (String alias : aliases) {
+            Integer idx = headerIndex.get(normalizeHeader(alias));
+            if (idx != null && idx.intValue() >= 0 && idx.intValue() < rowTokens.size()) {
+                return rowTokens.get(idx.intValue());
+            }
+        }
+        return null;
+    }
+
+    private List<String> parseCsvLine(String line, char delim) {
+        List<String> result = new ArrayList<String>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (inQuotes) {
+                if (c == '"') {
+                    if (i + 1 < line.length() && line.charAt(i + 1) == '"') {
+                        current.append('"');
+                        i++;
+                    } else {
+                        inQuotes = false;
+                    }
+                } else {
+                    current.append(c);
+                }
+            } else {
+                if (c == '"') {
+                    inQuotes = true;
+                } else if (c == delim) {
+                    result.add(current.toString());
+                    current.setLength(0);
+                } else {
+                    current.append(c);
+                }
+            }
+        }
+
+        result.add(current.toString());
+        return result;
+    }
+
+    private Boolean parseBoolean(String value, Boolean defaultValue) {
+        String n = normalize(value);
+        if (n == null) {
+            return defaultValue;
+        }
+        String v = n.toLowerCase(Locale.ENGLISH);
+        if ("true".equals(v) || "t".equals(v) || "1".equals(v) || "yes".equals(v) || "y".equals(v)) {
+            return Boolean.TRUE;
+        }
+        if ("false".equals(v) || "f".equals(v) || "0".equals(v) || "no".equals(v) || "n".equals(v)) {
+            return Boolean.FALSE;
+        }
+        return defaultValue;
+    }
+
+    private Long parseLong(String value, Long defaultValue) {
+        String n = normalize(value);
+        if (n == null) {
+            return defaultValue;
+        }
+        try {
+            return Long.valueOf(n);
+        } catch (Exception e) {
+            return defaultValue;
+        }
+    }
+
+    private Timestamp parseTimestamp(String value, Timestamp defaultValue) {
+        String n = normalize(value);
+        if (n == null) {
+            return defaultValue;
+        }
+
+        List<DateTimeFormatter> f = Arrays.asList(
+                DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"),
+                DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss"),
+                DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss"),
+                DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"),
+                DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS"),
+                DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"),
+                DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss.SSS")
+        );
+
+        for (int i = 0; i < f.size(); i++) {
+            try {
+                return Timestamp.valueOf(LocalDateTime.parse(n, f.get(i)));
+            } catch (DateTimeParseException ignore) {
+            }
+        }
+
+        try {
+            return Timestamp.from(OffsetDateTime.parse(n).toInstant());
+        } catch (Exception ignore) {
+        }
+
+        return defaultValue;
+    }
+
+    private Timestamp currentTimestamp() {
+        return Timestamp.from(LocalDateTime.now().atZone(ZoneId.systemDefault()).toInstant());
+    }
+
+    private String normalize(String value) {
+        if (value == null) {
+            return null;
+        }
+        String t = value.trim();
+        if (t.length() == 0) {
+            return null;
+        }
+        if ("\\N".equalsIgnoreCase(t)) {
+            return null;
+        }
+        if ("NULL".equalsIgnoreCase(t)) {
+            return null;
+        }
+        return t;
+    }
+
+    private String normalizeHeader(String value) {
+        String n = normalize(value);
+        return n == null ? null : n.toLowerCase(Locale.ENGLISH);
+    }
+
+    private File moveAfterSuccess(File sourceFile) {
+        if (sourceFile == null || !sourceFile.exists()) {
+            return null;
+        }
+
+        File parent = sourceFile.getParentFile();
+        if (parent == null) {
+            return null;
+        }
+
+        File processedDir = new File(parent, "processed");
+        if (!processedDir.exists()) {
+            processedDir.mkdirs();
+        }
+
+        File target = new File(processedDir, sourceFile.getName());
+        int attempt = 0;
+        while (target.exists()) {
+            attempt++;
+            String name = sourceFile.getName();
+            int dot = name.lastIndexOf('.');
+            String base = dot > 0 ? name.substring(0, dot) : name;
+            String ext = dot > 0 ? name.substring(dot) : "";
+            target = new File(processedDir, base + "_" + attempt + ext);
+        }
+
+        try {
+            Files.move(sourceFile.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            return target;
+        } catch (IOException e) {
+            log("ERROR", "File move failed for " + sourceFile.getName() + ": " + rootCause(e), serverIP, "FILE_MOVE_FAILED");
+            return null;
+        }
+    }
+
+    private void logFileSummary(FileSummary s) {
+        StringBuilder sb = new StringBuilder(256);
+        sb.append("file=").append(s.fileName)
+          .append(" status=").append(s.status)
+          .append(" data_rows=").append(s.dataRows)
+          .append(" inserted=").append(s.inserted)
+          .append(" skipped=").append(s.skipped)
+          .append(" skipped_ineligible_type=").append(s.skippedIneligibleType)
+          .append(" db_failed=").append(s.dbFailed)
+          .append(" row_errors=").append(s.rowErrors)
+          .append(" batch_failures=").append(s.batchFailures)
+          .append(" blank_lines=").append(s.blankLines)
+          .append(" effective_batch_size=").append(s.effectiveBatchSize)
+          .append(" moved=").append(s.moved);
+        log("INFO", sb.toString(), serverIP, "FILE_SUMMARY");
+    }
+
+    private String buildDirectorySummary(DirectorySummary s) {
+        return "total_files=" + s.totalFiles +
+                " completed_files=" + s.completedFiles +
+                " retained_files=" + s.retainedFiles +
+                " empty_files=" + s.emptyFiles +
+                " header_only_files=" + s.headerOnlyFiles +
+                " error_files=" + s.errorFiles +
+                " total_rows=" + s.totalRows +
+                " inserted=" + s.inserted +
+                " skipped=" + s.skipped +
+                " skipped_ineligible_type=" + s.skippedIneligibleType +
+                " db_failed=" + s.dbFailed +
+                " row_errors=" + s.rowErrors +
+                " batch_failures=" + s.batchFailures +
+                " blank_lines=" + s.blankLines;
+    }
+
+    private void closeQuietly(AutoCloseable c) {
+        if (c == null) {
+            return;
+        }
+        try {
+            c.close();
+        } catch (Exception ignore) {
+        }
+    }
+
+    private void rollbackQuietly(Connection c) {
+        if (c == null) {
+            return;
+        }
+        try {
+            c.rollback();
+        } catch (Exception ignore) {
+        }
+    }
+
+    private String rootCause(Throwable t) {
+        if (t == null) {
+            return "";
+        }
+        Throwable cur = t;
+        while (cur.getCause() != null && cur.getCause() != cur) {
+            cur = cur.getCause();
+        }
+        String msg = cur.getMessage();
+        return (msg == null || msg.trim().length() == 0) ? cur.getClass().getName() : msg;
+    }
+
+    private void log(String level, String message, String serverIP, String evtType) {
+        if ("DEBUG".equalsIgnoreCase(level) && !debugEnabled) {
+            return;
+        }
+
+        String timestamp = LocalDateTime.now().format(logFormat);
+        StringBuilder logBuilder = new StringBuilder(512);
+
+        logBuilder.append("Time:").append(timestamp).append(" [").append(capitalize(level)).append("] ")
+                .append("Process_Name: ").append(processName).append(" ");
+
+        if (serverIP != null && serverIP.length() > 0) {
+            logBuilder.append("Server_IP: ").append(serverIP).append(" ");
+        }
+
+        logBuilder.append("Process_Version: ").append(processVersion).append(" ")
+                .append("Log_Level: EVT_LOG ")
+                .append("EVT_Type: ").append(evtType != null ? evtType : "NA")
+                .append(" Description: ").append(message != null ? message : "");
+
+        System.err.println(logBuilder.toString().trim());
+    }
+
+    private String capitalize(String value) {
+        if (value == null || value.length() == 0) {
+            return "INFO";
+        }
+        String lower = value.toLowerCase(Locale.ENGLISH);
+        return Character.toUpperCase(lower.charAt(0)) + lower.substring(1);
+    }
+
+    private static final class BranchLookupRow {
+        private final UUID branchId;
+        private final UUID regionId;
+
+        private BranchLookupRow(UUID branchId, UUID regionId) {
+            this.branchId = branchId;
+            this.regionId = regionId;
+        }
+    }
+
+    private static final class FileSummary {
+        private final String fileName;
+        private String status = "NA";
+        private int dataRows;
+        private int inserted;
+        private int skipped;
+        private int skippedIneligibleType;
+        private int dbFailed;
+        private int rowErrors;
+        private int batchFailures;
+        private int blankLines;
+        private int effectiveBatchSize;
+        private boolean moved;
+        private boolean emptyFile;
+        private boolean headerOnlyFile;
+
+        private FileSummary(String fileName) {
+            this.fileName = fileName == null ? "NA" : fileName;
+        }
+    }
+
+    private static final class DirectorySummary {
+        private int totalFiles;
+        private int completedFiles;
+        private int retainedFiles;
+        private int emptyFiles;
+        private int headerOnlyFiles;
+        private int errorFiles;
+        private int totalRows;
+        private int inserted;
+        private int skipped;
+        private int skippedIneligibleType;
+        private int dbFailed;
+        private int rowErrors;
+        private int batchFailures;
+        private int blankLines;
+
+        private void accumulate(FileSummary fs) {
+            if (fs == null) {
+                return;
+            }
+            completedFiles++;
+            if (!fs.moved && ("FATAL_ERROR".equalsIgnoreCase(fs.status) || "DB_ERROR".equalsIgnoreCase(fs.status) || "BATCH_FAILURE".equalsIgnoreCase(fs.status))) {
+                retainedFiles++;
+            }
+            if (fs.emptyFile) {
+                emptyFiles++;
+            }
+            if (fs.headerOnlyFile) {
+                headerOnlyFiles++;
+            }
+            totalRows += fs.dataRows;
+            inserted += fs.inserted;
+            skipped += fs.skipped;
+            skippedIneligibleType += fs.skippedIneligibleType;
+            dbFailed += fs.dbFailed;
+            rowErrors += fs.rowErrors;
+            batchFailures += fs.batchFailures;
+            blankLines += fs.blankLines;
+        }
+    }
+
+    private static final class RowBuildResult {
+        private final boolean ok;
+        private final boolean skippedType;
+        private final Map<String, Object> rowValues;
+        private final String error;
+
+        private RowBuildResult(boolean ok, boolean skippedType, Map<String, Object> rowValues, String error) {
+            this.ok = ok;
+            this.skippedType = skippedType;
+            this.rowValues = rowValues;
+            this.error = error;
+        }
+
+        private static RowBuildResult success(Map<String, Object> rowValues) {
+            return new RowBuildResult(true, false, rowValues, null);
+        }
+
+        private static RowBuildResult fail(String error) {
+            return new RowBuildResult(false, false, null, error);
+        }
+
+        private static RowBuildResult skipType() {
+            return new RowBuildResult(false, true, null, "user_type not eligible");
+        }
+    }
+}

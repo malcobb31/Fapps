@@ -1,0 +1,147 @@
+package url_parserV1;
+
+import org.bytedeco.opencv.global.opencv_core;
+import org.bytedeco.opencv.global.opencv_imgcodecs;
+import org.bytedeco.opencv.opencv_core.*;
+import org.bytedeco.opencv.global.opencv_imgproc;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.InputStreamReader;
+
+public class url_parser_methods_login {
+
+    public static void main(String[] args) throws Exception {
+
+        String input = "captcha.png";
+        String processed = "processed.png";
+
+        // ----------------------------
+        // 1. LOAD IMAGE
+        // ----------------------------
+        Mat img = opencv_imgcodecs.imread(input);
+
+        // ----------------------------
+        // 2. HSV COLOR ISOLATION (blue text)
+        // ----------------------------
+        Mat hsv = new Mat();
+        opencv_imgproc.cvtColor(img, hsv, opencv_imgproc.COLOR_BGR2HSV);
+
+        Scalar lowerBlue = new Scalar(100, 50, 50, 0);
+        Scalar upperBlue = new Scalar(140, 255, 255, 0);
+
+        Mat mask = new Mat();
+        Mat lowerMat = new Mat(hsv.size(), hsv.type(), lowerBlue);
+        Mat upperMat = new Mat(hsv.size(), hsv.type(), upperBlue);
+
+        opencv_core.inRange(hsv, lowerMat, upperMat, mask);
+
+        // ----------------------------
+        // 3. THRESHOLD + LINE REMOVAL
+        // ----------------------------
+        opencv_imgproc.threshold(mask, mask, 0, 255, opencv_imgproc.THRESH_BINARY);
+
+        // Remove thin noise lines
+        Mat kernelLine = opencv_imgproc.getStructuringElement(opencv_imgproc.MORPH_RECT, new Size(1, 3));
+        opencv_imgproc.morphologyEx(mask, mask, opencv_imgproc.MORPH_OPEN, kernelLine);
+
+        // ----------------------------
+        // 4. DILATE (thicken chars) + ERODE (cleanup)
+        // ----------------------------
+        Mat kernel = opencv_imgproc.getStructuringElement(opencv_imgproc.MORPH_RECT, new Size(2, 2));
+        opencv_imgproc.dilate(mask, mask, kernel);
+        opencv_imgproc.erode(mask, mask, kernel);
+
+        // ----------------------------
+        // 5. SAVE CLEAN IMAGE
+        // ----------------------------
+        opencv_imgcodecs.imwrite(processed, mask);
+
+        // ----------------------------
+        // 6. RUN TESSERACT.EXE
+        // ----------------------------
+        String tessPath = "C:\\Program Files\\Tesseract-OCR\\tesseract.exe";
+
+        ProcessBuilder pb = new ProcessBuilder(
+                tessPath,
+                processed,
+                "stdout",
+                "--psm", "7",                  // Treat image as a single text line
+                "--oem", "3",                  // LSTM OCR engine
+                "-c", "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        );
+
+        pb.redirectErrorStream(true);
+        Process process = pb.start();
+
+        BufferedReader br = new BufferedReader(new InputStreamReader(process.getInputStream()));
+        StringBuilder sb = new StringBuilder();
+        String line;
+
+        while ((line = br.readLine()) != null) {
+            sb.append(line);
+        }
+
+        process.waitFor();
+
+        String result = sb.toString().trim();
+
+        System.out.println("Extracted CAPTCHA: [" + result + "]");
+    }
+}
+
+
+
+//
+//
+//
+//package url_parserV1;
+//
+//import java.io.IOException;
+//import java.nio.file.DirectoryStream;
+//import java.nio.file.Files;
+//import java.nio.file.Path;
+//import java.nio.file.Paths;
+//import java.util.Comparator;
+//import java.util.Optional;
+//import java.util.stream.Stream;
+//
+//public class url_parser_methods_login {
+//
+//    public static void main(String[] args) {
+//
+////        Path downloadDir = Paths.get(System.getProperty("user.home"), "Downloads");
+//      
+//         Path downloadDir = Paths.get("C:\\Users\\User\\Downloads\\NTT");
+//
+//        try {
+//            Optional<Path> latestXlsFileOpt = Files.list(downloadDir)
+//                .filter(p -> p.getFileName().toString().toLowerCase().endsWith(".xls"))
+//                .max(Comparator.comparingLong(p -> {
+//                    try {
+//                        return Files.getLastModifiedTime(p).toMillis();
+//                    } catch (IOException e) {
+//                       
+//                        throw new RuntimeException(e);
+//                    }
+//                }));
+//
+//            if (latestXlsFileOpt.isPresent()) {
+//                Path latestXlsFile = latestXlsFileOpt.get();
+//                Path renamedPath = downloadDir.resolve("123_Blocked.xls");
+//                
+//             
+//                Files.move(latestXlsFile, renamedPath);
+//                
+//                System.out.println("File Renamed To: " + renamedPath.toAbsolutePath());
+//            } else {
+//                System.out.println("No XLS file found in Downloads!");
+//            }
+//
+//        } catch (IOException | RuntimeException e) {
+//            System.err.println("An error occurred during file operation: " + e.getMessage());
+//            e.printStackTrace();
+//        }
+//    }
+//}
+

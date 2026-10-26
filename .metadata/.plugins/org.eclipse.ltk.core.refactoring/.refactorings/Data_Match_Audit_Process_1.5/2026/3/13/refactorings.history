@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Copy element &apos;MySQLConnection.java&apos; to &apos;TP1_MetaData_Parser/src/metadata_parser_v1&apos;&#x0D;&#x0A;- Original project: &apos;Data_Match_Audit_Process_1.5&apos;&#x0D;&#x0A;- Destination element: &apos;TP1_MetaData_Parser/src/metadata_parser_v1&apos;&#x0D;&#x0A;- Original element: &apos;com.fapps.db.MySQLConnection.java&apos;" description="Copy compilation unit" destination="=TP1_MetaData_Parser/src&lt;metadata_parser_v1" element1="/Data_Match_Audit_Process_1.5\/src&lt;com.fapps.db{MySQLConnection.java" files="0" flags="589830" folders="0" id="org.eclipse.jdt.ui.copy" policy="org.eclipse.jdt.ui.copyResources" stamp="1774254653424" units="1" version="1.0"/>
+</session>

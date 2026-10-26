@@ -1,0 +1,476 @@
+package com.fapps.main;
+
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.Statement;
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.HashMap;
+
+import com.fapps.db.SNORangeFinder;
+import com.fapps.util.PrintUtilMsg;
+
+import java.sql.ResultSet;
+import com.fapps.main.DateUtil;
+public class Source_EyeQ 
+{
+	PrintUtilMsg pu = new PrintUtilMsg();
+	DateUtil dt= new DateUtil();
+	private String[] binarySearch(String binarySearch, String date, String sourceTable, String db_url, String db_name, String db_pass ) {
+		
+		String[] snoRangeReturn = new String[4];
+		
+		try {
+			
+			pu.sop("getAPILogData", "Is Binary Search? ["+binarySearch+"]");
+		
+		if(binarySearch.equalsIgnoreCase("yes")) {
+			
+			
+			String current_month = "";
+			String next_month    = "";
+			String year          = "";
+			String from_date     = "";
+			String to_date       = "";
+			String[] dates       =  new String[2];
+			int[] snoRange  = null;
+			int[] snoRangeFinal = new int[2];
+			 
+			boolean hashExist    = false; 
+		
+			String repId="120";
+			String[] pull_data_details=null;
+			String from_date_final="";
+			String to_date_final="";
+			boolean intrval_and_month = false;
+			
+			
+			
+			pull_data_details = date.split("~~"); 
+			
+			String[] dates_details = pull_data_details[1].split("#");
+			
+			if(dates_details.length > 1) {
+				hashExist = true;
+			}	
+
+
+			pu.sop("Status Date Interval", "Interval Status is "+hashExist);
+			
+			// ==============Getting Current Month if trendType is monthly
+			
+			if(pull_data_details[2].toLowerCase().equals("monthly") || (pull_data_details[2].toLowerCase().equals("daily") && hashExist==true )) {
+				
+				intrval_and_month = true;
+				
+				if(hashExist==false) { //===only monthly data
+					
+					pu.sop("Trend Type", "Monthly only "+hashExist);
+					
+					current_month = pull_data_details[1].substring(5, 7); 
+					pu.sop( "Monthly", "Month is "+current_month);
+				
+					if(Integer.parseInt(current_month)==12) {
+						next_month = "01";
+						pu.sop( "Monthly", "Next Month is "+next_month);
+						
+						
+					}else {
+									
+						next_month = ""+(Integer.parseInt(current_month)+1);
+						pu.sop( "Monthly", "Next Month is "+next_month);
+					}
+					if(next_month.length()==1) {
+						next_month = "0"+next_month;
+					}
+					pu.sop( "Monthly", "Final Next Month is "+next_month);
+					
+					
+					from_date = pull_data_details[1].substring(0, 8)+"01";
+					
+					pu.sop( "Monthly", "From data is "+from_date);
+					
+					from_date_final = from_date;
+					
+					if(Integer.parseInt(current_month)==12) {
+						 year = ""+((Integer.parseInt(pull_data_details[1].substring(0, 4)))+1);
+						to_date = year+"-"+next_month+"-"+"01";
+						
+					}else {
+						 to_date = from_date.replace(current_month, next_month);
+						
+					}
+					pu.sop( "Monthly", "To data is "+to_date);
+					
+					//to_date_final = to_date;  //changing for monthly to-date as input date
+					to_date_final = pull_data_details[1];
+				}else if(hashExist==true && pull_data_details[2].toLowerCase().equals("monthly")){
+					
+					pu.sop("Trend Type", "Monthly Interval "+hashExist);
+					
+					SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd");
+					//String shared_date = sdf.format(dates[0]);
+					
+					Date shared_date = sdf.parse(dates_details[0]);
+					
+					Calendar c = Calendar.getInstance(); 
+					c.setTime(shared_date); 
+					c.add(Calendar.MONTH, -Integer.parseInt(dates_details[1]));
+					pu.sop("Getting Require month and year", "Year is "+c.getTime());
+					
+					Date from_month = c.getTime();
+				    
+				    String from_year_month = sdf.format(from_month);
+					 
+					/*Date to_date1 = new SimpleDateFormat("yyyy-MM-dd").parse(""+c.getTime());
+					SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd");
+					String to_date_final1 = sdf.format(to_date);*/
+				
+				    pu.sop("Getting Require month and year", "Year is "+from_year_month);
+					
+					
+					from_date_final = from_year_month.substring(0, 8)+"01";
+					
+					pu.sop("Final From Date", "From Date "+from_date_final);
+					
+					
+					to_date_final = dates_details[0].substring(0, 8)+"01";
+					
+					pu.sop("Final To Date", "To Date "+to_date_final);
+					
+					
+						
+					
+				}else {
+					
+					pu.sop("Trend Type", "Date Interval "+hashExist);
+					
+					int numberOfDays =0;
+					
+					Date shared_date = new SimpleDateFormat("yyyy-MM-dd").parse(dates_details[0]);
+					
+					numberOfDays = (Integer.parseInt(dates_details[1]))-1;
+					pu.sop("Number of days","Days are: "+numberOfDays);
+					
+					SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd");
+					to_date_final = sdf.format(shared_date);
+						
+					System.out.println("To date is "+to_date_final);
+						
+					Calendar c = Calendar.getInstance();
+				    c.setTime(shared_date);	
+						
+				    c.add(Calendar.DATE, -numberOfDays);
+				        
+				     Date from_fetched_date = c.getTime();
+				    
+				    from_date_final = sdf.format(from_fetched_date);
+				    
+				    System.out.println("From date is "+from_date_final);
+				}
+				dates[0] = from_date_final;
+				dates[1] = to_date_final;
+				//pull_data_details[2] = "daily";
+				snoRange = new SNORangeFinder().getStartEndIdOfTable( sourceTable,
+						  db_url,
+						  db_name,
+						  db_pass );
+				pu.sop( "TABLE MIN MAX VALUE", "MIN ["+snoRange[0]+"], MAX ["+snoRange[1]+"]");
+				
+				int[] snoRangeToFromDate  = null;
+				
+				for(int i=0; i< dates.length; i++) {
+				
+					snoRangeToFromDate = new SNORangeFinder().getStartAndEndId(dates[i], /* date */ 
+											   			 snoRange[0], 
+					   									 snoRange[1], 
+					   									 sourceTable, 
+					   									 "DATE_FORMAT("+pull_data_details[0]+",'%Y-%m-%d')",
+					   									"daily", /*   daily//weekly//monthly ==Trend Type    */
+					   									 repId, 
+					   									 false, 
+					   									 "sno", 
+					   									 db_url,
+					   									 db_name, 
+					   									 db_pass);
+				
+				
+					pu.sop("getAPILogData", "Table Name ["+sourceTable+"]");
+					pu.sop("getAPILogData", "FOR DATE ["+dates[i]+"], MinSno["+snoRangeToFromDate[0]+"], MaxSno["+snoRangeToFromDate[1]+"]");
+					pu.sop("getAPILogData", "Date ["+date+"]");
+					if(i==0) {
+						snoRangeFinal[0] = snoRangeToFromDate[0];
+					}else {
+						snoRangeFinal[1] = snoRangeToFromDate[1];
+					}
+				
+				
+				
+				}
+
+				snoRangeReturn[0] =""+snoRangeFinal[0];
+				snoRangeReturn[1] =""+snoRangeFinal[1];
+				snoRangeReturn[2] =from_date_final;
+				snoRangeReturn[3] =to_date_final;
+				
+			// ========closing trend type monthly	
+			}else {
+				
+				
+				snoRange = new SNORangeFinder().getStartEndIdOfTable( sourceTable,
+						  db_url,
+						  db_name,
+						  db_pass );
+				pu.sop( "TABLE MIN MAX VALUE", "MIN ["+snoRange[0]+"], MAX ["+snoRange[1]+"]");
+				
+				
+				
+				snoRange = new SNORangeFinder().getStartAndEndId(pull_data_details[1], /* date */ 
+			   			 snoRange[0], 
+							 snoRange[1], 
+							 sourceTable, 
+							 "DATE_FORMAT("+pull_data_details[0]+",'%Y-%m-%d')",
+							pull_data_details[2].toLowerCase(), /*   daily//weekly//monthly ==Trend Type    */
+							 repId, 
+							 false, 
+							 "sno", 
+							 db_url,
+							 db_name, 
+							 db_pass);
+
+
+				pu.sop("getAPILogData", "Table Name ["+sourceTable+"]");
+				pu.sop("getAPILogData", "MinSno["+snoRange[0]+"], MaxSno["+snoRange[1]+"]");
+				pu.sop("getAPILogData", "Date ["+date+"]");
+				
+				snoRangeReturn[0] =""+snoRange[0];
+				snoRangeReturn[1] =""+snoRange[1];
+				snoRangeReturn[2] ="NA";
+				snoRangeReturn[3] ="NA";
+			}
+		}	
+		
+		}catch(Exception ex) {
+			System.out.println("EXCEPTION JAR: Join_Left: "+ex.toString());
+			
+			ex.printStackTrace();
+			
+		}
+		
+		return snoRangeReturn;
+	}	
+	
+	
+	/*public boolean truncateTable(String db_url, String db_name, String db_pass, String tablename) {
+		boolean isUpdated = false;
+		Connection conn = null;
+		Statement stmt  = null;
+		int numberOfEffected = -1;
+		
+		String queryToUpdate = "truncate table " +tablename;
+		
+		try {
+			conn = new com.fapps.db.MySQLConnection().getConnection(db_url, db_name, db_pass);
+			stmt = conn.createStatement();
+			numberOfEffected = stmt.executeUpdate(queryToUpdate);
+			if ( numberOfEffected <= 0 ) {
+				isUpdated = false;
+			}else {
+				isUpdated = true;
+			}
+		}catch(Exception e) {
+			System.out.println("Error in DB Operation...");
+			e.printStackTrace();
+		}finally {
+			//Code to close stmt and connection properly.
+			try {
+				if (conn != null) {
+					if (stmt != null)
+						stmt.close();
+						conn.close();
+				}
+			} catch (Exception e) {
+			}
+		}
+		
+		return isUpdated;
+	}*/
+	
+	
+	public HashMap<String, String[]> getMRDfromPatient(String sourceTable, String date, String db_url, String db_name,
+			String db_pass) {
+		HashMap<String, String[]> data = null;
+		Connection conn = null;
+		Statement stmt = null;
+		ResultSet rs = null;
+		String query = null;
+		String[] snoRange = null;
+		String binaryDate = "";
+		int rowCount = 0;
+		int row = 0;
+		String[] curr_moth=null;
+		
+		try
+		{
+			curr_moth=dt.getStartDateForMonths("yyyy-MM-dd", date, "-1");
+//			System.out.println("date is--"+date);
+			binaryDate = "VISIT_DATE~~"+curr_moth[0]+"~~daily";
+//			
+			snoRange = binarySearch("yes", binaryDate, "Patient_Type_Age_wise_final", db_url, db_name, db_pass);
+			
+			binaryDate = "VISIT_DATE~~"+date+"~~daily";
+			
+			String[] snoRange2 = binarySearch("yes", binaryDate, "Patient_Type_Age_wise_final", db_url, db_name, db_pass);
+			
+			query="select MRD_NO,LOCATION_NAME  as location"
+				+ " from Patient_Type_Age_wise_final "
+				+" where sno >= "+snoRange[0]+" and sno <= "+snoRange2[1]+""
+				+" and DATE_FORMAT(VISIT_DATE,'%Y-%m-%d')>=DATE_FORMAT('"+curr_moth[0]+"','%Y-%m-%d')"
+				+" and DATE_FORMAT(VISIT_DATE,'%Y-%m-%d')<=DATE_FORMAT('"+date+"','%Y-%m-%d')"
+				+ "group by MRD_NO";
+							
+				pu.sop("Query API Log: getMRDfromPatient ", query);
+
+				conn = new com.fapps.db.MySQLConnection().getConnection(db_url, db_name, db_pass);
+				stmt = conn.createStatement();
+				rs   = stmt.executeQuery( query );
+				rs.last();
+				rowCount = rs.getRow();
+				rs.beforeFirst();
+				
+				pu.sop("Row Count", "Total rows:["+rowCount+"]");
+
+				if( rowCount > 0 ){
+						
+					String[] sourceTableColumns = new String[6];
+
+					pu.sop("Column Count", "Total Columns:["+sourceTableColumns.length+"]");	
+					
+					data = new HashMap<String, String[]>();
+					//	data[0] = new String[sourceTableColumns.length];
+					int colNumber=0;
+					String[] tableData = null ;
+					
+
+					while( rs.next() )
+					{
+						colNumber=0;
+						//tableData="";
+						tableData = new String[sourceTableColumns.length];
+						tableData[0]= rs.getString("MRD_NO");
+						tableData[1]= rs.getString("location");
+
+						data.put(rs.getString("MRD_NO"), tableData	);
+						
+					}
+
+				}
+		}
+		catch( Exception ex )
+		{
+			System.out.println("EXCEPTION JAR: getMRDfromPatient: "+ex.toString());
+			data = null;
+			ex.printStackTrace();
+		}
+		finally
+		{
+			try
+			{
+				if( conn != null )
+				{
+					if( rs != null )
+						rs.close();
+					if( stmt != null )
+						stmt.close();
+					conn.close();
+				}
+			}catch( Exception e ){}
+		}
+		return data;
+	}		
+	
+	public HashMap<String, String[]> getMRDfromRCO_count(String sourceTable, String date, String db_url, String db_name,String db_pass) {
+			HashMap<String, String[]> data = null;
+			Connection conn = null;
+			Statement stmt = null;
+			ResultSet rs = null;
+			String query = null;
+			String[] snoRange = null;
+			String binaryDate = "";
+			int rowCount = 0;
+			int row = 0;
+			
+					try {
+			
+						
+				binaryDate = "data_processing_date~~"+date+"~~daily";
+						
+				snoRange = binarySearch("yes", binaryDate, "daily_rco_count_monthly", db_url, db_name,
+						db_pass);
+				
+				query="select rco_count FROM daily_rco_count_monthly "
+						+ " where sno >= "+snoRange[0]+" and sno <= "+snoRange[1]+" "
+						+" and DATE_FORMAT(data_processing_date,'%Y-%m-%d')=DATE_FORMAT('"+date+"','%Y-%m-%d') "
+						+ " group by rco_count";
+				
+				
+				pu.sop("Query API Log: getMRDfromRCO_count ", query);
+			
+				conn = new com.fapps.db.MySQLConnection().getConnection(db_url, db_name, db_pass);
+				stmt = conn.createStatement();
+				rs = stmt.executeQuery(query);
+				rs.last();
+				rowCount = rs.getRow();
+				rs.beforeFirst();
+			
+				pu.sop("Row Count", "Total rows:[" + rowCount + "]");
+			
+				if (rowCount > 0) {
+			
+					String[] sourceTableColumns = new String[1];
+			
+					pu.sop("Column Count", "Total Columns:[" + sourceTableColumns.length + "]");
+			
+					data = new HashMap<String, String[]>();
+					// data[0] = new String[sourceTableColumns.length];
+					int colNumber = 0;
+					String[] tableData = null;
+			
+					while (rs.next()) {
+						colNumber = 0;
+						// tableData="";
+						tableData = new String[sourceTableColumns.length];
+						tableData[0]= rs.getString("rco_count");
+						
+						data.put(rs.getString("rco_count"), tableData);
+			
+					}
+			
+				}
+			}
+				catch (Exception ex) {
+					System.out.println("EXCEPTION JAR: getMRDfromRCO_count: " + ex.toString());
+					data = null;
+					ex.printStackTrace();
+				} finally {
+					try {
+						if (conn != null) {
+							if (rs != null)
+								rs.close();
+							if (stmt != null)
+								stmt.close();
+							conn.close();
+						}
+					} catch (Exception e) {
+					}
+				}
+				return data;
+}
+	
+
+
+	
+	
+}

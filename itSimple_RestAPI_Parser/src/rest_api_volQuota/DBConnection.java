@@ -1,0 +1,84 @@
+package rest_api_volQuota;
+
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.Statement;
+import java.sql.ResultSet;
+
+public class DBConnection {
+
+    // Update these as needed for your MySQL setup
+    private static final String URL = "jdbc:mysql://localhost:3306/pview";
+    private static final String USER = "root";
+    private static final String PASS = "admin@321";
+
+    public static void insertEnterpriseDetail(
+            String enterpriseName, String username, String password,
+            String confirmPassword, String accessKey, String secretKey,
+            String bucketName, String userQuota) {
+
+        Connection conn = null;
+        Statement stmt = null;
+        PreparedStatement pstmt = null;
+        ResultSet rs = null;
+
+        try {
+            Class.forName("com.mysql.jdbc.Driver"); // MySQL driver for Java 7
+            conn = DriverManager.getConnection(URL, USER, PASS);
+            stmt = conn.createStatement();
+
+            // Create table if it doesn't exist
+            String createTableSQL = "CREATE TABLE IF NOT EXISTS enterprise_detail (" +
+                    "id INT AUTO_INCREMENT PRIMARY KEY," +
+                    "enterprise_name VARCHAR(255)," +
+                    "username VARCHAR(255)," +
+                    "password VARCHAR(255)," +
+                    "confirm_password VARCHAR(255)," +
+                    "access_key VARCHAR(255)," +
+                    "secret_key VARCHAR(255)," +
+                    "bucket_name VARCHAR(255)," +
+                    "user_quota VARCHAR(100)," +
+                    "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP" +
+                    ");";
+            stmt.execute(createTableSQL);
+
+            // Insert record
+            String insertSQL = "INSERT INTO enterprise_detail " +
+                    "(enterprise_name, username, password, confirm_password, access_key, secret_key, bucket_name, user_quota) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+
+            pstmt = conn.prepareStatement(insertSQL, Statement.RETURN_GENERATED_KEYS);
+            pstmt.setString(1, enterpriseName);
+            pstmt.setString(2, username);
+            pstmt.setString(3, password);
+            pstmt.setString(4, confirmPassword);
+            pstmt.setString(5, accessKey);
+            pstmt.setString(6, secretKey);
+            pstmt.setString(7, bucketName);
+            pstmt.setString(8, userQuota);
+
+            int rows = pstmt.executeUpdate();
+            if (rows > 0) {
+                rs = pstmt.getGeneratedKeys();
+                if (rs.next()) {
+                    int id = rs.getInt(1);
+                    System.out.println("[DB] Record inserted successfully into enterprise_detail, ID: " + id);
+                } else {
+                    System.out.println("[DB] Record inserted successfully into enterprise_detail");
+                }
+            } else {
+                System.out.println("[DB] Record insertion failed.");
+            }
+
+        } catch (Exception e) {
+            System.out.println("[DB] Database error:");
+            e.printStackTrace();
+        } finally {
+            try { if (rs != null) rs.close(); } catch (Exception ignored) {}
+            try { if (pstmt != null) pstmt.close(); } catch (Exception ignored) {}
+            try { if (stmt != null) stmt.close(); } catch (Exception ignored) {}
+            try { if (conn != null) conn.close(); } catch (Exception ignored) {}
+        }
+    }
+}

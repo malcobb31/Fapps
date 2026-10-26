@@ -1,0 +1,356 @@
+package ip_parser_v1;
+
+import java.io.*;
+import java.sql.*;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.regex.*;
+
+/**
+ * Parses raw ALERT log lines from CSV_TO_PSQL and writes per-table summary rows
+ * into a user-specified DB table.
+ *
+ * Usage (example):
+ *   java -jar ip_parser.jar "/path/csv_import2025-09-24.txt" "ip_parser" "jdbc:mysql://localhost:3306/pview" "root" "admin@321" "127.0.0.1"
+ */
+public class ip_parser_methods {
+
+    private final String processName = "IP_PARSER";
+    private final String processVersion = "1.0.0";
+    private final DateTimeFormatter TS_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    public class TableSummary {
+        public String processName;
+        public String serverIP;
+        public LocalDateTime processStart;
+        public LocalDateTime processEnd;
+        public String tableName;
+        public LocalDateTime tableStart;
+        public LocalDateTime tableEnd;
+        public int totalFiles = 0;
+        public int filesSuccess = 0;
+        public int filesFailed = 0;
+        public String tableStatus;
+        public String processStatus;
+        public int durationSeconds;
+    }
+
+    private void log(String level, String evtType, String message, String serverIP) {
+        String now = LocalDateTime.now().format(TS_FMT);
+        System.out.printf("ALERT - %s --> Process_Name:%s Server_IP:%s Process_Version:%s Log_Level:%s EVT_Type:%s Description:%s%n",
+                now, processName, serverIP, processVersion, level, evtType, message);
+    }
+
+    // Validate DB table identifier (basic)
+    private boolean isValidIdentifier(String t) {
+        return t != null && t.matches("[A-Za-z0-9_]+");
+    }
+
+    // Extract timestamp string between "ALERT - " and " -->"
+    private LocalDateTime extractTimestamp(String line) {
+        try {
+            int start = line.indexOf("ALERT - ");
+            int arrow = line.indexOf("-->");
+            if (start >= 0 && arrow > start) {
+                String ts = line.substring(start + 8, arrow).trim();
+                return LocalDateTime.parse(ts, TS_FMT);
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private String extractKey(String line, String key) {
+        // e.g. key = "EVT_Type" -> looks for EVT_Type:VALUE (VALUE no whitespace)
+        Pattern p = Pattern.compile(key + ":([^\\s]+)");
+        Matcher m = p.matcher(line);
+        if (m.find()) return m.group(1).trim();
+        return null;
+    }
+
+    private String extractDesc(String line) {
+        int idx = line.indexOf("Description:");
+        if (idx >= 0) {
+            return line.substring(idx + "Description:".length()).trim();
+        }
+        return "";
+    }
+
+    private String extractTableFromLine(String line) {
+        // look for Table:<tableName>
+        Pattern p = Pattern.compile("Table:([^\\s,]+)");
+        Matcher m = p.matcher(line);
+        if (m.find()) return m.group(1).trim();
+        return null;
+    }
+
+    private Integer extractIntFromDesc(String desc, String key) {
+        Pattern p = Pattern.compile(key + ":\\s*([0-9]+)");
+        Matcher m = p.matcher(desc);
+        if (m.find()) return Integer.parseInt(m.group(1));
+        return null;
+    }
+
+    /**
+     * Ensure the target DB table exists and has required columns; if some columns missing, add them.
+     */
+    private void ensureTableSchema(Connection conn, String table) throws SQLException {
+        // list of required columns -> SQL definition (MySQL-friendly types)
+        LinkedHashMap<String, String> req = new LinkedHashMap<>();
+        req.put("process_name", "VARCHAR(100)");
+        req.put("server_ip", "VARCHAR(50)");
+        req.put("process_start", "TIMESTAMP NULL");
+        req.put("process_end", "TIMESTAMP NULL");
+        req.put("table_name", "VARCHAR(100)");
+        req.put("table_start", "TIMESTAMP NULL");
+        req.put("table_end", "TIMESTAMP NULL");
+        req.put("total_files", "INT DEFAULT 0");
+        req.put("files_success", "INT DEFAULT 0");
+        req.put("files_failed", "INT DEFAULT 0");
+        req.put("table_status", "VARCHAR(20)");
+        req.put("process_status", "VARCHAR(20)");
+        req.put("duration_seconds", "INT DEFAULT 0");
+
+        DatabaseMetaData md = conn.getMetaData();
+        // MySQL is case-insensitive; use supplied table name as given.
+        ResultSet cols = md.getColumns(null, null, table, null);
+        Set<String> existing = new HashSet<>();
+        while (cols.next()) {
+            existing.add(cols.getString("COLUMN_NAME").toLowerCase());
+        }
+        cols.close();
+
+        try (Statement s = conn.createStatement()) {
+            if (existing.isEmpty()) {
+                // Table might not exist, create with all columns
+                StringBuilder create = new StringBuilder();
+                create.append("CREATE TABLE IF NOT EXISTS `").append(table).append("` (");
+                create.append("id INT AUTO_INCREMENT PRIMARY KEY, ");
+                boolean first = true;
+                for (Map.Entry<String, String> e : req.entrySet()) {
+                    if (!first) create.append(", ");
+                    create.append("`").append(e.getKey()).append("` ").append(e.getValue());
+                    first = false;
+                }
+                create.append(")");
+                s.execute(create.toString());
+                return;
+            }
+
+            // Add missing columns
+            for (Map.Entry<String, String> e : req.entrySet()) {
+                if (!existing.contains(e.getKey().toLowerCase())) {
+                    String alter = "ALTER TABLE `" + table + "` ADD COLUMN `" + e.getKey() + "` " + e.getValue();
+                    s.execute(alter);
+                }
+            }
+        }
+    }
+
+    /**
+     * Main parsing + DB insert function
+     *
+     * @param logFilePath   path to CSV_TO_PSQL log file (raw ALERT lines)
+     * @param targetTable   DB table to insert summary rows into (must be identifier)
+     * @param dbUrl
+     * @param dbUser
+     * @param dbPass
+     * @param serverIP      server ip used in log lines for parser logging
+     */
+    public void parseFile(String logFilePath, String targetTable, String dbUrl, String dbUser, String dbPass, String serverIP) {
+        if (!isValidIdentifier(targetTable)) {
+            log("ERROR", "INVALID_ARG", "Invalid target table name: " + targetTable, serverIP);
+            return;
+        }
+
+        LocalDateTime globalProcessStart = null;
+        LocalDateTime globalProcessEnd = null;
+
+        // Map of tableName -> summary
+        Map<String, TableSummary> summaries = new LinkedHashMap<>();
+
+        log("INFO", "PROCESS_START", "IP Parser started (parsing CSV_TO_PSQL logs): " + logFilePath, serverIP);
+
+        // Read file line-by-line and extract events
+        try (BufferedReader br = new BufferedReader(new FileReader(logFilePath))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+
+                LocalDateTime ts = extractTimestamp(line);
+                String evt = extractKey(line, "EVT_Type"); // e.g. TABLE_START, PSQL_IMPORT_SUCCESS
+                String desc = extractDesc(line);
+                String lowerDesc = desc.toLowerCase();
+
+                // update global process start/end
+                if ("PROCESS_START".equalsIgnoreCase(evt)) {
+                    if (globalProcessStart == null && ts != null) globalProcessStart = ts;
+                } else if ("PROCESS_END".equalsIgnoreCase(evt)) {
+                    if (ts != null) globalProcessEnd = ts;
+                }
+
+                // try get table name from the line
+                String tableFromLine = extractTableFromLine(line); // e.g. your_table_name
+
+                // if no table in this line, skip table-specific increments except for process-level events
+                if (tableFromLine != null) {
+                    summaries.putIfAbsent(tableFromLine, new TableSummary());
+                    TableSummary s = summaries.get(tableFromLine);
+                    s.processName = processName;
+                    s.serverIP = serverIP;
+                    s.tableName = tableFromLine;
+                    if (s.processStart == null && globalProcessStart != null) s.processStart = globalProcessStart;
+
+                    // TABLE_START
+                    if ("TABLE_START".equalsIgnoreCase(evt)) {
+                        if (s.tableStart == null) s.tableStart = (ts != null ? ts : LocalDateTime.now());
+                    }
+
+                    // FILE_START -> counts as total file for that table
+                    if ("FILE_START".equalsIgnoreCase(evt)) {
+                        s.totalFiles++;
+                    }
+
+                    // PSQL_IMPORT_SUCCESS -> file successful
+                    if ("PSQL_IMPORT_SUCCESS".equalsIgnoreCase(evt)) {
+                        s.filesSuccess++;
+                        // sometimes FILE_START not counted earlier; ensure totalFiles at least success+failed
+                        s.totalFiles = Math.max(s.totalFiles, s.filesSuccess + s.filesFailed);
+                    }
+
+                    // CSV_DETAILS might indicate file metadata -> count as a processed file (defensive)
+                    if ("CSV_DETAILS".equalsIgnoreCase(evt)) {
+                        // if FILE_START not present, still consider a file discovered/processed
+                        s.totalFiles = Math.max(s.totalFiles, s.totalFiles); // noop; kept for clarity
+                    }
+
+                    // Errors / failures
+                    if (evt != null && (evt.toUpperCase().contains("ERROR") || evt.toUpperCase().contains("FAILED") || evt.toUpperCase().contains("FILE_ERROR"))) {
+                        s.filesFailed++;
+                        s.totalFiles = Math.max(s.totalFiles, s.filesSuccess + s.filesFailed);
+                    } else if (lowerDesc.contains("failed") || lowerDesc.contains("error")) {
+                        s.filesFailed++;
+                        s.totalFiles = Math.max(s.totalFiles, s.filesSuccess + s.filesFailed);
+                    }
+
+                    // TABLE_END -> parse Files_Processed and Status if present
+                    if ("TABLE_END".equalsIgnoreCase(evt)) {
+                        if (ts != null) s.tableEnd = ts;
+                        Integer filesProcessed = extractIntFromDesc(desc, "Files_Processed");
+                        if (filesProcessed != null) s.totalFiles = Math.max(s.totalFiles, filesProcessed);
+                        // status in description
+                        Pattern st = Pattern.compile("Status:\\s*([^\\s,]+)", Pattern.CASE_INSENSITIVE);
+                        Matcher m = st.matcher(desc);
+                        if (m.find()) {
+                            s.tableStatus = m.group(1).trim();
+                        } else {
+                            s.tableStatus = (s.filesFailed > 0) ? "Failed" : "Success";
+                        }
+                    }
+                } else {
+                    // No table in this line: maybe FILE_DISCOVERY or TABLE_FETCH etc. Try to capture process level info.
+                    if ("FILE_DISCOVERY".equalsIgnoreCase(evt) || "FILE_GROUPING".equalsIgnoreCase(evt)) {
+                        // not table-specific; ignore for now (we count files per-table)
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log("ERROR", "CSV_READ_FAIL", "Failed to read log file: " + e.getMessage(), serverIP);
+            // If file cannot be read, create placeholder summary row with failure and insert below
+        }
+
+        // finalize process-level timestamps if null
+        if (globalProcessStart == null) globalProcessStart = LocalDateTime.now();
+        if (globalProcessEnd == null) globalProcessEnd = LocalDateTime.now();
+
+        // Compute final fields for each summary
+        boolean anyFailed = false;
+        for (TableSummary s : summaries.values()) {
+            if (s.tableStart == null) s.tableStart = s.processStart != null ? s.processStart : globalProcessStart;
+            if (s.tableEnd == null) s.tableEnd = globalProcessEnd;
+            if (s.processStart == null) s.processStart = globalProcessStart;
+            s.processEnd = globalProcessEnd;
+            s.durationSeconds = (int) Duration.between(s.tableStart, s.tableEnd).getSeconds();
+            if (s.tableStatus == null) s.tableStatus = (s.filesFailed > 0 ? "Failed" : "Success");
+            s.processStatus = (s.filesFailed > 0 ? "Failed" : "Success");
+            if ("Failed".equalsIgnoreCase(s.tableStatus) || s.filesFailed > 0) anyFailed = true;
+        }
+
+        // If no table rows found (empty summaries), create a placeholder summary for the provided table name
+        if (summaries.isEmpty()) {
+            TableSummary s = new TableSummary();
+            s.processName = processName;
+            s.serverIP = serverIP;
+            s.processStart = globalProcessStart;
+            s.processEnd = globalProcessEnd;
+            s.tableName = targetTable;
+            s.tableStart = globalProcessStart;
+            s.tableEnd = globalProcessEnd;
+            s.totalFiles = 0;
+            s.filesSuccess = 0;
+            s.filesFailed = 0;
+            s.tableStatus = "Failed";
+            s.processStatus = "Failed";
+            s.durationSeconds = (int) Duration.between(s.tableStart, s.tableEnd).getSeconds();
+            summaries.put(targetTable, s);
+            anyFailed = true;
+        }
+
+        String overallProcessStatus = anyFailed ? "Failed" : "Success";
+
+        // Insert summaries into DB; ensure schema exists and add missing columns
+        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass)) {
+            ensureTableSchema(conn, targetTable);
+
+            String insertSQL = "INSERT INTO `" + targetTable + "` " +
+                    "(process_name, server_ip, process_start, process_end, table_name, table_start, table_end, " +
+                    " total_files, files_success, files_failed, table_status, process_status, duration_seconds) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+            try (PreparedStatement ps = conn.prepareStatement(insertSQL)) {
+                for (TableSummary s : summaries.values()) {
+                    ps.setString(1, s.processName);
+                    ps.setString(2, s.serverIP);
+                    if (s.processStart != null) ps.setTimestamp(3, Timestamp.valueOf(s.processStart)); else ps.setNull(3, Types.TIMESTAMP);
+                    if (s.processEnd != null) ps.setTimestamp(4, Timestamp.valueOf(s.processEnd)); else ps.setNull(4, Types.TIMESTAMP);
+                    ps.setString(5, s.tableName);
+                    if (s.tableStart != null) ps.setTimestamp(6, Timestamp.valueOf(s.tableStart)); else ps.setNull(6, Types.TIMESTAMP);
+                    if (s.tableEnd != null) ps.setTimestamp(7, Timestamp.valueOf(s.tableEnd)); else ps.setNull(7, Types.TIMESTAMP);
+                    ps.setInt(8, s.totalFiles);
+                    ps.setInt(9, s.filesSuccess);
+                    ps.setInt(10, s.filesFailed);
+                    ps.setString(11, s.tableStatus);
+                    ps.setString(12, s.processStatus != null ? s.processStatus : overallProcessStatus);
+                    ps.setInt(13, s.durationSeconds);
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+
+            log("INFO", "DB_INSERT", "Inserted " + summaries.size() + " summary row(s) into " + targetTable, serverIP);
+        } catch (SQLException e) {
+            log("ERROR", "DB_FAIL", "Failed to insert into " + targetTable + ": " + e.getMessage(), serverIP);
+        }
+
+        log("INFO", "PROCESS_END", "IP Parser completed", serverIP);
+
+        // Print human summary to stdout
+        for (TableSummary s : summaries.values()) {
+            System.out.println("---- Summary for table: " + s.tableName + " ----");
+            System.out.println("process_name: " + s.processName);
+            System.out.println("server_ip: " + s.serverIP);
+            System.out.println("process_start: " + (s.processStart != null ? s.processStart.format(TS_FMT) : "null"));
+            System.out.println("process_end: " + (s.processEnd != null ? s.processEnd.format(TS_FMT) : "null"));
+            System.out.println("table_start: " + (s.tableStart != null ? s.tableStart.format(TS_FMT) : "null"));
+            System.out.println("table_end: " + (s.tableEnd != null ? s.tableEnd.format(TS_FMT) : "null"));
+            System.out.println("total_files: " + s.totalFiles);
+            System.out.println("files_success: " + s.filesSuccess);
+            System.out.println("files_failed: " + s.filesFailed);
+            System.out.println("table_status: " + s.tableStatus);
+            System.out.println("process_status: " + s.processStatus);
+            System.out.println("duration_seconds: " + s.durationSeconds);
+            System.out.println("-------------------------------------------");
+        }
+    }
+}

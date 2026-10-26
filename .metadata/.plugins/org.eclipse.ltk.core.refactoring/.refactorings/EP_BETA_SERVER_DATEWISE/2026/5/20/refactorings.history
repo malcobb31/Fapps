@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename package &apos;ep_beta&apos; to &apos;ep_beta_v1&apos;&#x0D;&#x0A;- Original project: &apos;EP_BETA_SERVER_DATEWISE&apos;&#x0D;&#x0A;- Original element: &apos;EP_BETA_SERVER_DATEWISE/src/ep_beta&apos;&#x0D;&#x0A;- Renamed element: &apos;EP_BETA_SERVER_DATEWISE/src/ep_beta_v1&apos;&#x0D;&#x0A;- Update references to refactored element&#x0D;&#x0A;- Update textual occurrences in comments and strings" description="Rename package &apos;ep_beta&apos;" flags="589830" hierarchical="false" id="org.eclipse.jdt.ui.rename.package" input="/src&lt;ep_beta" name="ep_beta_v1" qualified="false" references="true" stamp="1778491147846" textual="false" version="1.0"/>
+</session>

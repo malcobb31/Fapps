@@ -1,0 +1,90 @@
+package rest_api_volQuota;
+
+import java.sql.*;
+
+public class DBConnection {
+
+    // Change these to your DB credentials / DB name
+    private static final String URL = "jdbc:mysql://localhost:3306/your_db?useSSL=false&allowPublicKeyRetrieval=true";
+    private static final String USER = "root";
+    private static final String PASS = "your_password";
+
+    public DBConnection() {
+        // Ensure table exists on instantiation
+        createEnterpriseDetailIfNotExists();
+    }
+
+    /**
+     * Create enterprise_detail table if it doesn't exist (DROP/CREATE was requested earlier,
+     * but to be safer, we create only if not exists).
+     */
+    private void createEnterpriseDetailIfNotExists() {
+        String sql = "CREATE TABLE IF NOT EXISTS enterprise_detail ("
+                   + "id INT AUTO_INCREMENT PRIMARY KEY,"
+                   + "enterprise_id INT,"
+                   + "enterprise_name VARCHAR(255),"
+                   + "s3_path VARCHAR(255),"
+                   + "volume_quota VARCHAR(255),"
+                   + "disk_path VARCHAR(255),"
+                   + "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                   + ")";
+
+        try (Connection conn = getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.execute(sql);
+            System.out.println("[DB] Verified / created table enterprise_detail.");
+        } catch (SQLException e) {
+            System.out.println("[DB ERROR] createEnterpriseDetailIfNotExists(): " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Insert enterprise details as required.
+     * enterpriseId may be null - handled accordingly.
+     */
+    public void insertEnterpriseDetails(String enterpriseIdStr, String enterpriseName, String s3Path,
+                                        String volumeQuota, String diskPath) {
+        Integer enterpriseId = null;
+        try {
+            if (enterpriseIdStr != null) enterpriseId = Integer.parseInt(enterpriseIdStr);
+        } catch (NumberFormatException ignored) { /* keep null */ }
+
+        insertEnterpriseDetails(enterpriseId, enterpriseName, s3Path, volumeQuota, diskPath);
+    }
+
+    public void insertEnterpriseDetails(Integer enterpriseId, String enterpriseName, String s3Path,
+                                        String volumeQuota, String diskPath) {
+        String sql = "INSERT INTO enterprise_detail (enterprise_id, enterprise_name, s3_path, volume_quota, disk_path) VALUES (?, ?, ?, ?, ?)";
+
+        try (Connection conn = getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+
+            if (enterpriseId != null) ps.setInt(1, enterpriseId);
+            else ps.setNull(1, Types.INTEGER);
+
+            ps.setString(2, enterpriseName);
+            ps.setString(3, s3Path);
+            ps.setString(4, volumeQuota);
+            ps.setString(5, diskPath);
+
+            int rows = ps.executeUpdate();
+            System.out.println("[DB] Inserted " + rows + " row(s) into enterprise_detail for enterprise_name=" + enterpriseName);
+        } catch (SQLException e) {
+            System.out.println("[DB ERROR] insertEnterpriseDetails(): " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    // Helper to obtain DB connection
+    private Connection getConnection() throws SQLException {
+        // ensure driver is loaded (driver jar required on classpath)
+        try {
+            Class.forName("com.mysql.cj.jdbc.Driver");
+        } catch (ClassNotFoundException e) {
+            // older driver classname:
+            try { Class.forName("com.mysql.jdbc.Driver"); } catch (ClassNotFoundException ignored) {}
+        }
+        return DriverManager.getConnection(URL, USER, PASS);
+    }
+}

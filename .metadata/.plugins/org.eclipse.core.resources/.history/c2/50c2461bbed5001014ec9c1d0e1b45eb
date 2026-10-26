@@ -1,0 +1,335 @@
+package url_parserV1;
+
+import org.openqa.selenium.*;
+import org.openqa.selenium.chrome.ChromeDriver;
+import org.openqa.selenium.chrome.ChromeOptions;
+import org.openqa.selenium.support.ui.ExpectedConditions;
+import org.openqa.selenium.support.ui.WebDriverWait;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.time.Duration;
+import java.util.Base64;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Scanner;
+
+public class url_parser_methods_full {
+	
+	public static void main(String[] args) throws Exception {
+		
+		MainMethods(args[0]);
+	}
+	
+    public static void MainMethods(String order_id) throws Exception {
+
+        System.setProperty("webdriver.chrome.driver", "C:\\chromedriver\\chromedriver.exe");
+
+        ChromeOptions options = new ChromeOptions();
+        options.addArguments("--headless=new");
+        options.addArguments("--remote-allow-origins=*");
+        options.addArguments("--disable-notifications");
+        options.addArguments("--window-size=1920,1080");
+        options.addArguments("--no-sandbox");
+        options.addArguments("--disable-dev-shm-usage");
+        options.setAcceptInsecureCerts(true);
+
+        Map<String, Object> prefs = new HashMap<>();
+        prefs.put("download.default_directory", "C:\\Users\\User\\Downloads");
+        prefs.put("download.prompt_for_download", false);
+        prefs.put("download.directory_upgrade", true);
+        prefs.put("safebrowsing.enabled", true);
+        options.setExperimentalOption("prefs", prefs);
+
+        WebDriver driver = new ChromeDriver(options);
+        WebDriverWait wait = new WebDriverWait(driver, 15);
+        Scanner scanner = new Scanner(System.in);
+
+        driver.get("https://ocbms.dot.gov.in/#/login-page");
+
+        WebElement userIdField = wait.until(
+                ExpectedConditions.visibilityOfElementLocated(By.cssSelector("input[formcontrolname='email']"))
+        );
+        userIdField.sendKeys("nttin.escalation.manager@global.ntt");
+
+        wait.until(ExpectedConditions.elementToBeClickable(By.xpath("//button[contains(., 'Submit')]"))).click();
+
+        WebElement passwordField = wait.until(
+                ExpectedConditions.visibilityOfElementLocated(By.cssSelector("input[placeholder='Enter password']"))
+        );
+        passwordField.sendKeys("Microf@cus@1234");
+
+       
+        WebElement captchaImg = wait.until(
+                ExpectedConditions.presenceOfElementLocated(By.xpath("//img[contains(@src, 'data:image')]"))
+        );
+
+        String src = captchaImg.getAttribute("src");
+        String base64Image = src.split(",")[1];
+
+        byte[] imageBytes = Base64.getDecoder().decode(base64Image);
+        File captchaFile = new File("captcha.png");
+        try (FileOutputStream fos = new FileOutputStream(captchaFile)) {
+            fos.write(imageBytes);
+        }
+        System.out.println("CAPTCHA saved at: " + captchaFile.getAbsolutePath());
+
+       
+        System.out.print("Enter CAPTCHA: ");
+        String captchaText = scanner.nextLine();
+        driver.findElement(By.cssSelector("input[placeholder='Enter captcha']")).sendKeys(captchaText);
+
+       
+        wait.until(ExpectedConditions.elementToBeClickable(By.xpath("//button[contains(., 'Next')]"))).click();
+
+        
+        WebElement otpField = wait.until(
+                ExpectedConditions.visibilityOfElementLocated(By.cssSelector("input[formcontrolname='otp']"))
+        );
+
+        System.out.println("Waiting for OTP from database...");
+
+        String otpFromDB = waitForOTPFromDB();
+
+        if (otpFromDB == null) {
+            System.out.println("ERROR: OTP not found in DB. Exiting.");
+            driver.quit();
+            return;
+        }
+
+        otpField.sendKeys(otpFromDB);
+        System.out.println("OTP Entered Automatically!");
+
+
+        WebElement loginBtn = wait.until(
+                ExpectedConditions.elementToBeClickable(By.cssSelector("div.row.mb-1.px-3.mt-4.float-right button.btn-primary"))
+        );
+        ((JavascriptExecutor) driver).executeScript("arguments[0].scrollIntoView(true);", loginBtn);
+        ((JavascriptExecutor) driver).executeScript("arguments[0].click();", loginBtn);
+
+        System.out.println("Login Successful!");
+
+        
+        wait.until(ExpectedConditions.invisibilityOfElementLocated(By.id("pause")));
+
+        WebElement totalPendingBtn = wait.until(
+                ExpectedConditions.presenceOfElementLocated(By.cssSelector("div.col-auto.icon i.fas.fa-archive"))
+        );
+        ((JavascriptExecutor) driver).executeScript("arguments[0].scrollIntoView(true);", totalPendingBtn);
+        ((JavascriptExecutor) driver).executeScript("arguments[0].click();", totalPendingBtn);
+
+        Thread.sleep(2000); 
+        System.out.print("Enter Order/Notice ID: ");
+        String orderId = scanner.nextLine().trim();
+
+        WebElement searchBox = wait.until(
+                ExpectedConditions.visibilityOfElementLocated(By.cssSelector("#myTable_filter input[type='search']"))
+        );
+        searchBox.clear();
+        searchBox.sendKeys(orderId);
+
+        
+        wait.until(ExpectedConditions.presenceOfElementLocated(By.cssSelector("#myTable tbody tr")));
+        List<WebElement> rows = driver.findElements(By.cssSelector("#myTable tbody tr"));
+        boolean found = false;
+
+        for (WebElement row : rows) {
+            try {
+                WebElement orderLink = row.findElement(By.cssSelector("a.regclickpreview"));
+                String dataOrderId = orderLink.getText().trim();
+
+                if (dataOrderId.equalsIgnoreCase(orderId)) {
+                    System.out.println("Order ID found " + dataOrderId);
+                    ((JavascriptExecutor) driver).executeScript("arguments[0].scrollIntoView(true);", orderLink);
+                    ((JavascriptExecutor) driver).executeScript("arguments[0].click();", orderLink);
+                    found = true;
+                    break;
+                }
+            } catch (Exception ignore) { }
+        }
+
+        if (!found) {
+            System.out.println("ERROR: Order ID NOT FOUND in table: " + orderId);
+            driver.quit();
+            return;
+        }
+
+//        wait.until(ExpectedConditions.visibilityOfElementLocated(By.cssSelector("div.col-auto.icon i.fas.fa-archive")));
+
+     // Wait for radio buttons to become clickable (Angular load)
+        String statusType = "unknown";
+
+        try {
+        	
+
+        	// Wait for modal to appear
+        	wait.until(ExpectedConditions.visibilityOfElementLocated(
+        	    By.cssSelector("app-preview .modal-dialog")
+        	));
+
+        	// Wait for the radio labels to load (ensures Angular finished rendering)
+        	wait.until(ExpectedConditions.visibilityOfElementLocated(
+        	    By.xpath("//label[@for='blocking']")
+        	));
+
+            WebElement blockInput = driver.findElement(By.id("blocking"));
+            WebElement unblockInput = driver.findElement(By.id("unblocking"));
+
+            Thread.sleep(200); // give Angular time to render
+
+            boolean isBlock =
+                "true".equals(blockInput.getAttribute("checked")) ||
+                blockInput.isSelected();
+
+            boolean isUnblock =
+                "true".equals(unblockInput.getAttribute("checked")) ||
+                unblockInput.isSelected();
+
+            if (isBlock) statusType = "blocking";
+            else if (isUnblock) statusType = "unblocking";
+            else statusType = "unknown";
+
+        } catch (Exception e) {
+            System.out.println("Request type detection failed: " + e.getMessage());
+            statusType = "unknown";
+        }
+
+        System.out.println("Detected Request Type = " + statusType);
+
+   
+      
+       
+        WebElement exportButton = wait.until(
+                ExpectedConditions.elementToBeClickable(By.cssSelector("span.btn-export"))
+        );
+        ((JavascriptExecutor) driver).executeScript("arguments[0].scrollIntoView(true);", exportButton);
+        ((JavascriptExecutor) driver).executeScript("arguments[0].click();", exportButton);
+
+        System.out.println("Export clicked. Waiting for download...");
+        Thread.sleep(6000); 
+      
+       
+        File downloadDir = new File("C:\\Users\\User\\Downloads");
+        File[] files = downloadDir.listFiles();
+        File latestCSV = null;
+        long lastModified = Long.MIN_VALUE;
+
+        if (files != null) {
+            for (File f : files) {
+                if (f.isFile() && f.getName().toLowerCase().endsWith(".xls")) {
+                    if (f.lastModified() > lastModified) {
+                        lastModified = f.lastModified();
+                        latestCSV = f;
+                    }
+                }
+            }
+        }
+
+        if (latestCSV != null) {
+            File renamed = new File(downloadDir, orderId + "_" + statusType + ".xls");
+            if (latestCSV.renameTo(renamed)) {
+                System.out.println("File Renamed To: " + renamed.getAbsolutePath());
+            } else {
+                System.out.println("ERROR: Could not rename file!");
+            }
+        } else {
+            System.out.println("No CSV file found in Downloads!");
+        }
+
+        try {
+            WebElement closeBtn = wait.until(
+                    ExpectedConditions.elementToBeClickable(By.xpath("//button[contains(text(), 'Close')]"))
+            );
+            ((JavascriptExecutor) driver).executeScript("arguments[0].scrollIntoView(true);", closeBtn);
+            ((JavascriptExecutor) driver).executeScript("arguments[0].click();", closeBtn);
+        } catch (Exception e) {
+            System.out.println("Popup close button not found.");
+        }
+
+        driver.quit();
+        System.out.println(" Script Completed Successfully.");
+    }
+//    MEHTODS   
+    
+    public static String waitForOTPFromDB() {
+        String url = "jdbc:mysql://localhost:3306/pview";
+        String user = "root";            
+        String pass = "Admin@321";        
+
+        int maxAttempts = 10;            // default
+        int waitSeconds = 15;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            System.out.println("Checking OTP in DB... Attempt " + attempt);
+
+            try (Connection conn = DriverManager.getConnection(url, user, pass)) {
+
+                String selectQuery =
+                    "SELECT sno, OTP FROM otp_table WHERE otp_read_status='P' ORDER BY sno DESC LIMIT 1";
+
+                PreparedStatement ps = conn.prepareStatement(selectQuery);
+                ResultSet rs = ps.executeQuery();
+
+                if (rs.next()) {
+                    int sno = rs.getInt("sno");
+                    String otp = rs.getString("OTP");
+
+                    
+                    String updateQuery =
+                        "UPDATE otp_table SET otp_read_status='D' WHERE sno=?";
+                    PreparedStatement ps2 = conn.prepareStatement(updateQuery);
+                    ps2.setInt(1, sno);
+                    ps2.executeUpdate();
+
+                    System.out.println("OTP FOUND: " + otp + " (sno = " + sno + ")");
+                    return otp;
+                }
+
+            } catch (Exception e) {
+                System.out.println("DB Error: " + e.getMessage());
+            }
+
+            try { Thread.sleep(waitSeconds * 1000); } catch (InterruptedException ignored) {}
+        }
+
+        System.out.println("NO OTP RECEIVED AFTER MAX ATTEMPTS!");
+        return null;
+    }
+
+
+    public static boolean switchToFrameWithElement(WebDriver driver, By locator) {
+        driver.switchTo().defaultContent();
+        return searchFrames(driver, locator);
+    }
+
+    private static boolean searchFrames(WebDriver driver, By locator) {
+        List<WebElement> frames = driver.findElements(By.tagName("iframe"));
+
+        for (int i = 0; i < frames.size(); i++) {
+            try {
+                driver.switchTo().frame(i);
+
+                // Element found in this frame?
+                if (driver.findElements(locator).size() > 0) {
+                    return true;
+                }
+
+                // Search nested frames inside this frame
+                if (searchFrames(driver, locator)) {
+                    return true;
+                }
+
+                driver.switchTo().parentFrame();
+            } catch (Exception e) {
+                driver.switchTo().parentFrame();
+            }
+        }
+        return false;
+    }
+
+}

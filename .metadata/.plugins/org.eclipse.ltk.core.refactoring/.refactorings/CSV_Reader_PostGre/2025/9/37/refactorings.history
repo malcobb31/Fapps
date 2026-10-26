@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename compilation unit &apos;postgre_ip_v4.postgre_v4_methods.java&apos; to &apos;PostgreV4MethodsTest.java&apos;&#x0D;&#x0A;- Original project: &apos;CSV_Reader_PostGre&apos;&#x0D;&#x0A;- Original element: &apos;postgre_ip_v4.postgre_v4_methods.java&apos;&#x0D;&#x0A;- Renamed element: &apos;postgre_ip_v4.PostgreV4MethodsTest.java&apos;" description="Rename compilation unit &apos;postgre_v4_methods.java&apos;" flags="2" id="org.eclipse.jdt.ui.rename.compilationunit" input="/src&lt;postgre_ip_v4{postgre_v4_methods.java" name="PostgreV4MethodsTest.java" references="false" stamp="1757486285260" version="1.0"/>
+</session>

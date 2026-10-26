@@ -1,0 +1,212 @@
+package delete_process_v2;
+
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+import java.util.List;
+
+/**
+ * delete_process_main_v2
+ *
+ * Driver / entry point for the V2 DELETE synchronizer.
+ *
+ * This mirrors the existing project's main-class shape and connection
+ * handling: it opens the MySQL (trigger/config) and PostgreSQL (target)
+ * connections, loads eligible configurations, and delegates all
+ * processing to delete_process_methods_v2#processConfiguration for each
+ * one. It does not implement any business logic itself -- that lives in
+ * delete_process_methods_v2, exactly as delete_process_main_v1 delegates
+ * to delete_process_methods.
+ *
+ * Connection handling notes (same contract as V1):
+ *
+ *  - delete_process_methods_v2 does NOT open or close connections.
+ *  - This class owns connection lifecycle and is responsible for closing
+ *    both connections when processing finishes or fails.
+ *  - Credentials are expected via configuration/environment, not hardcoded.
+ *    The placeholders below (MYSQL_URL, MYSQL_USER, ... ) should be wired
+ *    to the same configuration source the existing V1 main class uses.
+ */
+public class delete_process_main_v2 {
+
+    /*
+     * Name of the config table driving this run.
+     */
+    private static final String CONFIG_TABLE = "config_delete";
+
+    /*
+     * Batch size for trigger row fetches within a bounded sno range.
+     * Matches the batchSize contract already used by V1's
+     * processConfiguration.
+     */
+    private static final int BATCH_SIZE = 500;
+
+    // -------------------------------------------------------------------
+    // Connection configuration placeholders.
+    //
+    // Wire these to the same source (properties file / env vars / secrets
+    // manager) that the existing delete_process_main (V1) uses. They are
+    // intentionally left as constants here so this file is self-contained
+    // and compiles standalone; replace with the existing project's config
+    // loader if one already exists.
+    // -------------------------------------------------------------------
+
+    private static final String MYSQL_URL =
+            System.getenv().getOrDefault(
+                    "DELETE_PARSER_MYSQL_URL",
+                    "jdbc:mysql://localhost:3306/ckyc"
+            );
+
+    private static final String MYSQL_USER =
+            System.getenv().getOrDefault(
+                    "DELETE_PARSER_MYSQL_USER",
+                    ""
+            );
+
+    private static final String MYSQL_PASSWORD =
+            System.getenv().getOrDefault(
+                    "DELETE_PARSER_MYSQL_PASSWORD",
+                    ""
+            );
+
+    private static final String PSQL_URL =
+            System.getenv().getOrDefault(
+                    "DELETE_PARSER_PSQL_URL",
+                    "jdbc:postgresql://localhost:5432/kyc"
+            );
+
+    private static final String PSQL_USER =
+            System.getenv().getOrDefault(
+                    "DELETE_PARSER_PSQL_USER",
+                    ""
+            );
+
+    private static final String PSQL_PASSWORD =
+            System.getenv().getOrDefault(
+                    "DELETE_PARSER_PSQL_PASSWORD",
+                    ""
+            );
+
+    public static void main(String[] args) {
+
+        /*
+         * Simple stdout/stderr logger implementation. Replace with the
+         * existing project's logger wiring (e.g. slf4j/log4j adapter) if
+         * one is already used by delete_process_main (V1) -- the
+         * delete_process_methods_v2.Logger contract is identical to V1's,
+         * so any existing Logger implementation is compatible as-is.
+         */
+        delete_process_methods.Logger logger =
+                (level, evtType, message) ->
+                        System.out.println(
+                                "[" + level + "] "
+                                        + evtType
+                                        + " - "
+                                        + message
+                        );
+
+        delete_process_methods methods =
+                new delete_process_methods(logger);
+
+        Connection mysqlConn = null;
+        Connection psqlConn = null;
+
+        try {
+
+            mysqlConn = openMysqlConnection();
+            psqlConn = openPsqlConnection();
+
+            /*
+             * Both source-of-truth connections should behave predictably
+             * with respect to auto-commit; per-statement auto-commit
+             * matches the existing V1 processing model, which issues
+             * discrete UPDATE/DELETE statements and relies on its own
+             * checkpoint logic (not DB transactions) for recovery.
+             */
+            mysqlConn.setAutoCommit(true);
+            psqlConn.setAutoCommit(true);
+
+            List<delete_process_methods.ParserConfigV2> configs =
+                    methods.loadEligibleConfigurations(
+                            mysqlConn,
+                            CONFIG_TABLE
+                    );
+
+            logger.log(
+                    "INFO",
+                    "RUN_START",
+                    "Config_Table=" + CONFIG_TABLE
+                            + " Eligible_Configs=" + configs.size()
+                            + " Batch_Size=" + BATCH_SIZE
+            );
+
+            for (delete_process_methods.ParserConfigV2 config : configs) {
+
+                methods.processConfiguration(
+                        mysqlConn,
+                        psqlConn,
+                        CONFIG_TABLE,
+                        config,
+                        BATCH_SIZE
+                );
+            }
+
+            logger.log(
+                    "INFO",
+                    "RUN_COMPLETED",
+                    "Config_Table=" + CONFIG_TABLE
+                            + " Configs_Processed=" + configs.size()
+            );
+
+        } catch (SQLException ex) {
+
+            logger.log(
+                    "ERROR",
+                    "RUN_FAILED",
+                    "Config_Table=" + CONFIG_TABLE
+                            + " Error=" + ex.getMessage()
+            );
+
+        } finally {
+
+            closeQuietly(mysqlConn, logger);
+            closeQuietly(psqlConn, logger);
+        }
+    }
+
+    private static Connection openMysqlConnection() throws SQLException {
+        return DriverManager.getConnection(
+                MYSQL_URL,
+                MYSQL_USER,
+                MYSQL_PASSWORD
+        );
+    }
+
+    private static Connection openPsqlConnection() throws SQLException {
+        return DriverManager.getConnection(
+                PSQL_URL,
+                PSQL_USER,
+                PSQL_PASSWORD
+        );
+    }
+
+    private static void closeQuietly(
+            Connection conn,
+            delete_process_methods.Logger logger) {
+
+        if (conn == null) {
+            return;
+        }
+
+        try {
+            conn.close();
+        } catch (SQLException ex) {
+
+            logger.log(
+                    "WARN",
+                    "CONNECTION_CLOSE_FAILED",
+                    "Error=" + ex.getMessage()
+            );
+        }
+    }
+}

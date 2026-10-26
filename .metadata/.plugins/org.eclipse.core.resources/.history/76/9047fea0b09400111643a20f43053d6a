@@ -1,0 +1,215 @@
+package ktp10_upd_process_v1;
+
+public class ktp10_upd_process_main {
+
+    public static void main(String[] args) {
+        if (args == null || args.length < 6) {
+            ktp10_upd_process_methods.log(
+                    "ERROR",
+                    "fatal_error=invalid_arguments\nusage=inputPath archiveDir outputDir appJdbcUrl appDbUser "
+                            + "kycJdbcUrl kycDbUser serverIP [flushSize]\n"
+                            + "note=appDbPass and kycDbPass are read from APP_DB_PASS and KYC_DB_PASS "
+                            + "environment variables, not from args",
+                    null,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        String inputPath = args[0];
+        String archiveDir = args[1];
+        String outputDir = args[2];
+        String appJdbcUrl = args[3];
+        String appDbUser = args[4];
+        String kycJdbcUrl = args[5];
+
+        String kycDbUser = args.length >= 7 ? args[6] : null;
+        String serverIP = args.length >= 8 ? args[7] : null;
+
+        int flushSize = 50000;
+        if (args.length >= 9) {
+            try {
+                flushSize = Integer.parseInt(args[8]);
+                if (flushSize <= 0) {
+                    ktp10_upd_process_methods.log(
+                            "ERROR",
+                            "fatal_error=invalid_flush_size",
+                            serverIP,
+                            "FATAL_ERROR");
+                    return;
+                }
+            } catch (Exception ex) {
+                ktp10_upd_process_methods.log(
+                        "ERROR",
+                        "fatal_error=invalid_flush_size",
+                        serverIP,
+                        "FATAL_ERROR");
+                return;
+            }
+        }
+
+        if (inputPath == null || inputPath.trim().length() == 0) {
+            ktp10_upd_process_methods.log(
+                    "ERROR",
+                    "fatal_error=missing_input_path",
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (archiveDir == null || archiveDir.trim().length() == 0) {
+            ktp10_upd_process_methods.log(
+                    "ERROR",
+                    "fatal_error=missing_archive_dir",
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (outputDir == null || outputDir.trim().length() == 0) {
+            ktp10_upd_process_methods.log(
+                    "ERROR",
+                    "fatal_error=missing_output_dir",
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (appJdbcUrl == null || appJdbcUrl.trim().length() == 0) {
+            ktp10_upd_process_methods.log(
+                    "ERROR",
+                    "fatal_error=missing_app_jdbc_url",
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (appDbUser == null || appDbUser.trim().length() == 0) {
+            ktp10_upd_process_methods.log(
+                    "ERROR",
+                    "fatal_error=missing_app_db_user",
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        // Password is intentionally NOT an arg: ps/proc listing and shell
+        // history would expose it in plaintext for the life of the process
+        // and beyond. Read from environment instead.
+        String appDbPass = System.getenv("APP_DB_PASS");
+        if (appDbPass == null || appDbPass.trim().length() == 0) {
+            ktp10_upd_process_methods.log(
+                    "ERROR",
+                    "fatal_error=missing_app_db_pass env_var=APP_DB_PASS",
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        String kycDbPass = null;
+        boolean kycConfigured = kycJdbcUrl != null && kycJdbcUrl.trim().length() > 0;
+        if (kycConfigured) {
+            if (kycDbUser == null || kycDbUser.trim().length() == 0) {
+                ktp10_upd_process_methods.log(
+                        "ERROR",
+                        "fatal_error=missing_kyc_db_user",
+                        serverIP,
+                        "FATAL_ERROR");
+                return;
+            }
+
+            kycDbPass = System.getenv("KYC_DB_PASS");
+            if (kycDbPass == null || kycDbPass.trim().length() == 0) {
+                ktp10_upd_process_methods.log(
+                        "ERROR",
+                        "fatal_error=missing_kyc_db_pass env_var=KYC_DB_PASS",
+                        serverIP,
+                        "FATAL_ERROR");
+                return;
+            }
+        }
+
+        java.io.File input = new java.io.File(inputPath);
+        java.io.File archive = new java.io.File(archiveDir);
+        java.io.File output = new java.io.File(outputDir);
+
+        if (!input.exists()) {
+            ktp10_upd_process_methods.log(
+                    "ERROR",
+                    "fatal_error=input_path_not_found path=" + inputPath,
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (!input.canRead()) {
+            ktp10_upd_process_methods.log(
+                    "ERROR",
+                    "fatal_error=input_path_not_readable path=" + inputPath,
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (!archive.exists()) {
+            ktp10_upd_process_methods.log(
+                    "ERROR",
+                    "fatal_error=archive_dir_not_found path=" + archiveDir,
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (!archive.isDirectory()) {
+            ktp10_upd_process_methods.log(
+                    "ERROR",
+                    "fatal_error=archive_path_not_directory path=" + archiveDir,
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (!archive.canWrite()) {
+            ktp10_upd_process_methods.log(
+                    "ERROR",
+                    "fatal_error=archive_dir_not_writable path=" + archiveDir,
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (!output.exists()) {
+            output.mkdirs();
+        }
+
+        if (!output.isDirectory()) {
+            ktp10_upd_process_methods.log(
+                    "ERROR",
+                    "fatal_error=output_path_not_directory path=" + outputDir,
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        if (!output.canWrite()) {
+            ktp10_upd_process_methods.log(
+                    "ERROR",
+                    "fatal_error=output_dir_not_writable path=" + outputDir,
+                    serverIP,
+                    "FATAL_ERROR");
+            return;
+        }
+
+        ktp10_upd_process_methods.process(
+                input,
+                archive,
+                output,
+                appJdbcUrl,
+                appDbUser,
+                appDbPass,
+                kycConfigured ? kycJdbcUrl : null,
+                kycDbUser,
+                kycDbPass,
+                serverIP,
+                flushSize);
+    }
+}

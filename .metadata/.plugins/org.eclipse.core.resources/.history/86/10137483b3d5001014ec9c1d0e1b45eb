@@ -1,0 +1,117 @@
+package url_parserV1;
+
+import net.sourceforge.tess4j.ITesseract;
+import net.sourceforge.tess4j.Tesseract;
+
+import org.bytedeco.opencv.global.opencv_core;
+import org.bytedeco.opencv.global.opencv_imgcodecs;
+import org.bytedeco.opencv.opencv_core.*;
+import org.bytedeco.opencv.global.opencv_imgproc;
+
+import java.io.File;
+
+public class url_parser_methods_login {
+
+    public static void main(String[] args) throws Exception {
+
+        // Load CAPTCHA image
+        Mat img = opencv_imgcodecs.imread("captcha.png");
+
+        // ---- PREPROCESSING PIPELINE ----
+
+        // Convert to HSV (to isolate blue characters)
+        Mat hsv = new Mat();
+        opencv_imgproc.cvtColor(img, hsv, opencv_imgproc.COLOR_BGR2HSV);
+
+        // Blue color range mask (tuned)
+        Scalar lowerBlue = new Scalar(100, 80, 80, 0);
+        Scalar upperBlue = new Scalar(130, 255, 255, 0);
+
+        // Convert bounds to Mat because inRange requires Mat, Mat, Mat, Mat
+        Mat lowerMat = new Mat(hsv.size(), hsv.type(), lowerBlue);
+        Mat upperMat = new Mat(hsv.size(), hsv.type(), upperBlue);
+
+        Mat mask = new Mat();
+        opencv_core.inRange(hsv, lowerMat, upperMat, mask);
+
+        // Remove small noise
+        Mat kernel = opencv_imgproc.getStructuringElement(opencv_imgproc.MORPH_RECT, new Size(3, 3));
+        opencv_imgproc.morphologyEx(mask, mask, opencv_imgproc.MORPH_OPEN, kernel);
+
+        // Strengthen characters
+        opencv_imgproc.dilate(mask, mask, kernel);
+
+        // Save processed image
+        opencv_imgcodecs.imwrite("processed.png", mask);
+
+        // ---- OCR ----
+
+        ITesseract tesseract = new Tesseract();
+
+        // Restrict characters (A–Z, a–z, 0–9)
+        tesseract.setTessVariable("tessedit_char_whitelist",
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789");
+
+        // DPI improves small-text accuracy
+        tesseract.setTessVariable("user_defined_dpi", "300");
+
+        String text = tesseract.doOCR(new File("processed.png")).trim();
+
+        System.out.println("Extracted CAPTCHA: " + text);
+    }
+}
+
+
+//
+//
+//
+//package url_parserV1;
+//
+//import java.io.IOException;
+//import java.nio.file.DirectoryStream;
+//import java.nio.file.Files;
+//import java.nio.file.Path;
+//import java.nio.file.Paths;
+//import java.util.Comparator;
+//import java.util.Optional;
+//import java.util.stream.Stream;
+//
+//public class url_parser_methods_login {
+//
+//    public static void main(String[] args) {
+//
+////        Path downloadDir = Paths.get(System.getProperty("user.home"), "Downloads");
+//      
+//         Path downloadDir = Paths.get("C:\\Users\\User\\Downloads\\NTT");
+//
+//        try {
+//            Optional<Path> latestXlsFileOpt = Files.list(downloadDir)
+//                .filter(p -> p.getFileName().toString().toLowerCase().endsWith(".xls"))
+//                .max(Comparator.comparingLong(p -> {
+//                    try {
+//                        return Files.getLastModifiedTime(p).toMillis();
+//                    } catch (IOException e) {
+//                       
+//                        throw new RuntimeException(e);
+//                    }
+//                }));
+//
+//            if (latestXlsFileOpt.isPresent()) {
+//                Path latestXlsFile = latestXlsFileOpt.get();
+//                Path renamedPath = downloadDir.resolve("123_Blocked.xls");
+//                
+//             
+//                Files.move(latestXlsFile, renamedPath);
+//                
+//                System.out.println("File Renamed To: " + renamedPath.toAbsolutePath());
+//            } else {
+//                System.out.println("No XLS file found in Downloads!");
+//            }
+//
+//        } catch (IOException | RuntimeException e) {
+//            System.err.println("An error occurred during file operation: " + e.getMessage());
+//            e.printStackTrace();
+//        }
+//    }
+//}
+

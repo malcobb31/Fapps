@@ -1,0 +1,344 @@
+package postgre_agent_v2;
+
+import java.io.*;
+import java.nio.file.*;
+import java.sql.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+public class postgre_v2_update {
+
+    private static final String PROCESS_NAME = "CSV_TO_PSQL";
+    private static final String PROCESS_VERSION = "1.1.0";
+
+    private static final DateTimeFormatter LOG_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private static final DateTimeFormatter FILE_TS_FORMAT = DateTimeFormatter.ofPattern("yyyy_MM_dd_HH_mm_ss");
+
+    private static final ConcurrentLinkedQueue<LogRecord> LOG_QUEUE = new ConcurrentLinkedQueue<>();
+    private static final int DEFAULT_THREAD_COUNT = Math.max(1, Runtime.getRuntime().availableProcessors());
+
+    private static class LogRecord {
+        final String timestamp;
+        final String processName;
+        final String processVersion;
+        final String logLevel;
+        final String evtType;
+        final String description;
+
+        LogRecord(String timestamp, String processName, String processVersion, String logLevel, String evtType, String description) {
+            this.timestamp = timestamp;
+            this.processName = processName;
+            this.processVersion = processVersion;
+            this.logLevel = logLevel;
+            this.evtType = evtType;
+            this.description = description;
+        }
+    }
+
+    public static void processAllInDirectory(String dirPath, String processedDirPath, String headerFlag, String delimiter,
+                                             String dbHost, String dbPort, String dbName, String dbUser, String dbPass,
+                                             String pdbHost, String pdbPort, String pdbName, String pdbUser, String pdbPass,
+                                             String numTablesToPickStr, String config_table) {
+
+        int numTablesToPick;
+        try {
+            numTablesToPick = Integer.parseInt(numTablesToPickStr);
+        } catch (NumberFormatException e) {
+            enqueueLog("CRITICAL", "INVALID_TABLE_COUNT", "Invalid number format for tables to pick: " + numTablesToPickStr);
+            flushLogsToStdOut();
+            return;
+        }
+
+        try {
+            // Fetch tables with sync_status = ready_to_import
+            List<String[]> readyTables = new ArrayList<>();
+            String query = "SELECT sno, table_name FROM " + config_table + " WHERE sync_status = 'ready_to_import' LIMIT ?";
+
+            try (Connection conn = DriverManager.getConnection(
+                    "jdbc:mysql://" + dbHost + ":" + dbPort + "/" + dbName,
+                    dbUser, dbPass);
+                 PreparedStatement ps = conn.prepareStatement(query)) {
+                enqueueLog("INFO", "Query_Ran", "Query:" + ps);
+                ps.setInt(1, numTablesToPick);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        readyTables.add(new String[]{rs.getString("sno"), rs.getString("table_name")});
+                    }
+                }
+            }
+
+            if (readyTables.isEmpty()) {
+                enqueueLog("INFO", "NO_READY_TABLES", "No tables found with sync_status=ready_to_import");
+                return;
+            }
+
+            // Load eligible files from dir
+            List<Path> allFiles = Files.list(Paths.get(dirPath))
+                    .filter(p -> {
+                        String fname = p.getFileName().toString();
+                        return (fname.startsWith("raw_") || fname.startsWith("process_")) && fname.endsWith(".csv");
+                    })
+                    .collect(Collectors.toList());
+
+            if (allFiles.isEmpty()) {
+                enqueueLog("INFO", "NO_FILES", "No files to process in directory: " + dirPath);
+                return;
+            }
+
+            // Group files per selected table
+            Map<String, List<Path>> tableFilesMap = new HashMap<>();
+            for (String[] tableEntry : readyTables) {
+                String sno = tableEntry[0];
+                List<Path> matchedFiles = allFiles.stream()
+                        .filter(f -> {
+                            String[] parts = f.getFileName().toString().split("_");
+                            return parts.length > 4 && parts[4].equals(sno);
+                        })
+                        .sorted(Comparator.comparing(p -> {
+                            String fname = p.getFileName().toString();
+                            try {
+                                String[] parts = fname.split("_");
+                                if (parts.length >= 7) {
+                                    String tsStr = String.join("_", Arrays.copyOfRange(parts, parts.length - 6, parts.length))
+                                            .replace(".csv", "");
+                                    return LocalDateTime.parse(tsStr, FILE_TS_FORMAT);
+                                }
+                            } catch (Exception e) {
+                                enqueueLog("MAJOR", "FILENAME_TS_PARSE_FAIL", "File: " + fname + " Error: " + safeMessage(e));
+                            }
+                            return LocalDateTime.now();
+                        }))
+                        .collect(Collectors.toList());
+                tableFilesMap.put(sno, matchedFiles);
+            }
+
+            // Process tables in parallel
+            ExecutorService executor = Executors.newFixedThreadPool(Math.min(numTablesToPick, DEFAULT_THREAD_COUNT));
+            List<Future<?>> futures = new ArrayList<>();
+
+            for (String[] tableEntry : readyTables) {
+                String sno = tableEntry[0];
+                String tableName = tableEntry[1];
+                List<Path> tableFiles = tableFilesMap.getOrDefault(sno, Collections.emptyList());
+
+                futures.add(executor.submit(() -> {
+                    if (tableFiles.isEmpty()) {
+                        enqueueLog("INFO", "TABLE_NO_FILES", "Table: " + tableName + " (SNO: " + sno + ") has no files to process");
+                        updateTableStatus(sno, false, dbHost, dbPort, dbName, dbUser, dbPass, config_table);
+                        return;
+                    }
+
+                    enqueueLog("INFO", "TABLE_PROCESS_START",
+                            "Table: " + tableName + " (SNO: " + sno + ") -> Files to process: " + tableFiles.size());
+
+                    boolean allSuccess = true;
+                    int processedCount = 0;
+                    int failedCount = 0;
+
+                    for (Path file : tableFiles) {
+                        boolean success = process(file.toString(), headerFlag, delimiter, pdbHost, pdbPort, pdbName, pdbUser, pdbPass, config_table);
+                        if (success) {
+                            processedCount++;
+                            enqueueLog("INFO", "TABLE_FILE_PROGRESS",
+                                    "Table: " + tableName + " (SNO: " + sno + ") -> Processed " + processedCount + "/" + tableFiles.size());
+                            moveFile(file, Paths.get(processedDirPath), true);
+                        } else {
+                            failedCount++;
+                            allSuccess = false;
+                            enqueueLog("MAJOR", "TABLE_PARSE_ERROR",
+                                    "Table: " + tableName + " (SNO: " + sno + ") failed on file: " + file.getFileName());
+                            break;
+                        }
+                    }
+
+                    enqueueLog("INFO", "TABLE_PROCESS_END",
+                            "Table: " + tableName + " (SNO: " + sno + ") -> Completed: " + processedCount
+                                    + " | Failed: " + failedCount + " | Total: " + tableFiles.size());
+
+                    updateTableStatus(sno, allSuccess, dbHost, dbPort, dbName, dbUser, dbPass, config_table);
+                    enqueueLog("INFO", "TABLE_STATUS_UPDATE",
+                            "Table: " + tableName + " -> " + (allSuccess ? "Init" : "Error"));
+                }));
+            }
+
+            for (Future<?> f : futures) {
+                try {
+                    f.get();
+                } catch (Exception e) {
+                    enqueueLog("CRITICAL", "THREAD_EXEC_ERROR", e.getMessage());
+                }
+            }
+
+            executor.shutdown();
+
+        } catch (Exception e) {
+            enqueueLog("CRITICAL", "DIRECTORY_PROCESS_ERROR", e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static void updateTableStatus(String sno, boolean allSuccess, String dbHost, String dbPort, String dbName, String dbUser, String dbPass, String config_table) {
+        String status = allSuccess ? "init" : "error"; // Map boolean to status string
+        String Query = "UPDATE " + config_table + " SET sync_status = ? WHERE sno = ?";
+        try (Connection conn = DriverManager.getConnection(
+                "jdbc:mysql://" + dbHost + ":" + dbPort + "/" + dbName,
+                dbUser, dbPass);
+             PreparedStatement ps = conn.prepareStatement(Query)) {
+
+            ps.setString(1, status);
+            ps.setString(2, sno);
+            enqueueLog("INFO", "Updation_Query", "Query:" + ps);
+            ps.executeUpdate();
+        } catch (Exception e) {
+            enqueueLog("MAJOR", "STATUS_UPDATE_FAIL", "SNO: " + sno + " Error: " + safeMessage(e));
+        }
+    }
+
+    public static boolean process(String csvFile, String headerFlag, String delimiter,
+                                  String dbHost, String dbPort, String dbName, String dbUser, String dbPass, String config_table) {
+
+        boolean header = headerFlag.equalsIgnoreCase("yes");
+        String resolvedTable = resolveTableFromCsvName(csvFile, dbHost, dbPort, dbName, dbUser, dbPass, config_table);
+
+        if (resolvedTable == null || resolvedTable.isEmpty()) {
+            enqueueLog("CRITICAL", "TABLE_RESOLVE_FAIL", "CSV_File:" + csvFile + "# Status:InvalidNaming or Schedule Mapping Missing");
+            return false;
+        }
+
+        enqueueLog("INFO", "P_START", "CSV_File:" + csvFile + "# ResolvedTable:" + resolvedTable + "# Host:" + dbHost);
+
+        if (!Files.exists(Paths.get(csvFile))) {
+            enqueueLog("CRITICAL", "CSV_NOT_FOUND", "CSV_File:" + csvFile + "# Status:NotFound");
+            enqueueLog("INFO", "P_END", "CSV_File:" + csvFile + "# Status:Terminated");
+            return false;
+        }
+
+        try {
+            if (!tableExists(dbHost, dbPort, dbName, dbUser, dbPass, resolvedTable)) {
+                enqueueLog("MAJOR", "TABLE_CREATION", "Table:" + resolvedTable + "# Action:Auto-Create");
+                createTableFromCSV(resolvedTable, csvFile, delimiter, dbHost, dbPort, dbName, dbUser, dbPass);
+                enqueueLog("MAJOR", "TABLE_CREATED", "Table:" + resolvedTable + "# Status:Created");
+            }
+
+            enqueueLog("INFO", "IMPORT_START", "CSV_File:" + csvFile + "# Table:" + resolvedTable + "# Header:" + header);
+            importCSVUsingPsql(csvFile, delimiter, header, resolvedTable, dbHost, dbPort, dbName, dbUser, dbPass);
+            enqueueLog("INFO", header ? "IMPORT_END" : "IMPORT_END", "CSV_File:" + csvFile + "# Import:Success");
+
+        } catch (Exception e) {
+            enqueueLog("CRITICAL", "ERR_IMPORT_FAILED", "Exception:" + safeMessage(e));
+            e.printStackTrace();
+            return false;
+        }
+
+        enqueueLog("INFO", "P_END", "Process:Complete# File:" + csvFile);
+        return true;
+    }
+
+    private static void moveFile(Path file, Path processedDir, boolean success) {
+        try {
+            if (!success) return;
+            Files.createDirectories(processedDir);
+            Files.move(file, processedDir.resolve(file.getFileName()), StandardCopyOption.REPLACE_EXISTING);
+            enqueueLog("INFO", "FILE_MOVED", file.getFileName() + " -> " + processedDir);
+        } catch (IOException e) {
+            enqueueLog("MAJOR", "FILE_MOVE_ERROR", safeMessage(e));
+        }
+    }
+
+    private static String resolveTableFromCsvName(String csvFile, String dbHost, String dbPort, String dbName, String dbUser, String dbPass, String config_table) {
+        try (Connection conn = DriverManager.getConnection(
+                "jdbc:mysql://" + dbHost + ":" + dbPort + "/" + dbName,
+                dbUser, dbPass)) {
+            String fileName = Paths.get(csvFile).getFileName().toString();
+            String[] parts = fileName.split("_");
+            if (parts.length < 5) return null;
+            String id = parts[4];
+            String sql = "SELECT table_name FROM " + config_table + " WHERE sno = ?";
+            try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+                stmt.setString(1, id);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    if (rs.next()) {
+                        return rs.getString(1);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            enqueueLog("MAJOR", "SCHEDULE_DB_ERROR", "Failed to resolve table name from schedule DB: " + safeMessage(e));
+        }
+        return null;
+    }
+
+    private static boolean tableExists(String host, String port, String dbName, String user, String pass, String tableName) throws IOException, InterruptedException {
+        ProcessBuilder pb = new ProcessBuilder("psql", "-h", host, "-p", port, "-U", user, "-d", dbName,
+                "-tAc", "SELECT 1 FROM information_schema.tables WHERE table_name = '" + tableName + "'");
+        pb.environment().put("PGPASSWORD", pass);
+        Process process = pb.start();
+        BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+        String line = reader.readLine();
+        process.waitFor();
+        return line != null && line.trim().equals("1");
+    }
+
+    private static void createTableFromCSV(String tableName, String csvFile, String delimiter, String host, String port, String dbName, String user, String pass) throws IOException, InterruptedException {
+        String headerLine = Files.lines(Paths.get(csvFile)).findFirst().orElseThrow(() -> new IOException("Empty CSV file: " + csvFile));
+        String[] columns = headerLine.split(Pattern.quote(delimiter), -1);
+        StringBuilder sql = new StringBuilder("CREATE TABLE \"" + tableName + "\" (");
+        for (int i = 0; i < columns.length; i++) {
+            String columnName = columns[i].trim()
+                    .replaceAll("[^a-zA-Z0-9_]", "_")
+                    .replaceAll("^_+", "")
+                    .replaceAll("_+$", "");
+            if (columnName.isEmpty()) columnName = "col_" + i;
+            sql.append("\"").append(columnName).append("\" text");
+            if (i != columns.length - 1) sql.append(", ");
+        }
+        sql.append(");");
+
+        ProcessBuilder pb = new ProcessBuilder("psql", "-h", host, "-p", port, "-U", user, "-d", dbName, "-c", sql.toString());
+        pb.environment().put("PGPASSWORD", pass);
+        pb.inheritIO();
+        Process p = pb.start();
+        p.waitFor();
+    }
+
+    private static void importCSVUsingPsql(String csvFile, String delimiter, boolean header, String tableName,
+                                           String host, String port, String dbName, String user, String pass) throws IOException, InterruptedException {
+        String copyCmd = String.format(
+                "COPY \"%s\" FROM '%s' WITH (FORMAT csv, DELIMITER '%s'%s);",
+                tableName, csvFile.replace("\\", "\\\\"), delimiter, header ? ", HEADER" : "");
+
+        ProcessBuilder pb = new ProcessBuilder("psql", "-h", host, "-p", port, "-U", user, "-d", dbName, "-c", copyCmd);
+        pb.environment().put("PGPASSWORD", pass);
+        pb.inheritIO();
+        Process p = pb.start();
+        int code = p.waitFor();
+        if (code != 0) {
+            throw new IOException("psql COPY command failed with exit code: " + code);
+        }
+    }
+
+    private static void enqueueLog(String logLevel, String evtType, String description) {
+        String timestamp = LocalDateTime.now().format(LOG_FORMAT);
+        LogRecord lr = new LogRecord(timestamp, PROCESS_NAME, PROCESS_VERSION, logLevel, evtType, description);
+        LOG_QUEUE.add(lr);
+        System.out.println(String.format("Time:%s [Debug] Process_Name: %s Server_IP:127.0.0.1 Process_Version: %s Log_Level: %s EVT_Log EVT_Type:%s Description: %s",
+                timestamp, PROCESS_NAME, PROCESS_VERSION, logLevel, evtType, description));
+    }
+
+    private static void flushLogsToStdOut() {
+        for (LogRecord r : LOG_QUEUE) {
+            System.out.println(String.format("QUEUED_LOG: %s | %s | %s | %s | %s | %s", r.timestamp, r.processName, r.logLevel, r.evtType, r.processVersion, r.description));
+        }
+    }
+
+    private static String safeMessage(Throwable t) {
+        if (t == null) return "";
+        String m = t.getMessage();
+        if (m == null) m = t.toString();
+        return m.replace("\n", " ").replace("\r", " ");
+    }
+}

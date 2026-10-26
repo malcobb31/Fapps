@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<launchConfiguration type="org.eclipse.jdt.launching.localJavaApplication">
+<listAttribute key="org.eclipse.debug.core.MAPPED_RESOURCE_PATHS">
+<listEntry value="/Skipper_EyeQ_Parser/src/eyeq_parser/eyeq_parser_main_v1.java"/>
+</listAttribute>
+<listAttribute key="org.eclipse.debug.core.MAPPED_RESOURCE_TYPES">
+<listEntry value="1"/>
+</listAttribute>
+<stringAttribute key="org.eclipse.jdt.launching.MAIN_TYPE" value="eyeq_parser.eyeq_parser_main_v1"/>
+<stringAttribute key="org.eclipse.jdt.launching.PROJECT_ATTR" value="Skipper_EyeQ_Parser"/>
+</launchConfiguration>

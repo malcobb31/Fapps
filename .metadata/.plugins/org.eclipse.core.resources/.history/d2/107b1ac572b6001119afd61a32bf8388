@@ -1,0 +1,41 @@
+package ftp_logger;
+
+import ftp_logger.ProcessData;
+
+public class Main {
+    public static void main(String[] args) throws Exception {
+        System.out.println("Length of arguments: " + args.length);
+        for (String arg : args) {
+            System.out.println("-------------- " + arg + " ------------");
+        }
+
+        if (args.length == 8) {
+            // Call the method that scans directory and processes all raw_*.csv files
+            ProcessData.process(
+                args[0],  // input dir
+                args[1],  // input filename
+                args[2],  // output folger
+                args[3],  // dburl
+                args[4],  // dbuser
+                args[5],  // dbpass
+                args[6],  // tablename
+                args[7]  // sftpdir
+               
+            );
+       
+
+            System.out.println("============================================================");
+            System.out.println("============= Directory scan & import complete =============");
+            System.out.println("============================================================");
+        } 
+        else {
+        	
+            System.out.println("=================== INVALID ARGUMENTS ======================");
+            System.out.println("Usage:");
+            System.out.println("<dirPath> <processedDirPath> <headerFlag> <delimiter> " +
+                         "<dbUrl> <dbUser> <dbPass> <pdbHost> <pdbPort> <pdbName> <pdbUser> <pdbPass> " +
+                         "<dest_sql_url> <dest_sql_user> <dest_sql_pass> <numTablesToPickStr> <config_table> "
+                         + "<MAX_CPU_UTILIZATION> <MAX_MEMORY_UTILIZATION> <bulkNumberStr> <dbTypeStr>");
+        }
+    }
+}

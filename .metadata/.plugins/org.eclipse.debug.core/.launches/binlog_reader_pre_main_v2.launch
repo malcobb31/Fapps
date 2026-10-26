@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<launchConfiguration type="org.eclipse.jdt.launching.localJavaApplication">
+<listAttribute key="org.eclipse.debug.core.MAPPED_RESOURCE_PATHS">
+<listEntry value="/BinLog_reader/src/binlog_reader_pre_v2/binlog_reader_pre_main_v2.java"/>
+</listAttribute>
+<listAttribute key="org.eclipse.debug.core.MAPPED_RESOURCE_TYPES">
+<listEntry value="1"/>
+</listAttribute>
+<stringAttribute key="org.eclipse.jdt.launching.MAIN_TYPE" value="binlog_reader_pre_v2.binlog_reader_pre_main_v2"/>
+<stringAttribute key="org.eclipse.jdt.launching.PROJECT_ATTR" value="BinLog_reader"/>
+</launchConfiguration>

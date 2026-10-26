@@ -1,0 +1,252 @@
+package tp3_parser;
+
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+
+/**
+ * CSVSourceData - Data Retrieval from CSV File (TP3)
+ *
+ * Mirrors SourceData.java in structure and return format.
+ * Returns HashMap<UniqueKey, String[]> where each record contains:
+ *   [sourceCol0, sourceCol1, ..., sourceColN, flagColumnValue]
+ *
+ * Methods:
+ * 1. fetchCSVData() - Read CSV, locate required columns by header name,
+ *                     return data in same format as SourceData.fetchSourceData()
+ */
+public class SourceData {
+
+    PrintUtilMsg pu = new PrintUtilMsg();
+
+    /**
+     * Fetch data from CSV file.
+     *
+     * @param csvFilePath      - Absolute path to the CSV file
+     * @param sourceColumns    - Array of source column names to read (must match CSV header)
+     * @param sourceCheckColumn - Column header name containing 'I'/'A' flag values
+     * @return HashMap<UniqueKey, String[]> with same layout as SourceData, or null on failure
+     */
+    public HashMap<String, String[]> fetchCSVData(String csvFilePath,
+                                                   String[] sourceColumns,
+                                                   String sourceCheckColumn) {
+
+        HashMap<String, String[]> sourceData = null;
+        BufferedReader br = null;
+        int rowCount = 0;
+
+        try {
+            pu.sop("fetchCSVData", "Opening CSV file: " + csvFilePath);
+
+            br = new BufferedReader(new FileReader(csvFilePath));
+
+            // ===== Read and parse header line =====
+            String headerLine = br.readLine();
+            if (headerLine == null || headerLine.trim().isEmpty()) {
+                pu.sop("fetchCSVData", "✗ ERROR: CSV file is empty or missing header");
+                return null;
+            }
+
+            String[] headers = parseCsvLine(headerLine);
+            pu.sop("fetchCSVData", "CSV header columns detected: " + headers.length);
+            for (int h = 0; h < headers.length; h++) {
+                pu.sop("fetchCSVData", "  Header[" + h + "]: " + headers[h]);
+            }
+
+            // ===== Locate required column indices in CSV header =====
+            int[] sourceColIndices = new int[sourceColumns.length];
+            for (int i = 0; i < sourceColumns.length; i++) {
+                sourceColIndices[i] = findColumnIndex(headers, sourceColumns[i]);
+                if (sourceColIndices[i] == -1) {
+                    pu.sop("fetchCSVData", "✗ ERROR: Source column '" + sourceColumns[i] + "' not found in CSV header");
+                    return null;
+                }
+                pu.sop("fetchCSVData", "  Source column '" + sourceColumns[i] + "' found at CSV index " + sourceColIndices[i]);
+            }
+
+            int checkColIndex = findColumnIndex(headers, sourceCheckColumn);
+            if (checkColIndex == -1) {
+                pu.sop("fetchCSVData", "✗ ERROR: Check column '" + sourceCheckColumn + "' not found in CSV header");
+                return null;
+            }
+            pu.sop("fetchCSVData", "  Check column '" + sourceCheckColumn + "' found at CSV index " + checkColIndex);
+
+            // ===== Read data rows =====
+            // Total columns in record: sourceColumns + check column (matches SourceData layout)
+            int totalColumns = sourceColumns.length + 1;
+            sourceData = new LinkedHashMap<String, String[]>();
+
+            String line;
+            int lineNumber = 1; // header was line 1; data starts at line 2
+
+            while ((line = br.readLine()) != null) {
+                lineNumber++;
+
+                // Skip blank lines silently
+                if (line.trim().isEmpty()) {
+                    continue;
+                }
+
+                String[] fields = parseCsvLine(line);
+
+                // Guard: CSV row must have enough columns to cover all required indices
+                int maxRequiredIndex = checkColIndex;
+                for (int idx : sourceColIndices) {
+                    if (idx > maxRequiredIndex) maxRequiredIndex = idx;
+                }
+
+                if (fields.length <= maxRequiredIndex) {
+                    pu.sop("fetchCSVData", "⚠ WARNING: Line " + lineNumber + " has " + fields.length +
+                           " columns, expected at least " + (maxRequiredIndex + 1) + ". Skipping.");
+                    continue;
+                }
+
+                String[] record = new String[totalColumns];
+                int colIndex = 0;
+
+                // Populate source column values
+                for (int i = 0; i < sourceColumns.length; i++) {
+                    record[colIndex] = fields[sourceColIndices[i]];
+                    colIndex++;
+                }
+
+                // Populate check column value (last slot, mirrors SourceData layout)
+                record[colIndex] = fields[checkColIndex];
+
+                // Key = auto-incrementing row count (same as SourceData)
+                sourceData.put(String.valueOf(rowCount), record);
+                rowCount++;
+
+                // Progress logging for large files
+                if (rowCount % 1000 == 0) {
+                    pu.sop("fetchCSVData", "Fetched " + rowCount + " records so far...");
+                }
+            }
+
+            pu.sop("fetchCSVData", "Total records stored in HashMap: " + sourceData.size());
+
+        } catch (Exception ex) {
+            System.out.println("EXCEPTION in fetchCSVData: " + ex.toString());
+            ex.printStackTrace();
+            sourceData = null;
+        } finally {
+            try {
+                if (br != null) br.close();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+
+        return sourceData;
+    }
+
+    // =========================================================================
+    // Private helpers
+    // =========================================================================
+
+    /**
+     * Find the index of a column name in the CSV header array.
+     * Comparison is case-insensitive and trimmed.
+     *
+     * @return 0-based index, or -1 if not found
+     */
+    private int findColumnIndex(String[] headers, String columnName) {
+        String target = columnName.trim().toLowerCase();
+        for (int i = 0; i < headers.length; i++) {
+            if (headers[i] != null && headers[i].trim().toLowerCase().equals(target)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Parse a single CSV line following RFC 4180 rules:
+     * - Fields may be enclosed in double-quotes.
+     * - A double-quote inside a quoted field is represented by two consecutive double-quotes.
+     * - Fields may contain commas and newlines when quoted.
+     * - Leading/trailing spaces outside quotes are preserved (raw field value returned).
+     *
+     * Does NOT use String.split(",") - handles all edge cases properly.
+     *
+     * @param line - Raw CSV line
+     * @return Array of parsed field values
+     */
+    private String[] parseCsvLine(String line) {
+
+        java.util.List<String> fields = new java.util.ArrayList<String>();
+
+        if (line == null) {
+            return new String[0];
+        }
+
+        int length = line.length();
+        int i = 0;
+
+        while (i <= length) {
+
+            if (i == length) {
+                // Trailing comma produced an empty field
+                fields.add("");
+                break;
+            }
+
+            if (line.charAt(i) == '"') {
+                // ===== Quoted field =====
+                StringBuilder sb = new StringBuilder();
+                i++; // skip opening quote
+
+                while (i < length) {
+                    char c = line.charAt(i);
+
+                    if (c == '"') {
+                        // Peek ahead for escaped double-quote ""
+                        if (i + 1 < length && line.charAt(i + 1) == '"') {
+                            sb.append('"');
+                            i += 2;
+                        } else {
+                            // Closing quote
+                            i++;
+                            break;
+                        }
+                    } else {
+                        sb.append(c);
+                        i++;
+                    }
+                }
+
+                fields.add(sb.toString());
+
+                // After closing quote, next char must be comma or end-of-line
+                if (i < length && line.charAt(i) == ',') {
+                    i++; // skip separator, continue to next field
+                }
+
+            } else {
+                // ===== Unquoted field =====
+                int start = i;
+
+                while (i < length && line.charAt(i) != ',') {
+                    i++;
+                }
+
+                fields.add(line.substring(start, i));
+
+                if (i < length && line.charAt(i) == ',') {
+                    i++; // skip comma
+                    // If comma was the last character, add empty trailing field on next iteration
+                    if (i == length) {
+                        fields.add("");
+                        break;
+                    }
+                } else {
+                    // End of line
+                    break;
+                }
+            }
+        }
+
+        return fields.toArray(new String[0]);
+    }
+}

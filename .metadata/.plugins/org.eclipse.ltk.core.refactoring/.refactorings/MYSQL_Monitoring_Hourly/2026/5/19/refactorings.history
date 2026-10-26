@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename type &apos;Mysql_HourlyV2.Mysql_hourly_main&apos; to &apos;Mysql_hourly_main_v2&apos;&#x0D;&#x0A;- Original project: &apos;MYSQL_Monitoring_Hourly&apos;&#x0D;&#x0A;- Original element: &apos;Mysql_HourlyV2.Mysql_hourly_main&apos;&#x0D;&#x0A;- Renamed element: &apos;Mysql_HourlyV2.Mysql_hourly_main_v2&apos;&#x0D;&#x0A;- Update references to refactored element&#x0D;&#x0A;- Update textual occurrences in comments and strings" description="Rename type &apos;Mysql_hourly_main&apos;" flags="589830" id="org.eclipse.jdt.ui.rename.type" input="/src&lt;Mysql_HourlyV2{Mysql_hourly_main.java[Mysql_hourly_main" matchStrategy="1" name="Mysql_hourly_main_v2" qualified="false" references="true" similarDeclarations="false" stamp="1778148603279" textual="false" version="1.0"/>
+</session>

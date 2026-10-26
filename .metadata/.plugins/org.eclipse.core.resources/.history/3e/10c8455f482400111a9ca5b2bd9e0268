@@ -1,0 +1,177 @@
+package opd_parser_final;
+
+import java.sql.Connection;
+import java.sql.Statement;
+import java.time.LocalDate;
+import java.util.HashSet;
+
+public class ProcessOPDData {
+
+    PrintUtilMsg pu = new PrintUtilMsg();
+
+    private static final String[] REFERRAL_SUBCATEGORIES = {
+        "REFERRAL ARMY CLINIC",
+        "MAX ATTENDENT ACTIVITIES",
+        "LASIK REFERRAL PROGRAM",
+        "REFERENCE FROM AGENT",
+        "INVITATION CARD ACTIVITY",
+        "IN CENTER COUPON ACTIVITY",
+        "REFERRAL THROUGH DOCTORS",
+        "REFERRAL MARKETING",
+        "REFERRAL FROM OPTICAL"
+    };
+
+    public boolean processOPDData(String tableSource, String tableDest,
+                                  String tableCamp,   String tableScreening,
+                                  String processDate, String processMonth,
+                                  String dbURL,       String dbName, String dbPass) {
+
+        Connection conn  = null;
+        Statement  stmt  = null;
+        boolean    status = false;
+
+        try {
+
+            // STEP 1: DELETE OLD DATA
+            pu.sop("processOPDData", "===== STEP 1: Delete existing day data =====");
+
+            boolean deleted = new OPD_Source().deleteCurrentDayData(
+                    tableDest, processDate, dbURL, dbName, dbPass);
+
+            pu.sop("processOPDData", deleted
+                    ? "Existing day data deleted successfully"
+                    : "No rows deleted");
+
+            // STEP 2: COPY DATA
+            pu.sop("processOPDData", "===== STEP 2: Copy source data =====");
+
+            int copied = new OPD_Source().copySourceData(
+                    tableSource, tableDest, processDate, processMonth,
+                    dbURL, dbName, dbPass);
+
+            if (copied < 0) {
+                pu.sop("processOPDData", "ERROR: copy failed");
+                return false;
+            }
+
+            if (copied == 0) {
+                pu.sop("processOPDData", "No data found for date: " + processDate);
+                return true;
+            }
+
+            // STEP 3: LOAD SETS
+            pu.sop("processOPDData", "===== STEP 3: Load MRD sets =====");
+
+            HashSet<String> campMRDSet = new OPD_Source().getMRDSetFromCamp(
+                    tableCamp, processDate, processMonth, dbURL, dbName, dbPass);
+
+            HashSet<String> screeningMRDSet = new OPD_Source().getMRDSetFromScreening(
+                    tableScreening, processDate, processMonth, dbURL, dbName, dbPass);
+
+            pu.sop("processOPDData", "Camp MRD count      : " + campMRDSet.size());
+            pu.sop("processOPDData", "Screening MRD count : " + screeningMRDSet.size());
+
+            // STEP 4: SINGLE PASS CLASSIFICATION
+            pu.sop("processOPDData", "===== STEP 4: Classification (single pass) =====");
+
+            conn = new MySQLConnection().getConnection(dbURL, dbName, dbPass);
+            conn.setAutoCommit(false);
+            stmt = conn.createStatement();
+
+            String campInClause = campMRDSet.isEmpty() ? "''" : buildInClause(campMRDSet);
+            String screeningInClause = screeningMRDSet.isEmpty() ? "''" : buildInClause(screeningMRDSet);
+            String referralInClause = buildStringInClause(REFERRAL_SUBCATEGORIES);
+
+            // DATE RANGE FIX (IMPORTANT)
+            String startDate = processDate + " 00:00:00";
+            java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd");
+            java.util.Date date = sdf.parse(processDate);
+
+            java.util.Calendar cal = java.util.Calendar.getInstance();
+            cal.setTime(date);
+            cal.add(java.util.Calendar.DATE, 1);
+
+            String endDate = sdf.format(cal.getTime()) + " 00:00:00";
+            String sql =
+                "UPDATE " + tableDest + " SET OPD_TYPE = CASE " +
+
+                "WHEN UPPER(TRIM(PATIENT_CATEGORY)) = 'DGHS' THEN 'New OPD DGHS' " +
+                "WHEN UPPER(TRIM(PATIENT_CATEGORY)) = 'CGHS' THEN 'New OPD CGHS' " +
+                "WHEN UPPER(TRIM(PATIENT_CATEGORY)) = 'EX SERVICEMAN' THEN 'New OPD ECHS' " +
+
+                "WHEN UPPER(TRIM(PATIENT_CATEGORY)) = 'MARKETING ACTIVITY' " +
+                "AND UPPER(TRIM(PATIENT_SUBCATEGORY)) = 'SENIOR CITIZEN ACTIVITY' " +
+                "THEN 'Senior Citizen Activity' " +
+
+                "WHEN UPPER(TRIM(PATIENT_CATEGORY)) IN ('CORPORATE (CASH)','CORPORATE (CASHLESS)') " +
+                "THEN 'Corporate OPD' " +
+
+                "WHEN UPPER(TRIM(PATIENT_CATEGORY)) = 'MARKETING ACTIVITY' " +
+                "AND UPPER(TRIM(PATIENT_SUBCATEGORY)) IN (" + referralInClause + ") " +
+                "THEN 'Referral' " +
+
+                "WHEN UPPER(TRIM(PATIENT_CATEGORY)) = 'MARKETING ACTIVITY' " +
+                "AND UPPER(TRIM(PATIENT_SUBCATEGORY)) = 'SURGICAL COUPON PATIENTS' " +
+                "THEN 'Surgical Coupon' " +
+
+                "WHEN UPPER(TRIM(PATIENT_CATEGORY)) = 'CAMP PATIENT' " +
+                "THEN 'Camp (In House)' " +
+
+                "WHEN (UPPER(TRIM(MRD_NO)) IN (" + campInClause + ") " +
+                "OR UPPER(TRIM(PATIENT_CATEGORY)) = 'OUT - REACH CAMP') " +
+                "THEN 'Camp (Out Reach)' " +
+
+                "WHEN UPPER(TRIM(MRD_NO)) IN (" + screeningInClause + ") " +
+                "THEN 'Attendant Activity' " +
+
+                "WHEN UPPER(TRIM(APPOINTMENT_TYPE)) = 'REG' " +
+                "AND UPPER(TRIM(PATIENT_TYPE)) != 'NEW' " +
+                "THEN 'Old OPD' " +
+
+                "ELSE 'Natural OPD' END " +
+
+                "WHERE VISIT_DATE >= '" + startDate + "' " +
+                "AND VISIT_DATE < '" + endDate + "'";
+
+            int updated = stmt.executeUpdate(sql);
+            conn.commit();
+
+            pu.sop("processOPDData", "Rows classified: " + updated);
+
+            status = true; // IMPORTANT FIX
+
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            try {
+                if (conn != null) conn.rollback();
+            } catch (Exception e) { }
+            status = false;
+
+        } finally {
+            try {
+                if (stmt != null) stmt.close();
+                if (conn != null) conn.close();
+            } catch (Exception e) { }
+        }
+
+        return status;
+    }
+
+    private String buildInClause(HashSet<String> values) {
+        StringBuilder sb = new StringBuilder();
+        for (String v : values) {
+            if (sb.length() > 0) sb.append(",");
+            sb.append("'").append(v.replace("'", "''")).append("'");
+        }
+        return sb.toString();
+    }
+
+    private String buildStringInClause(String[] values) {
+        StringBuilder sb = new StringBuilder();
+        for (String v : values) {
+            if (sb.length() > 0) sb.append(",");
+            sb.append("'").append(v.toUpperCase().replace("'", "''")).append("'");
+        }
+        return sb.toString();
+    }
+}

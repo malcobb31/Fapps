@@ -1,0 +1,100 @@
+package rest_api_v2;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+public class rest_api_methods {
+
+    private static final String AUTH_URL = "https://poc.itsimple.in/restapi/auth/token/";
+    private static final String REPO_URL = "https://poc.itsimple.in/restapi/datamanagement/repositories/";
+
+    public void run(String enterpriseName, String username, String password,
+                    String confirmPassword, String accessKey, String secretKey,
+                    String bucketName, String userQuota) throws Exception {
+
+        System.out.println("[INFO] Starting run for enterprise: " + enterpriseName);
+
+        // --- 1. Authenticate and get access token ---
+        System.out.println("[INFO] Authenticating via: " + AUTH_URL);
+
+        // Hardcoded JSON credentials
+        String jsonInput = "{\"name\":\"root\",\"password\":\"ATempo@123\"}";
+
+        HttpURLConnection authConn = (HttpURLConnection) new URL(AUTH_URL).openConnection();
+        authConn.setDoOutput(true);
+        authConn.setRequestMethod("POST");
+        authConn.setRequestProperty("Content-Type", "application/json");
+        authConn.getOutputStream().write(jsonInput.getBytes("UTF-8"));
+
+        int authCode = authConn.getResponseCode();
+        System.out.println("[INFO] Auth Response Code: " + authCode);
+
+        BufferedReader in = new BufferedReader(new InputStreamReader(authConn.getInputStream()));
+        String inputLine;
+        StringBuffer authResponse = new StringBuffer();
+        while ((inputLine = in.readLine()) != null) {
+            authResponse.append(inputLine);
+        }
+        in.close();
+
+        System.out.println("[DEBUG] Auth Response: " + authResponse.toString());
+
+        JSONObject authJson = new JSONObject(authResponse.toString());
+        String accessToken = authJson.getString("access");
+
+        // --- 2. Fetch repositories ---
+        System.out.println("[INFO] Fetching repositories from: " + REPO_URL);
+
+        HttpURLConnection repoConn = (HttpURLConnection) new URL(REPO_URL).openConnection();
+        repoConn.setRequestMethod("GET");
+        repoConn.setRequestProperty("Authorization", "Bearer " + accessToken);
+
+        int repoCode = repoConn.getResponseCode();
+        System.out.println("[INFO] Repositories GET Response Code: " + repoCode);
+
+        BufferedReader repoIn = new BufferedReader(new InputStreamReader(repoConn.getInputStream()));
+        StringBuffer repoResponse = new StringBuffer();
+        while ((inputLine = repoIn.readLine()) != null) {
+            repoResponse.append(inputLine);
+        }
+        repoIn.close();
+
+        System.out.println("[DEBUG] Repositories Response: " + repoResponse.toString());
+
+        JSONObject repoJson = new JSONObject(repoResponse.toString());
+        JSONArray results = repoJson.getJSONArray("results");
+
+        // --- 3. Find repository matching enterpriseName ---
+        JSONObject matchedRepo = null;
+        for (int i = 0; i < results.length(); i++) {
+            JSONObject repo = results.getJSONObject(i);
+            if (repo.getString("name").equalsIgnoreCase(enterpriseName)) {
+                matchedRepo = repo;
+                break;
+            }
+        }
+
+        if (matchedRepo == null) {
+            System.out.println("[INFO] Repository not found. Creating repository.");
+            // Call your repo creation logic here
+        } else {
+            System.out.println("[INFO] Repository found: " + matchedRepo.getString("name"));
+
+            // --- 4. Insert details into DB ---
+            String repoId = String.valueOf(matchedRepo.getInt("id"));
+            String volumeQuota = matchedRepo.getString("volumeQuota");
+
+            DbConnection.insertEnterpriseDetail(
+                enterpriseName, username, password, confirmPassword,
+                accessKey, secretKey, bucketName, volumeQuota
+            );
+        }
+
+        System.out.println("[INFO] Run complete for enterprise: " + enterpriseName);
+    }
+}

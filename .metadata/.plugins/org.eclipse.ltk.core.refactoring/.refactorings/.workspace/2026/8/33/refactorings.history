@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename Java project &apos;Delete_Parser&apos; to &apos;Incremental_Delete_Parser&apos;&#x0D;&#x0A;- Original element: &apos;Delete_Parser&apos;&#x0D;&#x0A;- Renamed element: &apos;Delete_Parser&apos;&#x0D;&#x0A;- Update references to refactored element" description="Rename Java project &apos;Delete_Parser&apos;" flags="7" id="org.eclipse.jdt.ui.rename.java.project" input="=Delete_Parser" name="Incremental_Delete_Parser" references="true" stamp="1786709436375" version="1.0"/>
+</session>

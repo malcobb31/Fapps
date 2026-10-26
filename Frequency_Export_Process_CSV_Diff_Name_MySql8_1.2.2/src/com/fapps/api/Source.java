@@ -1,0 +1,263 @@
+package com.fapps.api;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+import com.fapps.util.PrintUtilMsg;
+
+public class Source {
+PrintUtilMsg pu = new PrintUtilMsg();
+
+
+public static String currentTime() {
+    String current_time = "";
+    try {
+        SimpleDateFormat sdf_date = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        Calendar c1 = Calendar.getInstance();
+        Date date = new Date();
+        c1.setTime(date);
+        current_time = sdf_date.format(c1.getTime());
+    } catch (Exception E) {
+        System.out.println("currentTime:: Exception while computing current date");
+        E.printStackTrace();
+    }
+    return current_time;
+}
+
+public ArrayList<String[]> getDataFromScheduleTable(String inputDate, String db_url, String db_User, String db_pass,
+                                                    String table, String limit, String logServerIP, String version) {
+
+    ArrayList<String[]> data = null;
+    Connection conn = null;
+    Statement stmt = null;
+    ResultSet rs = null;
+    String query = null;
+    PreparedStatement ps = null;
+    Statement stmt1 = null;
+    ResultSet rs1 = null;
+
+    int rowCount = 0;
+    int row = 0;
+
+    try {
+        //  UPDATED QUERY (added query_base, query_suffix)
+        query = "select sno,table_name, type, module, circle, tech, graph_id, last_export_timestamp, "
+                + "schedule_time, sync_status, last_import_timestamp, remarks, date_column, maxSno, date_exits, "
+                + "SourceColumn, DestColumn, query_base, query_suffix "
+                + "from " + table + " where lower(sync_status)=lower('Init') and Date_to_Pick = 'frequency' "
+                + "order by sno asc";
+
+        pu.sop("Query API Log:  getDataFromScheduleTable: ", query);
+
+        conn = new com.fapps.db.MySQLConnection().getConnection(db_url, db_User, db_pass);
+        stmt = conn.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+        rs = stmt.executeQuery(query);
+
+        rs.last();
+        rowCount = rs.getRow();
+        rs.beforeFirst();
+
+        pu.sop("Row Count", "Total rows:[" + rowCount + "]");
+        System.out.println("Time:" + currentTime() + " [Debug] Process_Name: EP Server_IP: " + logServerIP + " Process_Version: " + version + " Log_Level: EVT_LOG  EVT_Type: tableCount Description: " + rowCount);
+
+        if (rowCount > 0) {
+            data = new ArrayList<String[]>();
+
+            while (rs.next()) {
+                String[] tableData = new String[19]; //  UPDATED SIZE
+
+                for (int col = 0; col < 19; col++) {
+                    tableData[col] = rs.getString(col + 1);
+                }
+
+                data.add(tableData);
+
+                updateScheduleTableTransactionInProcess(
+                        table,
+                        tableData[1],
+                        "" + row,
+                        tableData[0],
+                        db_url,
+                        db_User,
+                        db_pass
+                );
+
+                row++;
+
+                if (limit != null && !limit.isEmpty() && row == Integer.parseInt(limit)) {
+                    break;
+                }
+            }
+
+        } else {
+            int totalRawCount = 0;
+            int totalCount = 0;
+
+            String query1 = "select count(*) cnt from " + table + " where sync_status IN ('Init','Ready_for_Export_Fre','Ready_for_Export_Fre_0')";
+            pu.sop("Query API Log:  getDataFromScheduleTable: ", query1);
+
+            stmt1 = conn.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+            rs1 = stmt1.executeQuery(query1);
+
+            rs1.last();
+            totalRawCount = rs1.getRow();
+            rs1.beforeFirst();
+
+            if (totalRawCount > 0) {
+                rs1.next();
+                totalCount = rs1.getInt("cnt");
+            }
+
+            if (totalCount == 0) {
+                query = "update " + table + " set sync_status = ? where sync_status = ? and Date_to_Pick = ?";
+                conn.setAutoCommit(false);
+
+                ps = conn.prepareStatement(query);
+                ps.setString(1, "Init");
+                ps.setString(2, "Done");
+                ps.setString(3, "frequency");
+
+                ps.addBatch();
+                ps.executeBatch();
+                conn.commit();
+            }
+        }
+
+    } catch (Exception ex) {
+        System.out.println("EXCEPTION JAR: :: getDataFromScheduleTable: " + ex.toString());
+        ex.printStackTrace();
+    } finally {
+        try {
+            if (conn != null) {
+                if (rs != null) rs.close();
+                if (stmt != null) stmt.close();
+                if (rs1 != null) rs1.close();
+                if (stmt1 != null) stmt1.close();
+                if (ps != null) ps.close();
+                conn.close();
+            }
+        } catch (Exception e) {
+        }
+    }
+    return data;
+}
+
+public boolean processScheduledTransactions(String scheduleTable, ArrayList<String[]> getDataFromScheduleTable,
+                                            String inputdate, String threadLimit, String eventTable,
+                                            String db_URL, String db_User, String db_Pass,
+                                            String filePath, String db_Name, String host,
+                                            int rawLimit, String logServerIP, String version,
+                                            String serverInfoTable) {
+
+    boolean status = false;
+
+    try {
+        ExecutorService exe = Executors.newFixedThreadPool(Integer.parseInt(threadLimit));
+        List<Future<String>> list = new ArrayList<Future<String>>();
+
+        for (int i = 0; i < getDataFromScheduleTable.size(); i++) {
+
+            String[] AL_Values = getDataFromScheduleTable.get(i);
+
+            Callable<String> callable = new ThreadProcessCSV(
+                    inputdate,
+                    AL_Values[0],
+                    AL_Values[1],
+                    AL_Values[2],
+                    AL_Values[3],
+                    AL_Values[4],
+                    AL_Values[5],
+                    db_URL,
+                    db_User,
+                    db_Pass,
+                    i,
+                    filePath,
+                    scheduleTable,
+                    db_Name,
+                    host,
+                    eventTable,
+                    AL_Values[13],
+                    AL_Values[12],
+                    AL_Values[14],
+                    rawLimit,
+                    logServerIP,
+                    version,
+                    serverInfoTable,
+                    AL_Values[15],
+                    AL_Values[16],
+                    AL_Values[17], //  query_base
+                    AL_Values[18]  //  query_suffix
+            );
+
+            Future<String> future = exe.submit(callable);
+            list.add(future);
+        }
+
+        for (Future<String> fut : list) {
+            try {
+                System.out.println("[" + fut.get().split(",")[0] + "] Response: " + fut.get());
+            } catch (InterruptedException | ExecutionException e) {
+                e.printStackTrace();
+            }
+        }
+
+        exe.shutdown();
+        status = true;
+
+    } catch (Exception e) {
+        pu.sop("Exception:::: ", "Exception while processingScheduledTransactions:::: " + e.toString());
+        e.printStackTrace();
+    }
+
+    return status;
+}
+
+private void updateScheduleTableTransactionInProcess(String scheduleTableName,
+                                                     String transactionTableName,
+                                                     String threadName,
+                                                     String sno,
+                                                     String db_URL,
+                                                     String db_User,
+                                                     String db_Pass) {
+
+    Connection conn = null;
+    PreparedStatement ps = null;
+
+    try {
+        String query = "update " + scheduleTableName + " set sync_status=? where sno=? and table_name=?";
+        conn = new com.fapps.db.MySQLConnection().getConnection(db_URL, db_User, db_Pass);
+        conn.setAutoCommit(false);
+
+        ps = conn.prepareStatement(query);
+        ps.setString(1, "InProcess_EP");
+        ps.setString(2, sno);
+        ps.setString(3, transactionTableName);
+
+        ps.executeUpdate();
+        conn.commit();
+
+    } catch (Exception ex) {
+        ex.printStackTrace();
+    } finally {
+        try {
+            if (ps != null) ps.close();
+            if (conn != null) conn.close();
+        } catch (Exception e) {
+        }
+    }
+}
+
+
+}

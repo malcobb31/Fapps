@@ -1,0 +1,45 @@
+package postgre_agent_v2;
+
+import postgre_agent_v2.postgre_v2_update;
+
+public class postgre_v2_main {
+    public static void main(String[] args) {
+        System.out.println("Length of arguments: " + args.length);
+        for (String arg : args) {
+            System.out.println("-------------- " + arg + " ------------");
+        }
+
+        if (args.length == 14) {
+            // Call the method that scans directory and processes all raw_*.csv files
+            postgre_v2_update.processAllInDirectory(
+                args[0],  // directory containing CSVs
+                args[1],  // dir for processed file
+                args[2],  // header yes/no
+                args[3],  // delimeter
+                args[4],  // sqldburl
+               
+                args[5],  // sdbuser
+                args[6],  // sdbpass
+                args[7],  // postgredbhost
+                args[8], // pdbport
+                args[9], // pdbname
+                args[10], // pdbuser
+                args[11], // pdbpass
+                args[12], // number of table to pick
+                args[13],  // config table name
+                args[14],
+                args[15]
+            );
+
+            System.out.println("============================================================");
+            System.out.println("============= Directory scan & import complete =============");
+            System.out.println("============================================================");
+        } else {
+            System.out.println("=================== INVALID ARGUMENTS ======================");
+            System.out.println("Usage:");
+            System.out.println("<csv_directory> <processed_dir_path> <header_yes_no> <delimiter> <dbHost> "
+            		+ "<dbPort> <dbName> <dbUser> <dbPass> <PdbHost> <PdbPort> <PdbName> "
+            		+ "<PdbUser> <PdbPass> <NumberOfTableToBeProcessed> <Tablename>");
+        }
+    }
+}

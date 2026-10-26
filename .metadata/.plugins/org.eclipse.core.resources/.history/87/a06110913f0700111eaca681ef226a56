@@ -1,0 +1,109 @@
+package dell_scality;
+
+import java.util.*;
+import java.util.logging.*;
+
+import com.amazonaws.ClientConfiguration;
+import com.amazonaws.auth.*;
+import com.amazonaws.client.builder.AwsClientBuilder;
+import com.amazonaws.services.s3.*;
+import com.amazonaws.services.s3.model.*;
+
+public class Delete {
+
+    private static final Logger logger = Logger.getLogger(Delete.class.getName());
+
+    static {
+        ConsoleHandler handler = new ConsoleHandler();
+        handler.setFormatter(new SimpleFormatter());
+        logger.addHandler(handler);
+        logger.setUseParentHandlers(false);
+    }
+
+    public static AmazonS3 createClient(String accessKey, String secretKey, String endpoint) {
+
+        BasicAWSCredentials creds = new BasicAWSCredentials(accessKey, secretKey);
+
+        ClientConfiguration config = new ClientConfiguration();
+        config.setMaxConnections(200);
+        config.setSignerOverride("S3SignerType");
+
+        return AmazonS3ClientBuilder.standard()
+                .withEndpointConfiguration(
+                        new AwsClientBuilder.EndpointConfiguration(endpoint, "us-east-1"))
+                .withPathStyleAccessEnabled(true)
+                .withClientConfiguration(config)
+                .withCredentials(new AWSStaticCredentialsProvider(creds))
+                .build();
+    }
+
+    public static void main(String[] args) {
+
+        AmazonS3 s3 = createClient(
+                "HPZBCYK10H24VCNRKKM7",
+                "hNz4QcK6TWQUmCuqfUSr+DBHXC2kHo93Fhq5xqLm",
+                "http://172.20.161.11"
+        );
+
+        String bucketName = "test";
+
+        //  Folders you want untouched
+        Set<String> keepFolders = new HashSet<>(Arrays.asList(
+                "New folder/",
+                "No-Permission-test/",
+                "Target-10th-Feb/",
+                "Target-4Feb/"
+        ));
+
+        logger.info("=========== SAFE FOLDER CLEANUP STARTED ===========");
+
+        ListObjectsRequest request = new ListObjectsRequest()
+                .withBucketName(bucketName)
+                .withDelimiter("/"); // VERY IMPORTANT
+
+        ObjectListing listing = s3.listObjects(request);
+
+        for (String prefix : listing.getCommonPrefixes()) {
+
+            if (keepFolders.contains(prefix)) {
+
+                logger.info("KEEPING folder -> " + prefix);
+                continue;
+            }
+
+            logger.warning("DELETING folder -> " + prefix);
+
+            deleteFolderCompletely(s3, bucketName, prefix);
+        }
+
+        logger.info("=========== CLEANUP COMPLETE ===========");
+    }
+
+    private static void deleteFolderCompletely(AmazonS3 s3, String bucket, String prefix) {
+
+        ObjectListing listing = s3.listObjects(bucket, prefix);
+
+        do {
+
+            List<DeleteObjectsRequest.KeyVersion> keys = new ArrayList<>();
+
+            for (S3ObjectSummary obj : listing.getObjectSummaries()) {
+                keys.add(new DeleteObjectsRequest.KeyVersion(obj.getKey()));
+            }
+
+            if (!keys.isEmpty()) {
+
+//                DeleteObjectsRequest deleteRequest =
+//                        new DeleteObjectsRequest(bucket).withKeys(keys);
+
+//                s3.deleteObjects(deleteRequest);
+
+                logger.info("Deleted " + keys.size() +
+                        " objects from -> " + prefix);
+            }
+
+            listing = s3.listNextBatchOfObjects(listing);
+
+        } while (listing.isTruncated());
+    }
+}

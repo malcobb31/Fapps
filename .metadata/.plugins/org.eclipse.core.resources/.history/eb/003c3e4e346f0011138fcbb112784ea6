@@ -1,0 +1,1037 @@
+package ktp10_process_v1;
+
+import java.io.BufferedReader;
+import java.io.Closeable;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.sql.Connection;
+import java.sql.Date;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.text.SimpleDateFormat;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.logging.Logger;
+
+public class ktp10_process_methods {
+
+    private static final Logger LOGGER = Logger.getLogger(ktp10_process_methods.class.getName());
+
+    private static final String PROCESS_NAME = "KYC_LINKED_INSTITUTIONS";
+    private static final String PROCESS_VERSION = "1.0.0";
+    private static final boolean debugEnabled = false;
+    private static final DateTimeFormatter LOG_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    private static final String TARGET_TABLE = "kyc.kyc_linked_re";
+
+    // Keep this small to avoid heap pressure when files are very large.
+    private static final int MAX_PARALLEL_FILES = 2;
+
+    // Safe upper bound for batching to keep memory usage under control.
+    private static final int MAX_RECOMMENDED_BATCH_SIZE = 5000;
+
+    private static final String[] MAPPED_HEADERS = new String[] {
+            "kli_kyc_no",
+            "kli_created_by",
+            "delink_status",
+            "kli_reg_code",
+            "kli_updated_by",
+            "kli_created_date",
+            "kli_updated_date",
+            "kli_fi_code",
+            "kli_br_code"
+    };
+
+    private static final String INSERT_SQL = buildInsertSql();
+
+    public static void process(File inputPath, File archiveDir, String jdbcUrl, String dbUser, String dbPass, String serverIP, int configuredBatchSize) {
+        DirectoryResult dirResult = new DirectoryResult();
+
+        List<File> files = collectCsvFiles(inputPath);
+        dirResult.totalFiles = files.size();
+
+        log(
+                "INFO",
+                "process_start input_path=" + inputPath.getAbsolutePath() + " input_type=" + (inputPath.isFile() ? "file" : "directory"),
+                serverIP,
+                "PROCESS_START");
+
+        log(
+                "INFO",
+                "directory_start input_path=" + inputPath.getAbsolutePath()
+                        + " archive_dir=" + archiveDir.getAbsolutePath()
+                        + " total_files=" + files.size()
+                        + " batch_size=" + configuredBatchSize,
+                serverIP,
+                "DIRECTORY_START");
+
+        if (files.isEmpty()) {
+            logDirectorySummary(dirResult, serverIP);
+            return;
+        }
+
+        int poolSize = getWorkerPoolSize(files.size());
+        ExecutorServiceHolder executorHolder = new ExecutorServiceHolder(poolSize);
+
+        List<java.util.concurrent.Future<FileResult>> futures = new ArrayList<java.util.concurrent.Future<FileResult>>();
+        for (int i = 0; i < files.size(); i++) {
+            final File file = files.get(i);
+            futures.add(executorHolder.submit(new java.util.concurrent.Callable<FileResult>() {
+                public FileResult call() {
+                    return processSingleFile(file, archiveDir, jdbcUrl, dbUser, dbPass, serverIP, configuredBatchSize);
+                }
+            }));
+        }
+
+        executorHolder.shutdown();
+
+        for (int i = 0; i < futures.size(); i++) {
+            try {
+                FileResult result = futures.get(i).get();
+
+                dirResult.totalRows += result.dataRows;
+                dirResult.inserted += result.inserted;
+                dirResult.skipped += result.skipped;
+                dirResult.dbFailed += result.dbFailed;
+                dirResult.rowErrors += result.rowErrors;
+                dirResult.batchFailures += result.batchFailures;
+                dirResult.blankLines += result.blankLines;
+
+                if ("SUCCESS".equals(result.status)) {
+                    dirResult.completedFiles++;
+                } else {
+                    dirResult.retainedFiles++;
+                }
+
+                if ("EMPTY".equals(result.status)) {
+                    dirResult.emptyFiles++;
+                } else if ("HEADER_ONLY".equals(result.status)) {
+                    dirResult.headerOnlyFiles++;
+                } else if ("ERROR".equals(result.status)) {
+                    dirResult.errorFiles++;
+                }
+
+            } catch (Exception ex) {
+                dirResult.errorFiles++;
+                dirResult.retainedFiles++;
+                log(
+                        "ERROR",
+                        "fatal_error=directory_worker_failure reason=" + rootCause(ex),
+                        serverIP,
+                        "FATAL_ERROR");
+            }
+        }
+
+        logDirectorySummary(dirResult, serverIP);
+    }
+
+    private static int getWorkerPoolSize(int fileCount) {
+        int cpu = Runtime.getRuntime().availableProcessors();
+        int preferred = cpu / 2;
+        if (preferred < 1) {
+            preferred = 1;
+        }
+        if (preferred > MAX_PARALLEL_FILES) {
+            preferred = MAX_PARALLEL_FILES;
+        }
+        if (fileCount < preferred) {
+            return fileCount;
+        }
+        return preferred;
+    }
+
+    private static FileResult processSingleFile(File file, File archiveDir, String jdbcUrl, String dbUser, String dbPass, String serverIP, int configuredBatchSize) {
+        FileResult result = new FileResult(file.getName());
+
+        log("INFO", "file_start file=" + file.getName(), serverIP, "FILE_START");
+
+        BufferedReader reader = null;
+        Connection connection = null;
+        PreparedStatement ps = null;
+
+        boolean headerCaptured = false;
+        boolean dbInitialized = false;
+        boolean commitSuccess = false;
+
+        String[] header = null;
+        int currentBatchCount = 0;
+        int batchSize = prepareBatchSize(configuredBatchSize);
+        result.effectiveBatchSize = batchSize;
+
+        try {
+            reader = new BufferedReader(
+                    new InputStreamReader(
+                            new FileInputStream(file),
+                            Charset.forName("UTF-8")));
+
+            String line;
+
+            while ((line = reader.readLine()) != null) {
+                if (line.trim().length() == 0) {
+                    result.blankLines++;
+                    continue;
+                }
+
+                List<String> parsed = parseCsvLine(line);
+                String[] row = toArray(parsed);
+
+                if (!headerCaptured) {
+                    if (row.length == 0) {
+                        continue;
+                    }
+                    row[0] = removeBom(row[0]);
+                    header = row;
+                    headerCaptured = true;
+                    continue;
+                }
+
+                result.dataRows++;
+
+                if (!dbInitialized) {
+                    connection = DriverManager.getConnection(jdbcUrl, dbUser, dbPass);
+                    connection.setAutoCommit(false);
+
+                    ps = connection.prepareStatement(INSERT_SQL);
+
+                    log(
+                            "INFO",
+                            "file=" + file.getName() + "\nsql=" + INSERT_SQL,
+                            serverIP,
+                            "INSERT_SQL");
+
+                    dbInitialized = true;
+                }
+
+                RowData mapped;
+                try {
+                    mapped = mapRow(header, row);
+                } catch (FatalProcessingException fpe) {
+                    throw fpe;
+                }
+
+                if (mapped == null) {
+                    result.skipped++;
+                    continue;
+                }
+
+                bindRow(ps, mapped);
+                ps.addBatch();
+                currentBatchCount++;
+
+                if (currentBatchCount >= batchSize) {
+                    try {
+                        ps.executeBatch();
+                        ps.clearBatch();
+                    } catch (SQLException sqle) {
+                        result.batchFailures++;
+                        result.dbFailed += currentBatchCount;
+                        log(
+                                "ERROR",
+                                "file=" + file.getName()
+                                        + "\nbatch_size=" + currentBatchCount
+                                        + "\nreason=" + rootCause(sqle),
+                                serverIP,
+                                "BATCH_ERROR");
+                        throw sqle;
+                    }
+                    currentBatchCount = 0;
+                }
+            }
+
+            if (!headerCaptured) {
+                result.status = "EMPTY";
+                result.moved = false;
+                logFileCompletion(result, serverIP);
+                return result;
+            }
+
+            if (result.dataRows == 0) {
+                result.status = "HEADER_ONLY";
+                result.moved = false;
+                logFileCompletion(result, serverIP);
+                return result;
+            }
+
+            if (currentBatchCount > 0 && ps != null) {
+                try {
+                    ps.executeBatch();
+                    ps.clearBatch();
+                } catch (SQLException sqle) {
+                    result.batchFailures++;
+                    result.dbFailed += currentBatchCount;
+                    log(
+                            "ERROR",
+                            "file=" + file.getName()
+                                    + "\nbatch_size=" + currentBatchCount
+                                    + "\nreason=" + rootCause(sqle),
+                            serverIP,
+                            "BATCH_ERROR");
+                    throw sqle;
+                }
+            }
+
+            if (result.dataRows < result.effectiveBatchSize) {
+                result.effectiveBatchSize = result.dataRows;
+            }
+
+            if (dbInitialized) {
+                connection.commit();
+                commitSuccess = true;
+                result.inserted = result.dataRows - result.skipped;
+                result.status = "SUCCESS";
+
+                try {
+                    moveFile(file, archiveDir);
+                    result.moved = true;
+                    log("INFO", "file_moved file=" + file.getName(), serverIP, "FILE_MOVED");
+                } catch (IOException ioe) {
+                    result.status = "ERROR";
+                    result.moved = false;
+                    log(
+                            "ERROR",
+                            "file=" + file.getName() + "\nreason=" + rootCause(ioe),
+                            serverIP,
+                            "FILE_ERROR");
+                }
+            } else {
+                result.status = "HEADER_ONLY";
+                result.moved = false;
+            }
+
+        } catch (FatalProcessingException fpe) {
+            rollbackQuietly(connection);
+            result.status = "ERROR";
+            result.moved = false;
+            result.inserted = 0;
+            log(
+                    "ERROR",
+                    "file=" + file.getName() + "\nreason=" + rootCause(fpe),
+                    serverIP,
+                    "FATAL_ERROR");
+        } catch (SQLException sqle) {
+            rollbackQuietly(connection);
+            result.status = "ERROR";
+            result.moved = false;
+            result.inserted = 0;
+            log(
+                    "ERROR",
+                    "file=" + file.getName() + "\nreason=" + rootCause(sqle),
+                    serverIP,
+                    "FATAL_ERROR");
+        } catch (RuntimeException re) {
+            rollbackQuietly(connection);
+            result.status = "ERROR";
+            result.moved = false;
+            result.inserted = 0;
+            log(
+                    "ERROR",
+                    "file=" + file.getName() + "\nreason=" + rootCause(re),
+                    serverIP,
+                    "FATAL_ERROR");
+        } catch (Exception ex) {
+            rollbackQuietly(connection);
+            result.status = "ERROR";
+            result.moved = false;
+            result.inserted = 0;
+            log(
+                    "ERROR",
+                    "file=" + file.getName() + "\nreason=" + rootCause(ex),
+                    serverIP,
+                    "FATAL_ERROR");
+        } finally {
+            closeQuietly(ps);
+            closeQuietly(connection);
+            closeQuietly(reader);
+
+            if (!commitSuccess && "SUCCESS".equals(result.status)) {
+                result.status = "ERROR";
+            }
+        }
+
+        logFileCompletion(result, serverIP);
+        return result;
+    }
+
+    private static List<File> collectCsvFiles(File inputPath) {
+        if (inputPath == null || !inputPath.exists()) {
+            return Collections.emptyList();
+        }
+
+        List<File> files = new ArrayList<File>();
+
+        if (inputPath.isFile()) {
+            if (isCsvFile(inputPath)) {
+                files.add(inputPath);
+            }
+            return files;
+        }
+
+        File[] listed = inputPath.listFiles();
+        if (listed == null || listed.length == 0) {
+            return files;
+        }
+
+        for (int i = 0; i < listed.length; i++) {
+            File f = listed[i];
+            if (f != null && f.isFile() && isCsvFile(f)) {
+                files.add(f);
+            }
+        }
+
+        Collections.sort(files, new Comparator<File>() {
+            public int compare(File a, File b) {
+                return a.getName().compareToIgnoreCase(b.getName());
+            }
+        });
+
+        return files;
+    }
+
+    private static boolean isCsvFile(File file) {
+        if (file == null) {
+            return false;
+        }
+        String name = file.getName();
+        if (name == null) {
+            return false;
+        }
+        return name.toLowerCase(Locale.ENGLISH).endsWith(".csv");
+    }
+
+    private static List<String> parseCsvLine(String line) throws FatalProcessingException {
+        List<String> values = new ArrayList<String>();
+        if (line == null) {
+            return values;
+        }
+
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+        int length = line.length();
+
+        for (int i = 0; i < length; i++) {
+            char ch = line.charAt(i);
+
+            if (ch == '"') {
+                if (inQuotes && i + 1 < length && line.charAt(i + 1) == '"') {
+                    current.append('"');
+                    i++;
+                } else {
+                    inQuotes = !inQuotes;
+                }
+            } else if (ch == '|' && !inQuotes) {
+                values.add(current.toString());
+                current.setLength(0);
+            } else {
+                current.append(ch);
+            }
+        }
+
+        if (inQuotes) {
+            throw new FatalProcessingException("unclosed_quotes");
+        }
+
+        values.add(current.toString());
+        return values;
+    }
+
+    private static String[] toArray(List<String> values) {
+        String[] arr = new String[values.size()];
+        for (int i = 0; i < values.size(); i++) {
+            arr[i] = values.get(i);
+        }
+        return arr;
+    }
+
+    private static RowData mapRow(String[] header, String[] row) throws FatalProcessingException {
+        if (header == null || header.length == 0) {
+            throw new FatalProcessingException("missing_header");
+        }
+
+        if (row == null) {
+            throw new FatalProcessingException("unexpected_null_row");
+        }
+
+        if (row.length > header.length) {
+            for (int i = header.length; i < row.length; i++) {
+                String extra = normalize(row[i]);
+                if (extra != null) {
+                    throw new FatalProcessingException("malformed_csv_row");
+                }
+            }
+        }
+
+        Map<String, String> sourceMap = new LinkedHashMap<String, String>();
+        for (int i = 0; i < header.length; i++) {
+            String h = cleanHeader(header[i]);
+            if (h == null || h.length() == 0) {
+                continue;
+            }
+
+            String value = null;
+            if (i < row.length) {
+                value = normalize(row[i]);
+            }
+            sourceMap.put(h.toLowerCase(Locale.ENGLISH), value);
+        }
+
+        String ckycNo = normalize(sourceMap.get("kli_kyc_no"));
+        if (ckycNo == null) {
+            return null;
+        }
+
+        String entityType = deriveEntityType(ckycNo);
+        if (entityType == null) {
+            return null;
+        }
+
+        String delinkStatus = sourceMap.get("delink_status");
+        boolean active = isEmptyTrim(delinkStatus);
+        String operationalStatus = active ? "ACTIVE" : "INACTIVE";
+
+        Map<String, String> metadata = new LinkedHashMap<String, String>();
+        for (int i = 0; i < header.length; i++) {
+            String h = cleanHeader(header[i]);
+            if (h == null || h.length() == 0) {
+                continue;
+            }
+
+            String lower = h.toLowerCase(Locale.ENGLISH);
+            if (isMappedHeader(lower)) {
+                continue;
+            }
+
+            String value = null;
+            if (i < row.length) {
+                value = normalize(row[i]);
+            }
+
+            if (value != null) {
+                metadata.put(lower, value);
+            }
+        }
+
+        RowData data = new RowData();
+        data.ckycNo = ckycNo;
+        data.entityType = entityType;
+        data.userId = sourceMap.get("kli_created_by");
+        data.operationalStatus = operationalStatus;
+        data.region = null;
+        data.regionCode = sourceMap.get("kli_reg_code");
+        data.relationType = "DOWNLOAD";
+        data.relationActive = Boolean.valueOf(active);
+        data.createdBy = sourceMap.get("kli_created_by");
+        data.updatedBy = sourceMap.get("kli_updated_by");
+        data.createdDate = parseTimestamp(sourceMap.get("kli_created_date"));
+        data.updatedDate = parseTimestamp(sourceMap.get("kli_updated_date"));
+        data.closedAt = null;
+        data.closedBy = null;
+        data.closureRemarks = null;
+        data.closureDate = null;
+        data.approverUserId = null;
+        data.approverReId = null;
+        data.workflowId = null;
+        data.fiCode = sourceMap.get("kli_fi_code");
+        data.branchCode = sourceMap.get("kli_br_code");
+        data.metadata = toJson(metadata);
+
+        return data;
+    }
+
+    private static boolean isMappedHeader(String lowerHeader) {
+        if (lowerHeader == null) {
+            return false;
+        }
+
+        for (int i = 0; i < MAPPED_HEADERS.length; i++) {
+            if (lowerHeader.equals(MAPPED_HEADERS[i])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String deriveEntityType(String ckycNo) {
+        if (ckycNo == null || ckycNo.length() == 0) {
+            return null;
+        }
+
+        char first = ckycNo.charAt(0);
+        if (first >= '1' && first <= '6') {
+            return "I";
+        }
+        if (first >= '7' && first <= '9') {
+            return "L";
+        }
+        return null;
+    }
+
+    private static Timestamp parseTimestamp(String value) throws FatalProcessingException {
+        value = normalize(value);
+        if (value == null) {
+            return null;
+        }
+
+        String[] patterns = new String[] {
+                "yyyy-MM-dd HH:mm:ss",
+                "yyyy-MM-dd HH:mm:ss.SSS",
+                "yyyy-MM-dd'T'HH:mm:ss",
+                "yyyy-MM-dd'T'HH:mm:ss.SSS",
+                "yyyy-MM-dd HH:mm:ssXXX",
+                "yyyy-MM-dd HH:mm:ss.SSSXXX",
+                "yyyy-MM-dd'T'HH:mm:ssXXX",
+                "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"
+        };
+
+        for (int i = 0; i < patterns.length; i++) {
+            try {
+                SimpleDateFormat sdf = new SimpleDateFormat(patterns[i]);
+                sdf.setLenient(false);
+                java.util.Date d = sdf.parse(value);
+                return new Timestamp(d.getTime());
+            } catch (Exception ex) {
+                // try next format
+            }
+        }
+
+        throw new FatalProcessingException("invalid_timestamp=" + value);
+    }
+
+    @SuppressWarnings("unused")
+    private static Date parseDate(String value) throws FatalProcessingException {
+        value = normalize(value);
+        if (value == null) {
+            return null;
+        }
+
+        String[] patterns = new String[] {
+                "yyyy-MM-dd",
+                "yyyy/MM/dd",
+                "dd-MM-yyyy",
+                "dd/MM/yyyy"
+        };
+
+        for (int i = 0; i < patterns.length; i++) {
+            try {
+                SimpleDateFormat sdf = new SimpleDateFormat(patterns[i]);
+                sdf.setLenient(false);
+                java.util.Date d = sdf.parse(value);
+                return new Date(d.getTime());
+            } catch (Exception ex) {
+                // try next format
+            }
+        }
+
+        throw new FatalProcessingException("invalid_date=" + value);
+    }
+
+    private static void bindRow(PreparedStatement ps, RowData row) throws SQLException {
+        int idx = 1;
+
+        ps.setString(idx++, row.ckycNo);
+        ps.setString(idx++, row.entityType);
+        ps.setString(idx++, row.userId);
+        ps.setString(idx++, row.operationalStatus);
+        ps.setString(idx++, row.region);
+        ps.setString(idx++, row.regionCode);
+        ps.setString(idx++, row.relationType);
+
+        if (row.relationActive == null) {
+            ps.setNull(idx++, java.sql.Types.BOOLEAN);
+        } else {
+            ps.setBoolean(idx++, row.relationActive.booleanValue());
+        }
+
+        ps.setString(idx++, row.createdBy);
+        ps.setString(idx++, row.updatedBy);
+
+        if (row.createdDate == null) {
+            ps.setNull(idx++, java.sql.Types.TIMESTAMP);
+        } else {
+            ps.setTimestamp(idx++, row.createdDate);
+        }
+
+        if (row.updatedDate == null) {
+            ps.setNull(idx++, java.sql.Types.TIMESTAMP);
+        } else {
+            ps.setTimestamp(idx++, row.updatedDate);
+        }
+
+        if (row.closedAt == null) {
+            ps.setNull(idx++, java.sql.Types.TIMESTAMP);
+        } else {
+            ps.setTimestamp(idx++, row.closedAt);
+        }
+
+        ps.setString(idx++, row.closedBy);
+        ps.setString(idx++, row.closureRemarks);
+
+        if (row.closureDate == null) {
+            ps.setNull(idx++, java.sql.Types.DATE);
+        } else {
+            ps.setDate(idx++, row.closureDate);
+        }
+
+        ps.setString(idx++, row.approverUserId);
+        ps.setString(idx++, row.approverReId);
+        ps.setString(idx++, row.workflowId);
+        ps.setString(idx++, row.fiCode);
+        ps.setString(idx++, row.branchCode);
+        ps.setString(idx++, row.metadata);
+    }
+
+    private static void moveFile(File sourceFile, File archiveDir) throws IOException {
+        if (sourceFile == null || archiveDir == null) {
+            return;
+        }
+
+        File targetFile = new File(archiveDir, sourceFile.getName());
+        Files.move(sourceFile.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    private static String buildInsertSql() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("INSERT INTO ").append(TARGET_TABLE).append(" (");
+        sb.append("ckyc_no, entity_type, user_id, operational_status, region, region_code, relation_type, relation_active, ");
+        sb.append("created_by, updated_by, created_date, updated_date, closed_at, closed_by, closure_remarks, closure_date, ");
+        sb.append("approver_user_id, approver_re_id, workflow_id, fi_code, branch_code, metadata");
+        sb.append(") VALUES (");
+        sb.append("?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS jsonb)");
+        sb.append(")");
+        return sb.toString();
+    }
+
+    private static String toJson(Map<String, String> map) {
+        if (map == null || map.isEmpty()) {
+            return "{}";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("{");
+
+        boolean first = true;
+        for (Map.Entry<String, String> entry : map.entrySet()) {
+            if (!first) {
+                sb.append(",");
+            }
+            first = false;
+
+            sb.append("\"");
+            sb.append(escapeJson(entry.getKey()));
+            sb.append("\":\"");
+            sb.append(escapeJson(entry.getValue()));
+            sb.append("\"");
+        }
+
+        sb.append("}");
+        return sb.toString();
+    }
+
+    private static String escapeJson(String value) {
+        if (value == null) {
+            return "";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            switch (ch) {
+                case '\\':
+                    sb.append("\\\\");
+                    break;
+                case '"':
+                    sb.append("\\\"");
+                    break;
+                case '\b':
+                    sb.append("\\b");
+                    break;
+                case '\f':
+                    sb.append("\\f");
+                    break;
+                case '\n':
+                    sb.append("\\n");
+                    break;
+                case '\r':
+                    sb.append("\\r");
+                    break;
+                case '\t':
+                    sb.append("\\t");
+                    break;
+                default:
+                    if (ch < 32) {
+                        String hex = Integer.toHexString(ch);
+                        sb.append("\\u");
+                        for (int j = hex.length(); j < 4; j++) {
+                            sb.append('0');
+                        }
+                        sb.append(hex);
+                    } else {
+                        sb.append(ch);
+                    }
+                    break;
+            }
+        }
+        return sb.toString();
+    }
+
+    private static String normalize(String value) {
+        if (value == null) {
+            return null;
+        }
+
+        String t = value.trim();
+        if (t.length() == 0) {
+            return null;
+        }
+
+        if ("\\N".equalsIgnoreCase(t)) {
+            return null;
+        }
+
+        if ("NULL".equalsIgnoreCase(t)) {
+            return null;
+        }
+
+        return t;
+    }
+
+    private static boolean isEmptyTrim(String value) {
+        return normalize(value) == null;
+    }
+
+    private static String cleanHeader(String header) {
+        header = normalize(header);
+        if (header == null) {
+            return null;
+        }
+        return removeBom(header);
+    }
+
+    private static String removeBom(String value) {
+        if (value == null) {
+            return null;
+        }
+        if (value.length() > 0 && value.charAt(0) == '\ufeff') {
+            return value.substring(1);
+        }
+        return value;
+    }
+
+    private static void rollbackQuietly(Connection connection) {
+        if (connection == null) {
+            return;
+        }
+        try {
+            connection.rollback();
+        } catch (Exception ex) {
+            // ignore
+        }
+    }
+
+    private static void closeQuietly(Closeable closeable) {
+        if (closeable == null) {
+            return;
+        }
+        try {
+            closeable.close();
+        } catch (Exception ex) {
+            // ignore
+        }
+    }
+
+    private static void closeQuietly(AutoCloseable closeable) {
+        if (closeable == null) {
+            return;
+        }
+        try {
+            closeable.close();
+        } catch (Exception ex) {
+            // ignore
+        }
+    }
+
+    private static String rootCause(Throwable t) {
+        if (t == null) {
+            return "unknown";
+        }
+
+        Throwable current = t;
+        while (current.getCause() != null && current.getCause() != current) {
+            current = current.getCause();
+        }
+
+        String msg = current.getMessage();
+        if (msg == null || msg.trim().length() == 0) {
+            msg = current.getClass().getSimpleName();
+        }
+        return msg;
+    }
+
+    private static void logFileCompletion(FileResult result, String serverIP) {
+        log(
+                "INFO",
+                "file=" + result.fileName
+                        + "\nstatus=" + result.status
+                        + "\ndata_rows=" + result.dataRows
+                        + "\ninserted=" + result.inserted
+                        + "\nskipped=" + result.skipped
+                        + "\ndb_failed=" + result.dbFailed
+                        + "\nrow_errors=" + result.rowErrors
+                        + "\nbatch_failures=" + result.batchFailures
+                        + "\nblank_lines=" + result.blankLines
+                        + "\neffective_batch_size=" + result.effectiveBatchSize
+                        + "\nmoved=" + result.moved,
+                serverIP,
+                "FILE_SUMMARY");
+    }
+
+    private static void logDirectorySummary(DirectoryResult result, String serverIP) {
+        log(
+                "INFO",
+                "total_files=" + result.totalFiles
+                        + "\ncompleted_files=" + result.completedFiles
+                        + "\nretained_files=" + result.retainedFiles
+                        + "\nempty_files=" + result.emptyFiles
+                        + "\nheader_only_files=" + result.headerOnlyFiles
+                        + "\nerror_files=" + result.errorFiles
+                        + "\ntotal_rows=" + result.totalRows
+                        + "\ninserted=" + result.inserted
+                        + "\nskipped=" + result.skipped
+                        + "\ndb_failed=" + result.dbFailed
+                        + "\nrow_errors=" + result.rowErrors
+                        + "\nbatch_failures=" + result.batchFailures
+                        + "\nblank_lines=" + result.blankLines,
+                serverIP,
+                "DIRECTORY_SUMMARY");
+    }
+
+    public static void log(String level, String message, String serverIP, String evtType) {
+        if ("DEBUG".equalsIgnoreCase(level) && !debugEnabled)
+            return;
+        String timestamp = LocalDateTime.now().format(LOG_FMT);
+        StringBuilder logBuilder = new StringBuilder(512);
+        logBuilder.append("Time:").append(timestamp).append(" [").append(capitalize(level)).append("] ")
+                .append("Process_Name: ").append(PROCESS_NAME).append(" ");
+        if (serverIP != null && !serverIP.isEmpty()) {
+            logBuilder.append("Server_IP: ").append(serverIP).append(" ");
+        }
+        logBuilder.append("Process_Version: ").append(PROCESS_VERSION).append(" ").append("Log_Level: EVT_LOG ")
+                .append(" EVT_Type: ").append(evtType != null ? evtType : "NA").append(" Description: ")
+                .append(message != null ? message : "");
+        System.out.println(logBuilder.toString().trim());
+    }
+
+    private static String capitalize(String level) {
+        if (level == null || level.length() == 0) {
+            return "Info";
+        }
+        String lower = level.toLowerCase(Locale.ENGLISH);
+        if ("debug".equals(lower)) {
+            return "Debug";
+        }
+        if ("error".equals(lower)) {
+            return "Error";
+        }
+        if ("warn".equals(lower) || "warning".equals(lower)) {
+            return "Warn";
+        }
+        if ("info".equals(lower)) {
+            return "Info";
+        }
+        return level.substring(0, 1).toUpperCase(Locale.ENGLISH) + level.substring(1).toLowerCase(Locale.ENGLISH);
+    }
+
+    private static class FileResult {
+        String fileName;
+        String status = "PENDING";
+        int dataRows = 0;
+        int inserted = 0;
+        int skipped = 0;
+        int dbFailed = 0;
+        int rowErrors = 0;
+        int batchFailures = 0;
+        int blankLines = 0;
+        int effectiveBatchSize = 0;
+        boolean moved = false;
+
+        FileResult(String fileName) {
+            this.fileName = fileName;
+        }
+    }
+
+    private static class DirectoryResult {
+        int totalFiles = 0;
+        int completedFiles = 0;
+        int retainedFiles = 0;
+        int emptyFiles = 0;
+        int headerOnlyFiles = 0;
+        int errorFiles = 0;
+        int totalRows = 0;
+        int inserted = 0;
+        int skipped = 0;
+        int dbFailed = 0;
+        int rowErrors = 0;
+        int batchFailures = 0;
+        int blankLines = 0;
+    }
+
+    private static class RowData {
+        String ckycNo;
+        String entityType;
+        String userId;
+        String operationalStatus;
+        String region;
+        String regionCode;
+        String relationType;
+        Boolean relationActive;
+        String createdBy;
+        String updatedBy;
+        Timestamp createdDate;
+        Timestamp updatedDate;
+        Timestamp closedAt;
+        String closedBy;
+        String closureRemarks;
+        Date closureDate;
+        String approverUserId;
+        String approverReId;
+        String workflowId;
+        String fiCode;
+        String branchCode;
+        String metadata;
+    }
+
+    private static class FatalProcessingException extends Exception {
+        FatalProcessingException(String message) {
+            super(message);
+        }
+    }
+
+    private static class ExecutorServiceHolder {
+        private final java.util.concurrent.ExecutorService executor;
+
+        ExecutorServiceHolder(int poolSize) {
+            this.executor = java.util.concurrent.Executors.newFixedThreadPool(poolSize);
+        }
+
+        <T> java.util.concurrent.Future<T> submit(java.util.concurrent.Callable<T> task) {
+            return executor.submit(task);
+        }
+
+        void shutdown() {
+            executor.shutdown();
+        }
+    }
+}

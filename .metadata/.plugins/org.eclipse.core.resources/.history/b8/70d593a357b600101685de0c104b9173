@@ -1,0 +1,49 @@
+package rest_api_job;
+
+import rest_api_job.rest_api_methods;
+
+public class rest_job_api_main {
+    public static void main(String[] args) {
+        System.out.println("Length of arguments: " + args.length + "\n\n");
+        for (String string : args) {
+            System.out.println("-------------- " + string + " ------------");
+        }
+
+        if (args.length == 8) {
+            // Arguments in order:
+            // args[0] = enterpriseName
+            // args[1] = username
+            // args[2] = password (not used in GET flow, can pass dummy)
+            // args[3] = confirmPassword (dummy)
+            // args[4] = accessKey (dummy)
+            // args[5] = secretKey (dummy)
+            // args[6] = bucketName
+            // args[7] = userQuota (dummy)
+            
+            try {
+                new rest_api_methods().run(
+                    args[0], // enterpriseName
+                    args[1], // username
+                    args[2], // password
+                    args[3], // confirmPassword
+                    args[4], // accessKey
+                    args[5], // secretKey
+                    args[6], // bucketName
+                    args[7]  // userQuota
+                );
+                System.out.println("============================================================");
+                System.out.println("========= GET API execution completed successfully =========");
+                System.out.println("============================================================");
+            } catch (Exception e) {
+                System.out.println("======================================================");
+                System.out.println("========= GET API execution failed ====================");
+                System.out.println("======================================================");
+                e.printStackTrace();
+            }
+        } else {
+            System.out.println("===================EXCEPTION JAR==================================");
+            System.out.println("EXCEPTION JAR: Please enter parameters in required order : ");
+            System.out.println("enterpriseName username password confirmPassword accessKey secretKey bucketName userQuota");
+        }
+    }
+}

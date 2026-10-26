@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<classpath>
+	<classpathentry kind="src" path="Frequency_Export_Process_CSV_Diff_Name_MySql8_1.1/Source/src"/>
+	<classpathentry kind="con" path="org.eclipse.jdt.launching.JRE_CONTAINER"/>
+	<classpathentry kind="output" path="Frequency_Export_Process_CSV_Diff_Name_MySql8_1.1/EyeQ_Department_Wise_Summary_1.0/bin"/>
+</classpath>

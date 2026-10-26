@@ -1,0 +1,533 @@
+package postgre_agent_v4;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.nio.file.*;
+import java.sql.*;
+import java.sql.Date;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * CSV_TO_DB Agent (dual-DB: PostgreSQL or MySQL via JDBC)
+ *
+ * Features:
+ * - Processes CSV files from a directory in chronological order based on the timestamp
+ *   embedded in the filename (format: yyyy_MM_dd_HH_mm_ss).
+ * - Destination DB selectable via --dbType=psql|sql and JDBC creds (--destDbUrl, --destDbUser, --destDbPass).
+ * - Optional auto table creation from CSV header (sanitizes column names).
+ * - Batch inserts with PreparedStatement.
+ * - Simple logging with counts and timing.
+ *
+ * Usage examples:
+ *  PostgreSQL:
+ *    java -jar agent.jar \
+ *      --dbType=psql \
+ *      --destDbUrl=jdbc:postgresql://127.0.0.1:5432/mydb \
+ *      --destDbUser=postgres \
+ *      --destDbPass=secret \
+ *      --inputDir=/data/incoming \
+ *      --tableName=my_table \
+ *      --delimiter=, \
+ *      --batchSize=1000 \
+ *      --createTable=true
+ *
+ *  MySQL:
+ *    java -jar agent.jar \
+ *      --dbType=sql \
+ *      --destDbUrl=jdbc:mysql://127.0.0.1:3306/mydb?rewriteBatchedStatements=true \
+ *      --destDbUser=root \
+ *      --destDbPass=secret \
+ *      --inputDir=/data/incoming \
+ *      --tableName=my_table \
+ *      --delimiter=, \
+ *      --batchSize=2000 \
+ *      --createTable=true
+ */
+public class postgre_v4_methods_test {
+    private static final String PROCESS_NAME = "CSV_TO_DB";
+    private static final Pattern TS_IN_NAME = Pattern.compile("(\\d{4}_\\d{2}_\\d{2}_\\d{2}_\\d{2}_\\d{2})"); // yyyy_MM_dd_HH_mm_ss
+    private static final DateTimeFormatter TS_FMT = DateTimeFormatter.ofPattern("yyyy_MM_dd_HH_mm_ss");
+
+    public static void main(String[] args) {
+        long t0 = System.nanoTime();
+        log("Starting %s", PROCESS_NAME);
+
+        Map<String, String> cfg = parseArgs(args);
+
+        // Required args
+        String dbType     = cfg.getOrDefault("dbType", "psql").toLowerCase(Locale.ROOT); // psql | sql
+        String destDbUrl  = require(cfg, "destDbUrl");
+        String destDbUser = require(cfg, "destDbUser");
+        String destDbPass = require(cfg, "destDbPass");
+        String inputDir   = require(cfg, "inputDir");
+        String tableName  = require(cfg, "tableName");
+
+        // Optional args
+        String delimiter  = cfg.getOrDefault("delimiter", ",");
+        int batchSize     = parseInt(cfg.getOrDefault("batchSize", "1000"), 1000);
+        boolean createTbl = parseBoolean(cfg.getOrDefault("createTable", "true"));
+        boolean headerPresent = parseBoolean(cfg.getOrDefault("header", "true"));
+        boolean continueOnError = parseBoolean(cfg.getOrDefault("continueOnError", "true"));
+        String timezone = cfg.getOrDefault("tz", "Asia/Kolkata");
+
+        // Log environment
+        log("dbType=%s", dbType);
+        log("destDbUrl=%s", destDbUrl);
+        log("inputDir=%s", inputDir);
+        log("tableName=%s", tableName);
+        log("delimiter='%s', batchSize=%d, createTable=%s, header=%s, continueOnError=%s, tz=%s",
+                delimiter, batchSize, createTbl, headerPresent, continueOnError, timezone);
+
+        // Connect
+        try (Connection conn = connect(dbType, destDbUrl, destDbUser, destDbPass)) {
+            conn.setAutoCommit(false);
+            log("Connected to DB");
+
+            // Discover files
+            List<File> files = listCsvFilesChronologically(inputDir);
+            if (files.isEmpty()) {
+                log("No CSV files to process. Exiting.");
+                return;
+            }
+            log("Found %d file(s) to process", files.size());
+
+            // Process each file
+            long totalRows = 0L, totalFailed = 0L;
+            int fileIndex = 0;
+            for (File f : files) {
+                fileIndex++;
+                log("(%d/%d) Processing file: %s", fileIndex, files.size(), f.getName());
+                try {
+                    FileProcessResult r = processOneCsv(conn, f, tableName, delimiter, batchSize, createTbl, headerPresent, dbType);
+                    totalRows += r.inserted;
+                    totalFailed += r.failed;
+                    conn.commit();
+                    log("Committed file: %s (inserted=%d, failed=%d)", f.getName(), r.inserted, r.failed);
+                } catch (Exception ex) {
+                    logErr("Error processing file %s: %s", f.getName(), ex.toString());
+                    if (!continueOnError) {
+                        logErr("Halting due to error (continueOnError=false). Rolling back...");
+                        try { conn.rollback(); } catch (SQLException ignored) {}
+                        throw ex;
+                    } else {
+                        try { conn.rollback(); } catch (SQLException ignored) {}
+                        logErr("Rolled back file %s but continuing (continueOnError=true).", f.getName());
+                    }
+                }
+            }
+
+            long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+            log("DONE. Files=%d, TotalInserted=%d, TotalFailed=%d, Elapsed=%d ms", files.size(), totalRows, totalFailed, ms);
+
+        } catch (Exception e) {
+            logErr("Fatal: %s", e.toString());
+            e.printStackTrace(System.err);
+        } finally {
+            MemoryMXBean mem = ManagementFactory.getMemoryMXBean();
+            log("Heap: used=%dMB, committed=%dMB", mem.getHeapMemoryUsage().getUsed() / (1024 * 1024), mem.getHeapMemoryUsage().getCommitted() / (1024 * 1024));
+            log("Exiting %s", PROCESS_NAME);
+        }
+    }
+
+    // ---------- Core CSV processing ----------
+
+    private static FileProcessResult processOneCsv(Connection conn,
+                                                  File csv,
+                                                  String tableName,
+                                                  String delimiter,
+                                                  int batchSize,
+                                                  boolean createTable,
+                                                  boolean headerPresent,
+                                                  String dbType) throws Exception {
+
+        try (BufferedReader br = new BufferedReader(new FileReader(csv))) {
+            String headerLine;
+            List<String> headers;
+
+            if (headerPresent) {
+                headerLine = br.readLine();
+                if (headerLine == null) {
+                    return new FileProcessResult(0, 0);
+                }
+                headers = parseCsvLine(headerLine, delimiter);
+            } else {
+                // If no header, we must infer column count from first data line
+                headerLine = br.readLine();
+                if (headerLine == null) {
+                    return new FileProcessResult(0, 0);
+                }
+                List<String> firstData = parseCsvLine(headerLine, delimiter);
+                headers = generateColumnNames(firstData.size());
+                // Rewind logic isn't trivial; instead we’ll process the firstData row explicitly first
+                // and then proceed with the rest of the file.
+                if (createTable) {
+                    ensureTable(conn, tableName, headers, dbType);
+                }
+                long[] counts = insertRows(conn, tableName, headers, batchSize, Arrays.asList(firstData), br, delimiter);
+                return new FileProcessResult(counts[0], counts[1]);
+            }
+
+            // Sanitize headers, ensure uniqueness
+            headers = sanitizeHeaders(headers);
+
+            if (createTable) {
+                ensureTable(conn, tableName, headers, dbType);
+            }
+
+            long[] counts = insertRows(conn, tableName, headers, batchSize, null, br, delimiter);
+            return new FileProcessResult(counts[0], counts[1]);
+        }
+    }
+
+    /**
+     * Insert rows using PreparedStatement in batches.
+     * Optionally seeds with a first row (firstRow) if provided (used when header=false).
+     */
+    private static long[] insertRows(Connection conn,
+                                     String tableName,
+                                     List<String> headers,
+                                     int batchSize,
+                                     List<String> firstRow,
+                                     BufferedReader br,
+                                     String delimiter) throws Exception {
+        String sql = buildInsertSQL(tableName, headers);
+        long inserted = 0L, failed = 0L;
+
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            int batchCount = 0;
+
+            if (firstRow != null) {
+                setRowParams(ps, headers.size(), firstRow);
+                ps.addBatch();
+                batchCount++;
+            }
+
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.isEmpty()) continue;
+                List<String> cols = parseCsvLine(line, delimiter);
+                // Resize to match header count
+                if (cols.size() < headers.size()) {
+                    // pad with nulls
+                    while (cols.size() < headers.size()) cols.add(null);
+                } else if (cols.size() > headers.size()) {
+                    // truncate extras
+                    cols = cols.subList(0, headers.size());
+                }
+
+                try {
+                    setRowParams(ps, headers.size(), cols);
+                    ps.addBatch();
+                    batchCount++;
+                } catch (SQLException ex) {
+                    failed++;
+                    // skip this row
+                }
+
+                if (batchCount >= batchSize) {
+                    int[] res = ps.executeBatch();
+                    inserted += countSuccessful(res);
+                    batchCount = 0;
+                }
+            }
+
+            if (batchCount > 0) {
+                int[] res = ps.executeBatch();
+                inserted += countSuccessful(res);
+            }
+        }
+
+        return new long[]{inserted, failed};
+    }
+
+    private static int countSuccessful(int[] results) {
+        int ok = 0;
+        for (int r : results) {
+            if (r == Statement.SUCCESS_NO_INFO || r >= 0) ok++;
+        }
+        return ok;
+    }
+
+    private static void setRowParams(PreparedStatement ps, int cols, List<String> values) throws SQLException {
+        for (int i = 0; i < cols; i++) {
+            String v = i < values.size() ? values.get(i) : null;
+            if (v == null || v.isEmpty()) {
+                ps.setNull(i + 1, Types.VARCHAR);
+            } else {
+                ps.setString(i + 1, v);
+            }
+        }
+    }
+
+    // ---------- Table management ----------
+
+    private static void ensureTable(Connection conn, String tableName, List<String> headers, String dbType) throws SQLException {
+        if (tableExists(conn, tableName)) {
+            log("Table '%s' exists", tableName);
+            return;
+        }
+        String ddl = buildCreateTableDDL(tableName, headers, dbType);
+        try (Statement st = conn.createStatement()) {
+            st.execute(ddl);
+            log("Created table '%s'", tableName);
+        }
+    }
+
+    private static boolean tableExists(Connection conn, String tableName) throws SQLException {
+        DatabaseMetaData md = conn.getMetaData();
+        try (ResultSet rs = md.getTables(null, null, tableName, new String[]{"TABLE"})) {
+            return rs.next();
+        }
+    }
+
+    /**
+     * Create a simple, portable table:
+     * - All CSV columns as TEXT/VARCHAR (no length limit issues for PG TEXT; MySQL TEXT is fine for general use).
+     * - Avoids DB-specific auto-id extras to keep it generic.
+     */
+    private static String buildCreateTableDDL(String tableName, List<String> headers, String dbType) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("CREATE TABLE ").append(ident(tableName, dbType)).append(" (");
+        for (int i = 0; i < headers.size(); i++) {
+            String col = headers.get(i);
+            sb.append(ident(col, dbType)).append(" ");
+            if (dbType.equals("psql") || dbType.equals("postgres") || dbType.equals("postgresql")) {
+                sb.append("TEXT");
+            } else {
+                // MySQL
+                sb.append("TEXT");
+            }
+            if (i < headers.size() - 1) sb.append(", ");
+        }
+        sb.append(")");
+        return sb.toString();
+    }
+
+    private static String buildInsertSQL(String tableName, List<String> headers) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("INSERT INTO ").append(tableName).append(" (");
+        for (int i = 0; i < headers.size(); i++) {
+            sb.append(headers.get(i));
+            if (i < headers.size() - 1) sb.append(", ");
+        }
+        sb.append(") VALUES (");
+        for (int i = 0; i < headers.size(); i++) {
+            sb.append("?");
+            if (i < headers.size() - 1) sb.append(", ");
+        }
+        sb.append(")");
+        return sb.toString();
+    }
+
+    // ---------- File discovery & ordering ----------
+
+    private static List<File> listCsvFilesChronologically(String dir) {
+        File d = new File(dir);
+        if (!d.exists() || !d.isDirectory()) {
+            logErr("Input dir not found or not a directory: %s", dir);
+            return Collections.emptyList();
+        }
+        File[] files = d.listFiles((f, name) -> name.toLowerCase(Locale.ROOT).endsWith(".csv"));
+        if (files == null || files.length == 0) return Collections.emptyList();
+
+        List<FileWithTime> withTimes = new ArrayList<>();
+        for (File f : files) {
+            LocalDateTime ts = extractTimestampFromName(f.getName());
+            if (ts == null) {
+                // If no timestamp, fall back to file lastModified
+                ts = LocalDateTime.ofInstant(
+                        new Date(f.lastModified()).toInstant(),
+                        ZoneId.systemDefault());
+            }
+            withTimes.add(new FileWithTime(f, ts));
+        }
+
+        withTimes.sort(Comparator.comparing(fwt -> fwt.ts));
+        List<File> ordered = new ArrayList<>(withTimes.size());
+        for (FileWithTime fwt : withTimes) ordered.add(fwt.file);
+        return ordered;
+    }
+
+    private static LocalDateTime extractTimestampFromName(String name) {
+        Matcher m = TS_IN_NAME.matcher(name);
+        if (m.find()) {
+            String ts = m.group(1);
+            try {
+                return LocalDateTime.parse(ts, TS_FMT);
+            } catch (Exception ignored) { }
+        }
+        return null;
+    }
+
+    // ---------- CSV helpers ----------
+
+    private static List<String> parseCsvLine(String line, String delimiter) {
+        // Simple CSV parser supporting quoted fields with delimiter inside quotes.
+        // For heavy CSVs, replace with a robust library (OpenCSV/Commons CSV).
+        List<String> out = new ArrayList<>();
+        if (line == null) return out;
+
+        char delim = delimiter.charAt(0);
+        StringBuilder cur = new StringBuilder();
+        boolean inQuotes = false;
+
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+
+            if (c == '"') {
+                if (inQuotes && i + 1 < line.length() && line.charAt(i + 1) == '"') {
+                    // Escaped quote
+                    cur.append('"');
+                    i++; // skip next
+                } else {
+                    inQuotes = !inQuotes;
+                }
+            } else if (c == delim && !inQuotes) {
+                out.add(cur.toString());
+                cur.setLength(0);
+            } else {
+                cur.append(c);
+            }
+        }
+        out.add(cur.toString());
+        return out;
+    }
+
+    private static List<String> sanitizeHeaders(List<String> raw) {
+        List<String> out = new ArrayList<>(raw.size());
+        Set<String> used = new HashSet<>();
+        for (int i = 0; i < raw.size(); i++) {
+            String h = raw.get(i);
+            if (h == null) h = "col_" + (i + 1);
+            h = h.trim().toLowerCase(Locale.ROOT);
+            // Replace non [a-zA-Z0-9_] with _
+            h = h.replaceAll("[^A-Za-z0-9_]", "_");
+            // If starts with digit, prefix
+            if (h.isEmpty() || Character.isDigit(h.charAt(0))) {
+                h = "c_" + h;
+            }
+            // collapse multiple underscores
+            h = h.replaceAll("_+", "_");
+            // ensure uniqueness
+            String base = h;
+            int k = 1;
+            while (used.contains(h)) {
+                h = base + "_" + k++;
+            }
+            used.add(h);
+            out.add(h);
+        }
+        return out;
+    }
+
+    private static List<String> generateColumnNames(int n) {
+        List<String> cols = new ArrayList<>(n);
+        for (int i = 1; i <= n; i++) cols.add("col_" + i);
+        return cols;
+    }
+
+    // ---------- DB connection / utils ----------
+
+    private static Connection connect(String dbType, String url, String user, String pass) throws Exception {
+        switch (dbType) {
+            case "psql":
+            case "postgres":
+            case "postgresql":
+                Class.forName("org.postgresql.Driver");
+                break;
+            case "sql":
+            case "mysql":
+                Class.forName("com.mysql.cj.jdbc.Driver");
+                break;
+            default:
+                throw new IllegalArgumentException("Unsupported dbType: " + dbType + " (use psql|sql)");
+        }
+        return DriverManager.getConnection(url, user, pass);
+    }
+
+    /**
+     * Identifier quoting. We’ve already sanitized names into [a-z0-9_],
+     * so we can just return them. If you want strict quoting:
+     *  - PG: return "\"" + name + "\""
+     *  - MySQL: return "`" + name + "`"
+     */
+    private static String ident(String name, String dbType) {
+        return name; // kept simple since we sanitize headers & accept simple tableName
+    }
+
+    // ---------- Args / logging helpers ----------
+
+    private static Map<String, String> parseArgs(String[] args) {
+        Map<String, String> map = new LinkedHashMap<>();
+        for (String a : args) {
+            if (a.startsWith("--")) {
+                int i = a.indexOf('=');
+                if (i > 2) {
+                    String k = a.substring(2, i);
+                    String v = a.substring(i + 1);
+                    map.put(k, v);
+                } else {
+                    map.put(a.substring(2), "true");
+                }
+            }
+        }
+        return map;
+    }
+
+    private static String require(Map<String, String> cfg, String key) {
+        String v = cfg.get(key);
+        if (v == null || v.isEmpty()) {
+            throw new IllegalArgumentException("Missing required arg --" + key);
+        }
+        return v;
+    }
+
+    private static int parseInt(String s, int def) {
+        try { return Integer.parseInt(s.trim()); } catch (Exception e) { return def; }
+    }
+
+    private static boolean parseBoolean(String s) {
+        if (s == null) return false;
+        String v = s.trim().toLowerCase(Locale.ROOT);
+        return v.equals("true") || v.equals("1") || v.equals("yes") || v.equals("y");
+    }
+
+    private static void log(String fmt, Object... args) {
+        String ts = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").format(LocalDateTime.now());
+        System.out.printf("[%s] [%s] %s%n", ts, PROCESS_NAME, String.format(fmt, args));
+    }
+
+    private static void logErr(String fmt, Object... args) {
+        String ts = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").format(LocalDateTime.now());
+        System.err.printf("[%s] [%s] %s%n", ts, PROCESS_NAME, String.format(fmt, args));
+    }
+
+    // ---------- small DTOs ----------
+
+    private static class FileProcessResult {
+        final long inserted;
+        final long failed;
+        FileProcessResult(long inserted, long failed) {
+            this.inserted = inserted;
+            this.failed = failed;
+        }
+    }
+
+    private static class FileWithTime {
+        final File file;
+        final LocalDateTime ts;
+        FileWithTime(File f, LocalDateTime ts) {
+            this.file = f; this.ts = ts;
+        }
+    }
+}

@@ -1,0 +1,135 @@
+package rest_api_volQuota;
+
+
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.util.regex.*;
+
+public class rest_api_methods {
+
+    private static final String BASE_URL = "https://poc.itsimple.in/restapi/schema/swagger/";
+
+    // Hardcoded authentication credentials
+    private static final String AUTH_NAME = "root";
+    private static final String AUTH_PASSWORD = "ATempo@123";
+
+    // Public entry point for the main class
+    public void run(String enterpriseName, String username, String password, String confirmPassword,
+                    String accessKey, String secretKey, String bucketName, String userQuota) throws Exception {
+
+        System.out.println("===== API Flow Started for Enterprise: " + enterpriseName + " =====");
+
+        String token = authenticate();
+        if (token == null) {
+            System.out.println("[ERROR] Authentication failed. Exiting...");
+            return;
+        }
+
+        Map<String, String> repo = getRepositoryDetails(token);
+        if (repo == null || repo.isEmpty()) {
+            System.out.println("[ERROR] Repository details could not be fetched.");
+            return;
+        }
+
+        DBConnection db = new DBConnection();
+        db.insertEnterpriseDetails(repo.get("name"), repo.get("id"), repo.get("volumeQuota"));
+
+        System.out.println("===== API Flow Completed Successfully for: " + enterpriseName + " =====");
+    }
+
+    // Step 1: Authentication
+    private String authenticate() {
+        try {
+            System.out.println("[INFO] Authenticating user...");
+
+            String authUrl = BASE_URL + "auth/token";
+            HttpURLConnection conn = (HttpURLConnection) new URL(authUrl).openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setDoOutput(true);
+
+            String jsonBody = "{\"name\":\"" + AUTH_NAME + "\",\"password\":\"" + AUTH_PASSWORD + "\"}";
+
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(jsonBody.getBytes());
+                os.flush();
+            }
+
+            int code = conn.getResponseCode();
+            if (code != 202 && code != 200) {
+                System.out.println("[ERROR] Authentication failed with code: " + code);
+                return null;
+            }
+
+            BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+            String response = br.lines().reduce("", (a, b) -> a + b);
+
+            String token = extractValue(response, "\"access\":\"(.*?)\"");
+            if (token == null || token.isEmpty()) {
+                System.out.println("[ERROR] Token not found in response.");
+                return null;
+            }
+
+            System.out.println("[INFO] Access Token retrieved successfully.");
+            return token;
+
+        } catch (Exception e) {
+            System.out.println("[EXCEPTION] During authentication: " + e.getMessage());
+            return null;
+        }
+    }
+
+    // Step 2: Fetch Repository Details
+    private Map<String, String> getRepositoryDetails(String token) {
+        Map<String, String> repoMap = new HashMap<>();
+        try {
+            System.out.println("[INFO] Fetching repository details...");
+
+            String repoUrl = BASE_URL + "datamanagement/repositories/";
+            HttpURLConnection conn = (HttpURLConnection) new URL(repoUrl).openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+            conn.setRequestProperty("Accept", "application/json");
+
+            int code = conn.getResponseCode();
+            if (code != 200) {
+                System.out.println("[ERROR] Repository API failed with code: " + code);
+                return null;
+            }
+
+            BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+            String response = br.lines().reduce("", (a, b) -> a + b);
+
+            String id = extractValue(response, "\"id\":\\s*(\\d+)");
+            String name = extractValue(response, "\"name\":\\s*\"(.*?)\"");
+            String volumeQuota = extractValue(response, "\"volumeQuota\":\\s*\"(\\d+)\"");
+
+            if (id == null || name == null || volumeQuota == null) {
+                System.out.println("[ERROR] Failed to extract fields from API response.");
+                return null;
+            }
+
+            repoMap.put("id", id);
+            repoMap.put("name", name);
+            repoMap.put("volumeQuota", volumeQuota);
+
+            System.out.println("[INFO] Repository details fetched: " + repoMap);
+            return repoMap;
+
+        } catch (Exception e) {
+            System.out.println("[EXCEPTION] During repository fetch: " + e.getMessage());
+            return null;
+        }
+    }
+
+    // Helper: Extracts a value from JSON using regex
+    private String extractValue(String text, String regex) {
+        Pattern p = Pattern.compile(regex);
+        Matcher m = p.matcher(text);
+        if (m.find()) {
+            return m.group(1);
+        }
+        return null;
+    }
+}

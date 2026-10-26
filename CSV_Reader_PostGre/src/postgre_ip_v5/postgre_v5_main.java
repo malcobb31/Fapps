@@ -1,0 +1,57 @@
+package postgre_ip_v5;
+
+
+
+public class postgre_v5_main {
+    public static void main(String[] args) throws Exception {
+        System.out.println("Length of arguments: " + args.length);
+        for (String arg : args) {
+            System.out.println("-------------- " + arg + " ------------");
+        }
+        
+        PostgreV5Methods obj = new PostgreV5Methods();
+        
+        if (args.length == 21) {
+            // Call the method that scans directory and processes all raw_*.csv files
+//            postgre_v4_methods_test.processAllInDirectory
+        	obj.processAllInDirectory
+            (
+                args[0],  // directory containing CSVs
+                args[1],  // dir for processed file
+                args[2],  // header yes/no
+                args[3],  // delimeter
+                args[4],  // sqldburl
+                args[5],  // sdbuser
+                args[6],  // sdbpass
+                args[7],  // postgredbhost
+                args[8],  // pdbport
+                args[9],  // pdbname
+                args[10], // pdbuser
+                args[11], // pdbpass
+                args[12], // desturl
+                args[13], // destuser
+                args[14], // dbpass
+                args[15], // how many table to pick
+                args[16], // config table name
+                args[17], // CPU MAX UTILIZATION
+                args[18], // CPU MAX MEMORY UTIL
+                args[19], // bulk number for batch
+                args[20]  // dbtype_variable (sql or psql)
+            );
+       
+
+            System.out.println("============================================================");
+            System.out.println("============= Directory scan & import complete =============");
+            System.out.println("============================================================");
+        } 
+        else {
+        	
+            System.out.println("=================== INVALID ARGUMENTS ======================");
+            System.out.println("Usage:");
+            System.out.println("<dirPath> <processedDirPath> <headerFlag> <delimiter> " +
+                         "<dbUrl> <dbUser> <dbPass> <pdbHost> <pdbPort> <pdbName> <pdbUser> <pdbPass> " +
+                         "<dest_sql_url> <dest_sql_user> <dest_sql_pass> <numTablesToPickStr> <config_table> "
+                         + "<MAX_CPU_UTILIZATION> <MAX_MEMORY_UTILIZATION> <bulkNumberStr> <dbTypeStr>");
+        }
+    }
+}

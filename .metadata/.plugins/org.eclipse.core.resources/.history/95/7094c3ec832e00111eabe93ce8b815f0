@@ -1,0 +1,154 @@
+package tp3_parser;
+
+public class tp3_main_v1 {
+    
+    public static void main(String[] args) {
+        
+        System.out.println("========================================");
+        System.out.println("PostgreSQL Boolean Parser - STARTED");
+        System.out.println("========================================");
+        System.out.println("Length of arguments: " + args.length + "\n");
+        
+        for (String arg : args) {
+            System.out.println("--------------" + arg + "------------");
+        }
+        
+        // TP2 Expected arguments (9):
+        // args[0] = DB URL (jdbc:postgresql://host:port/database)
+        // args[1] = DB Username
+        // args[2] = DB Password
+        // args[3] = Source Table Name
+        // args[4] = Target Table Name
+        // args[5] = Source Columns (comma-separated: col1,col2,col3)
+        // args[6] = Target Columns (comma-separated: col1,col2,col3)
+        // args[7] = Source Check Column (column containing 'I'/'A' values)
+        // args[8] = Target Boolean Column (column to store TRUE/FALSE)
+        //
+        // TP3 Expected arguments (11):
+        // args[0]  = DB URL (jdbc:postgresql://host:port/database)
+        // args[1]  = DB Username
+        // args[2]  = DB Password
+        // args[3]  = (unused - pass empty string "" or any placeholder)
+        // args[4]  = Target Table Name
+        // args[5]  = Source Columns in CSV (comma-separated: col1,col2,col3)
+        // args[6]  = Target Columns (comma-separated: col1,col2,col3)
+        // args[7]  = Source Check Column (CSV header name containing 'I'/'A' values)
+        // args[8]  = Target Boolean Column (column to store TRUE/FALSE)
+        // args[9]  = CSV File Path (absolute path to input CSV file)
+        // args[10] = Flag Column Index (0-based index in record[] where flag value lives;
+        //            typically = number of source columns, e.g. pass the count of args[5] columns)
+        
+        if (args.length == 9) {
+            
+            // ===== TP2: DB source  target =====
+            String dbURL            = args[0];
+            String dbUsername       = args[1];
+            String dbPassword       = args[2];
+            String sourceTableName  = args[3];
+            String targetTableName  = args[4];
+            String sourceColumns    = args[5];
+            String targetColumns    = args[6];
+            String sourceCheckColumn   = args[7];
+            String targetBooleanColumn = args[8];
+            
+            if (new ProcessData().parseAndTransferData(
+                    dbURL,
+                    dbUsername,
+                    dbPassword,
+                    sourceTableName,
+                    targetTableName,
+                    sourceColumns,
+                    targetColumns,
+                    sourceCheckColumn,
+                    targetBooleanColumn)) {
+                
+                System.out.println("============================================================");
+                System.out.println("========Data successfully parsed and transferred===========");
+                System.out.println("============================================================");
+                
+            } else {
+                
+                System.out.println("=====================FAILED=================================");
+                System.out.println("========Data parsing and transfer failed====================");
+                System.out.println("=====================FAILED=================================");
+            }
+            
+        } else if (args.length == 11) {
+            
+            // ===== TP3: CSV source  target =====
+            String dbURL               = args[0];
+            String dbUsername          = args[1];
+            String dbPassword          = args[2];
+            // args[3] is unused in TP3 (no source table); kept for positional consistency
+            String targetTableName     = args[4];
+            String sourceColumns       = args[5];
+            String targetColumns       = args[6];
+            String sourceCheckColumn   = args[7];
+            String targetBooleanColumn = args[8];
+            String csvFilePath         = args[9];
+            int    flagColumnIndex;
+            
+            try {
+                flagColumnIndex = Integer.parseInt(args[10].trim());
+            } catch (NumberFormatException e) {
+                System.out.println("===================EXCEPTION JAR============================");
+                System.out.println("EXCEPTION JAR: args[10] (flagColumnIndex) must be an integer. Received: " + args[10]);
+                System.out.println("===================EXCEPTION JAR============================");
+                return;
+            }
+            
+            if (new ProcessData().parseAndTransferDataFromCSV(
+                    dbURL,
+                    dbUsername,
+                    dbPassword,
+                    targetTableName,
+                    sourceColumns,
+                    targetColumns,
+                    sourceCheckColumn,
+                    targetBooleanColumn,
+                    csvFilePath,
+                    flagColumnIndex)) {
+                
+                System.out.println("============================================================");
+                System.out.println("========Data successfully parsed and transferred===========");
+                System.out.println("============================================================");
+                
+            } else {
+                
+                System.out.println("=====================FAILED=================================");
+                System.out.println("========Data parsing and transfer failed====================");
+                System.out.println("=====================FAILED=================================");
+            }
+            
+        } else {
+            
+            System.out.println("===================EXCEPTION JAR============================");
+            System.out.println("EXCEPTION JAR: Please enter parameters in required order.");
+            System.out.println();
+            System.out.println("--- TP2 (DB source, 9 arguments) ---");
+            System.out.println("1.  DB URL (jdbc:postgresql://host:port/database)");
+            System.out.println("2.  DB Username");
+            System.out.println("3.  DB Password");
+            System.out.println("4.  Source Table Name");
+            System.out.println("5.  Target Table Name");
+            System.out.println("6.  Source Columns (comma-separated)");
+            System.out.println("7.  Target Columns (comma-separated)");
+            System.out.println("8.  Source Check Column (containing 'I'/'A' values)");
+            System.out.println("9.  Target Boolean Column (to store TRUE/FALSE)");
+            System.out.println();
+            System.out.println("--- TP3 (CSV source, 11 arguments) ---");
+            System.out.println("1.  DB URL (jdbc:postgresql://host:port/database)");
+            System.out.println("2.  DB Username");
+            System.out.println("3.  DB Password");
+            System.out.println("4.  (unused placeholder - pass any non-empty string)");
+            System.out.println("5.  Target Table Name");
+            System.out.println("6.  Source CSV Columns (comma-separated, must match CSV headers)");
+            System.out.println("7.  Target Columns (comma-separated)");
+            System.out.println("8.  Source Check Column (CSV header containing 'I'/'A' values)");
+            System.out.println("9.  Target Boolean Column (to store TRUE/FALSE)");
+            System.out.println("10. CSV File Path (absolute path)");
+            System.out.println("11. Flag Column Index (0-based; typically = number of source columns)");
+            System.out.println("===================EXCEPTION JAR============================");
+        }
+    }
+}

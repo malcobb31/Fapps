@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<launchConfiguration type="org.eclipse.jdt.launching.localJavaApplication">
+<listAttribute key="org.eclipse.debug.core.MAPPED_RESOURCE_PATHS">
+<listEntry value="/Vi_Recon_Data_Counter_1.0/src/data_counter_v1/data_counter_main_v1.java"/>
+</listAttribute>
+<listAttribute key="org.eclipse.debug.core.MAPPED_RESOURCE_TYPES">
+<listEntry value="1"/>
+</listAttribute>
+<stringAttribute key="org.eclipse.jdt.launching.MAIN_TYPE" value="data_counter_v1.data_counter_main_v1"/>
+<stringAttribute key="org.eclipse.jdt.launching.PROJECT_ATTR" value="Vi_Recon_Data_Counter_1.0"/>
+</launchConfiguration>

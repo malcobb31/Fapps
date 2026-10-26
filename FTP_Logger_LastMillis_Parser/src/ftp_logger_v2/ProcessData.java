@@ -1,0 +1,375 @@
+package ftp_logger_v2;
+
+import java.io.*;
+import java.nio.file.*;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.*;
+import java.util.regex.*;
+
+public class ProcessData {
+
+    String version = "2.0.0";
+
+    private static final String LAST_RUN_FILE = "last_run_time.txt";
+
+    // Output/input formats that can be recognized
+    private static final List<DateTimeFormatter> LOG_FORMATS = Arrays.asList(
+        DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss"),
+        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"),
+        DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss"),
+        DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss"),
+        DateTimeFormatter.ofPattern("dd-MM-yyyy'T'HH:mm:ss"),
+        DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"),
+        DateTimeFormatter.ofPattern("dd/MM/yyyy'T'HH:mm:ss"),
+        DateTimeFormatter.ofPattern("yyyy/MM/dd'T'HH:mm:ss")
+    );
+
+    private static final DateTimeFormatter CSV_NAME_FORMAT =
+        DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss");
+
+    // ===== LOG CONFIG =====
+    private static final String processName = "FTP_LOG_READER";
+    private static final String processVersion = "1.0.0";
+    private static boolean debugEnabled = true;
+
+    private static void log(String level, String message, String serverIP, String evtType) {
+        if ("DEBUG".equalsIgnoreCase(level) && !debugEnabled)
+            return;
+
+        String timestamp = LocalDateTime.now()
+                .format(DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss"));
+
+        StringBuilder logBuilder = new StringBuilder(512);
+
+        logBuilder.append("Time:").append(timestamp)
+                .append(" [").append(level).append("] ")
+                .append("Process_Name: ").append(processName).append(" ");
+
+        if (serverIP != null && !serverIP.isEmpty()) {
+            logBuilder.append("Server_IP: ").append(serverIP).append(" ");
+        }
+
+        logBuilder.append("Process_Version: ").append(processVersion)
+                .append(" Log_Level: EVT_LOG ")
+                .append(" EVT_Type: ").append(evtType != null ? evtType : "NA")
+                .append(" Description: ").append(message != null ? message : "");
+
+        System.out.println(logBuilder.toString().trim());
+    }
+
+    // EVT TYPES
+    private static final String EVT_START = "START";
+    private static final String EVT_PARSE = "PARSE";
+    private static final String EVT_MATCH = "MATCH";
+    private static final String EVT_CSV = "CSV_WRITE";
+    private static final String EVT_TIME_FILTER = "TIME_FILTER";
+    private static final String EVT_ERROR = "ERROR";
+    private static final String EVT_END = "END";
+
+    public static boolean process(String inputFileName,
+                                  String inputFolder,
+                                  String outputFolder,
+                                  String db_url,
+                                  String username,
+                                  String password,
+                                  String tableName,
+                                  String sftpOutputFilepath) {
+
+        try {
+            log("INFO",
+                    "Processing started for file: " + inputFileName,
+                    null,
+                    EVT_START);
+
+            long currentMillis = System.currentTimeMillis();
+            long lastRunMillis = readLastRunTime();
+
+            log("DEBUG",
+                    "Time window -> lastRun: " + lastRunMillis +
+                    " current: " + currentMillis,
+                    null,
+                    EVT_TIME_FILTER);
+
+            String outputFileName =
+                    "output_" +
+                    LocalDateTime.now().format(CSV_NAME_FORMAT) +
+                    ".csv";
+
+            String csvFilePath =
+                    Paths.get(outputFolder, outputFileName).toString();
+
+            BufferedReader reader =
+                    Files.newBufferedReader(
+                            Paths.get(inputFolder, inputFileName));
+
+            BufferedWriter csvWriter = null;
+
+            int matchedCount = 0;
+
+            /*
+             * GENERALIZED LOG PATTERN
+             *
+             * Supported examples:
+             *
+             * Time:22-09-2026 15:05:17 308 [Debug] ...
+             * Time:2026-09-22 15:05:17 [Debug] ...
+             * Time:22/09/2026 15:05:17 [DEBUG] ...
+             *
+             * EVT_Type / EVT_TYPE / Evt_Type / evt_type etc.
+             *
+             * Regex is CASE_INSENSITIVE.
+             */
+            Pattern activePattern = Pattern.compile(
+            	    "(?i)^\\s*" +
+            	    "Time\\s*:\\s*" +
+            	    "([0-9]{1,4}[-/][0-9]{1,2}[-/][0-9]{1,4}" +
+            	    "(?:[T\\s]+)" +
+            	    "[0-9]{1,2}:[0-9]{2}:[0-9]{2})" +
+            	    "(?:\\s+\\d+)?" +
+            	    "\\s*\\[([^\\]]+)\\]" +
+            	    "\\s+Process_Name\\s*:\\s*" +
+            	    "(.+?)" +
+            	    "\\s+Process_Version\\s*:\\s*" +
+            	    "([^\\s]+)" +
+            	    "\\s+Log_Level\\s*:\\s*" +
+            	    "([^\\s]+)" +
+            	    "\\s+EVT_Type\\s*:\\s*" +
+            	    "([^\\s]+)" +
+            	    "\\s+Description\\s*:\\s*" +
+            	    "(.*)\\s*$"
+            	);
+
+            String line;
+            int totalLines = 0;
+
+            while ((line = reader.readLine()) != null) {
+
+                totalLines++;
+
+                Matcher matcher = activePattern.matcher(line);
+
+                if (!matcher.matches()) {
+                    continue;
+                }
+
+                String time = matcher.group(1).trim();
+
+                /*
+                 * group(2) = [Debug]
+                 * group(3) = Process_Name
+                 * group(4) = Process_Version
+                 * group(5) = Log_Level
+                 * group(6) = EVT_Type
+                 * group(7) = Description
+                 */
+
+                String process = matcher.group(3).trim();
+
+                // Your existing regex does not currently capture Server_IP.
+                // Keep blank unless you decide to add it explicitly.
+                String ip = "";
+
+                String version = matcher.group(4).trim();
+                String level = matcher.group(5).trim();
+                String evt = matcher.group(6).trim();
+                String desc = matcher.group(7).trim();
+
+                LocalDateTime logTime;
+
+                try {
+                    logTime = parseLogDateTime(time);
+                } catch (DateTimeParseException e) {
+
+                    log("WARN",
+                            "Unable to parse timestamp: " + time +
+                            " | line: " + line,
+                            null,
+                            EVT_PARSE);
+
+                    continue;
+                }
+
+                long logMillis =
+                        logTime
+                                .atZone(ZoneId.systemDefault())
+                                .toInstant()
+                                .toEpochMilli();
+
+                if (logMillis > lastRunMillis &&
+                    logMillis <= currentMillis) {
+
+                    if (csvWriter == null) {
+
+                        csvWriter =
+                                Files.newBufferedWriter(
+                                        Paths.get(csvFilePath));
+
+                        csvWriter.write(
+                            "Time Stamp,Process_Name,Server_IP," +
+                            "Process_Version,Log_Level,EVT_Type,Description"
+                        );
+
+                        csvWriter.newLine();
+
+                        log("INFO",
+                                "CSV file created: " + csvFilePath,
+                                null,
+                                EVT_CSV);
+                    }
+
+                    String csvLine = String.join(",",
+                            escapeCsv(time),
+                            escapeCsv(process),
+                            escapeCsv(ip),
+                            escapeCsv(version),
+                            escapeCsv(level),
+                            escapeCsv(evt),
+                            escapeCsv(desc)
+                    );
+
+                    csvWriter.write(csvLine);
+                    csvWriter.newLine();
+
+                    matchedCount++;
+                }
+            }
+
+            reader.close();
+
+            if (csvWriter != null) {
+
+                csvWriter.close();
+
+                log("INFO",
+                        "CSV written successfully. Records: " +
+                        matchedCount,
+                        null,
+                        EVT_CSV);
+
+            } else {
+
+                log("WARN",
+                        "No records matched. CSV not created.",
+                        null,
+                        EVT_PARSE);
+            }
+
+            log("INFO",
+                    "Total lines scanned: " +
+                    totalLines +
+                    ", matched: " +
+                    matchedCount,
+                    null,
+                    EVT_MATCH);
+
+            saveLastRunTime(currentMillis);
+
+            log("INFO",
+                    "Processing completed",
+                    null,
+                    EVT_END);
+
+            return true;
+
+        } catch (Exception e) {
+
+            log("ERROR",
+                    "Processing failed: " + e.getMessage(),
+                    null,
+                    EVT_ERROR);
+
+            return false;
+        }
+    }
+
+    /**
+     * Attempts to parse the timestamp using all supported formats.
+     */
+    private static LocalDateTime parseLogDateTime(String value)
+            throws DateTimeParseException {
+
+        String normalized = value.trim();
+
+        DateTimeParseException lastException = null;
+
+        for (DateTimeFormatter formatter : LOG_FORMATS) {
+
+            try {
+                return LocalDateTime.parse(normalized, formatter);
+
+            } catch (DateTimeParseException e) {
+                lastException = e;
+            }
+        }
+
+        throw lastException != null
+                ? lastException
+                : new DateTimeParseException(
+                        "Unsupported date format",
+                        normalized,
+                        0);
+    }
+
+    private static void saveLastRunTime(long currentMillis) {
+
+        try (BufferedWriter writer =
+                     Files.newBufferedWriter(
+                             Paths.get(LAST_RUN_FILE))) {
+
+            writer.write(String.valueOf(currentMillis));
+            writer.flush();
+
+            log("DEBUG",
+                    "Saved last run time: " + currentMillis,
+                    null,
+                    EVT_TIME_FILTER);
+
+        } catch (IOException e) {
+
+            log("ERROR",
+                    "Failed to save last run time: " +
+                    e.getMessage(),
+                    null,
+                    EVT_ERROR);
+        }
+    }
+
+    private static long readLastRunTime() {
+
+        try {
+
+            if (Files.exists(Paths.get(LAST_RUN_FILE))) {
+
+                String content =
+                        new String(
+                                Files.readAllBytes(
+                                        Paths.get(LAST_RUN_FILE)))
+                                .trim();
+
+                return Long.parseLong(content);
+            }
+
+        } catch (Exception e) {
+
+            log("ERROR",
+                    "Failed to read last run time, defaulting to 0",
+                    null,
+                    EVT_ERROR);
+        }
+
+        return 0L;
+    }
+
+    private static String escapeCsv(String value) {
+
+        if (value == null)
+            return "\"\"";
+
+        String escaped =
+                value.replace("\"", "\"\"").trim();
+
+        return "\"" + escaped + "\"";
+    }
+}

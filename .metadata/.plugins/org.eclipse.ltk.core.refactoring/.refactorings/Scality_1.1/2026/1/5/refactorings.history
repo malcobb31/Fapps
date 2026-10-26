@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Copy element &apos;unstructured_main_v3.java&apos; to &apos;unstructured.unstructured_main_v3.java&apos;&#x0D;&#x0A;- Original project: &apos;Scality_1.1&apos;&#x0D;&#x0A;- Destination element: &apos;unstructured.unstructured_main_v3.java&apos;&#x0D;&#x0A;- Original element: &apos;unstructured.unstructured_main_v3.java&apos;" description="Copy compilation unit" destination="/src&lt;unstructured{unstructured_main_v3.java" element1="/src&lt;unstructured{unstructured_main_v3.java" files="0" flags="589830" folders="0" id="org.eclipse.jdt.ui.copy" policy="org.eclipse.jdt.ui.copyResources" stamp="1769515396818" units="1" version="1.0"/>
+</session>

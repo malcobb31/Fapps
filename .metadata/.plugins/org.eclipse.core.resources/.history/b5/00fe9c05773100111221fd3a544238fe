@@ -1,0 +1,77 @@
+package tp3_parser;
+
+import java.nio.file.Paths;
+
+public class tp3_main_v1 {
+
+    public static void main(String[] args) {
+
+        System.out.println("========================================");
+        System.out.println("TP3 CSV PostgreSQL Pipeline STARTED");
+        System.out.println("========================================");
+
+        if (args.length != 10) {
+            System.out.println("Invalid arguments for TP3");
+            System.out.println("Expected 10 arguments:");
+            System.out.println("1. DB URL");
+            System.out.println("2. DB Username");
+            System.out.println("3. DB Password");
+            System.out.println("4. Target Table");
+            System.out.println("5. CSV Columns");
+            System.out.println("6. Target Columns");
+            System.out.println("7. Flag Column (I/A)");
+            System.out.println("8. Boolean Column");
+            System.out.println("9. CSV File Path");
+            System.out.println("10. Processed Directory");
+            return;
+        }
+
+        String dbURL               = args[0];
+        String dbUsername          = args[1];
+        String dbPassword          = args[2];
+        String targetTableName     = args[3];
+        String sourceColumns       = args[4];
+        String targetColumns       = args[5];
+        String sourceCheckColumn   = args[6];
+        String targetBooleanColumn = args[7];
+        String csvFilePath         = args[8];
+        String processedDir        = args[9];
+
+        String fileName = Paths.get(csvFilePath).getFileName().toString();
+
+        System.out.println("[TP3] Processing file: " + fileName);
+
+        FileManager fm = new FileManager();
+
+        // Idempotency check
+        if (fm.isAlreadyProcessed(csvFilePath, processedDir)) {
+            System.out.println("[TP3] File already processed. Skipping: " + fileName);
+            return;
+        }
+
+        boolean success = new ProcessData().parseAndTransferDataFromCSV(
+                dbURL,
+                dbUsername,
+                dbPassword,
+                targetTableName,
+                sourceColumns,
+                targetColumns,
+                sourceCheckColumn,
+                targetBooleanColumn,
+                csvFilePath
+        );
+
+        if (success) {
+            System.out.println("[TP3] SUCCESS: " + fileName);
+
+            boolean moved = fm.moveToProcessed(csvFilePath, processedDir);
+
+            if (!moved) {
+                System.out.println("[TP3] WARNING: File not moved. Manual action required.");
+            }
+
+        } else {
+            System.out.println("[TP3] FAILED: " + fileName);
+        }
+    }
+}

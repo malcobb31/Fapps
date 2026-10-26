@@ -1,0 +1,587 @@
+package tp3_parser;
+
+import java.io.File;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
+
+/**
+ * tp3_main_v2 - Config-Driven TP3 CSV → PostgreSQL Pipeline Entry Point
+ *
+ * Replaces tp3_main_v1 (single-file, args-driven) with a fully config-driven,
+ * multi-file, scheduler-friendly engine — modelled after TP2's architecture.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * EXECUTION MODEL
+ * ─────────────────────────────────────────────────────────────────────────────
+ *   Scheduler → run jar → reads MySQL config → auto file pickup → process → move
+ *
+ *   No manual file path input. All file locations come from the config table.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * REQUIRED ARGUMENTS (10, positional)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *   [0]  mysqlURL         e.g. jdbc:mysql://host:3306/configdb
+ *   [1]  mysqlUser
+ *   [2]  mysqlPass
+ *   [3]  configTable      e.g. metadata_parser_config
+ *   [4]  pgURL            e.g. jdbc:postgresql://host:5432/targetdb
+ *   [5]  pgUser
+ *   [6]  pgPass
+ *   [7]  tm_id            filter value — only rows matching this tm_id are processed
+ *   [8]  flagColumnName   (optional, pass "" to use default "flag")
+ *   [9]  processedDir     fallback processed directory; overridden per-row by
+ *                         destination_path if non-empty
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CONFIG TABLE CONTRACT  (metadata_parser_config)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *   source_path              → directory containing CSV files to ingest
+ *   destination_table_name   → target PostgreSQL table
+ *   destination_path         → processed directory for this config row
+ *   parameters               → pipe-separated mapping string (see below)
+ *   tm_id                    → tenant / task marker — filter condition
+ *   is_active                → only rows with is_active = 1 are processed
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * PARAMETERS FORMAT
+ * ─────────────────────────────────────────────────────────────────────────────
+ *   "<sourceColumns> | <targetColumns> | <flagColumn> | <booleanColumn>"
+ *
+ *   Example:
+ *     "id,name,amount | id,name,amount | flag | is_active"
+ *
+ *   Rules:
+ *   - Pipe (|) is the field delimiter.
+ *   - Comma (,) separates column names within source/target fields.
+ *   - All parsing is trimmed and case-insensitive.
+ *   - Exactly 4 pipe-delimited segments are required.
+ *   - flagColumn and booleanColumn must be single column names (no commas).
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * FILE PROCESSING RULES
+ * ─────────────────────────────────────────────────────────────────────────────
+ *   1. Only *.csv files in source_path are picked up.
+ *   2. Files are sorted by name (ascending) for deterministic ordering.
+ *   3. FileManager.isAlreadyProcessed() is called before every file — any file
+ *      already present in the processed directory is silently skipped.
+ *   4. On SUCCESS  → FileManager.moveToProcessed() is called.
+ *   5. On FAILURE  → file stays in source_path; no movement.
+ *   6. An empty source_path directory is logged and skipped (no error).
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CLASSES REUSED UNCHANGED
+ * ─────────────────────────────────────────────────────────────────────────────
+ *   ProcessData    – streaming CSV parse + PostgreSQL insert + batch commit
+ *   FileManager    – idempotency guard + atomic file movement
+ *   CSVSourceData  – RFC 4180 CSV parser (used internally by ProcessData)
+ *   PrintUtilMsg   – timestamped tagged logging
+ *   PostgreSQLConnection – PostgreSQL JDBC connection factory
+ */
+public class tp3_main_v1 {
+
+    // =========================================================================
+    // Constants
+    // =========================================================================
+
+    /** Number of pipe-delimited segments expected in the parameters column. */
+    private static final int PARAMETERS_SEGMENT_COUNT = 4;
+
+    /** Default flag column name when arg[8] is blank. */
+    private static final String DEFAULT_FLAG_COLUMN = "flag";
+
+    /** Batch size used for DB processing (informational — enforced in ProcessData). */
+    private static final int CSV_BATCH_SIZE = 200;
+
+    // =========================================================================
+    // Instance state
+    // =========================================================================
+
+    private final PrintUtilMsg pu = new PrintUtilMsg();
+
+    // =========================================================================
+    // Main
+    // =========================================================================
+
+    public static void main(String[] args) {
+
+        System.out.println("========================================");
+        System.out.println("  TP3 Config-Driven Pipeline  [v2]    ");
+        System.out.println("========================================");
+
+        if (args.length != 10) {
+            printUsage();
+            System.exit(1);
+        }
+
+        new tp3_main_v2().run(args);
+    }
+
+    // =========================================================================
+    // Core orchestrator
+    // =========================================================================
+
+    /**
+     * Main execution body. Reads config rows from MySQL, then for each active
+     * row matching tm_id, scans the source directory and processes every CSV file.
+     */
+    private void run(String[] args) {
+
+        // ── Parse arguments ───────────────────────────────────────────────────
+        final String mysqlURL       = args[0].trim();
+        final String mysqlUser      = args[1].trim();
+        final String mysqlPass      = args[2].trim();
+        final String configTable    = args[3].trim();
+        final String pgURL          = args[4].trim();
+        final String pgUser         = args[5].trim();
+        final String pgPass         = args[6].trim();
+        final String tmId           = args[7].trim();
+        final String flagArgRaw     = args[8].trim();
+        final String fallbackProcessedDir = args[9].trim();
+
+        // Resolve effective flag column (arg[8] is optional; blank → default)
+        final String globalFlagColumn = flagArgRaw.isEmpty() ? DEFAULT_FLAG_COLUMN : flagArgRaw;
+
+        pu.sop("run", "────────────────────────────────────────────────────────");
+        pu.sop("run", "Pipeline arguments:");
+        pu.sop("run", "  MySQL URL       : " + mysqlURL);
+        pu.sop("run", "  MySQL User      : " + mysqlUser);
+        pu.sop("run", "  Config Table    : " + configTable);
+        pu.sop("run", "  PG URL          : " + pgURL);
+        pu.sop("run", "  PG User         : " + pgUser);
+        pu.sop("run", "  TM_ID filter    : " + tmId);
+        pu.sop("run", "  Flag Column     : " + globalFlagColumn + (flagArgRaw.isEmpty() ? " (default)" : " (from args)"));
+        pu.sop("run", "  Fallback ProcDir: " + fallbackProcessedDir);
+        pu.sop("run", "────────────────────────────────────────────────────────");
+
+        // ── Load config rows from MySQL ───────────────────────────────────────
+        List<ConfigRow> configRows = loadConfigRows(
+                mysqlURL, mysqlUser, mysqlPass, configTable, tmId);
+
+        if (configRows == null) {
+            pu.sop("run", "FATAL: Could not load config rows. Aborting pipeline.");
+            System.exit(2);
+        }
+
+        if (configRows.isEmpty()) {
+            pu.sop("run", "No active config rows found for tm_id='" + tmId + "'. Nothing to process.");
+            return;
+        }
+
+        pu.sop("run", "Config rows loaded: " + configRows.size());
+
+        // ── Process each config row ───────────────────────────────────────────
+        int totalConfigRows  = configRows.size();
+        int rowsSucceeded    = 0;
+        int rowsFailed       = 0;
+        int totalFilesOk     = 0;
+        int totalFilesFailed = 0;
+
+        for (int rowIdx = 0; rowIdx < configRows.size(); rowIdx++) {
+
+            ConfigRow row = configRows.get(rowIdx);
+
+            pu.sop("run", "Processing config row [" + (rowIdx + 1) + "/" + totalConfigRows + "]");
+            pu.sop("run", "  source_path            : " + row.sourcePath);
+            pu.sop("run", "  destination_table_name : " + row.destinationTableName);
+            pu.sop("run", "  destination_path       : " + row.destinationPath);
+            pu.sop("run", "  parameters             : " + row.parameters);
+
+            // ── Parse parameters ──────────────────────────────────────────────
+            ParsedParameters params = parseParameters(row.parameters, globalFlagColumn);
+
+            if (params == null) {
+                pu.sop("run", "ERROR: Could not parse parameters for config row [" + (rowIdx + 1) + "]. Skipping row.");
+                rowsFailed++;
+                continue;
+            }
+
+            pu.sop("run", "  Parsed sourceColumns    : " + params.sourceColumns);
+            pu.sop("run", "  Parsed targetColumns    : " + params.targetColumns);
+            pu.sop("run", "  Parsed flagColumn       : " + params.flagColumn);
+            pu.sop("run", "  Parsed booleanColumn    : " + params.booleanColumn);
+
+            // ── Resolve processed directory (per-row overrides global fallback) ─
+            String effectiveProcessedDir = (row.destinationPath != null && !row.destinationPath.trim().isEmpty())
+                    ? row.destinationPath.trim()
+                    : fallbackProcessedDir;
+
+            pu.sop("run", "  Effective processedDir  : " + effectiveProcessedDir);
+
+            // ── Scan source directory for CSV files ───────────────────────────
+            File[] csvFiles = scanCsvDirectory(row.sourcePath);
+
+            if (csvFiles == null) {
+                // scanCsvDirectory already logged the reason (dir not found, not readable, etc.)
+                rowsFailed++;
+                continue;
+            }
+
+            if (csvFiles.length == 0) {
+                pu.sop("run", "  Directory is empty or has no CSV files: " + row.sourcePath + ". Skipping row.");
+                rowsSucceeded++; // Empty dir is not a failure — pipeline ran cleanly
+                continue;
+            }
+
+            pu.sop("run", "  CSV files found: " + csvFiles.length);
+
+            // ── Process each CSV file ─────────────────────────────────────────
+            FileManager fm = new FileManager();
+            ProcessData pd = new ProcessData();
+
+            int filesOkThisRow     = 0;
+            int filesFailedThisRow = 0;
+
+            for (int fileIdx = 0; fileIdx < csvFiles.length; fileIdx++) {
+
+                File csvFile = csvFiles[fileIdx];
+                String csvFilePath = csvFile.getAbsolutePath();
+                String fileName    = csvFile.getName();
+
+                pu.sop("run", "  ──────────────────────────────────────────────────");
+                pu.sop("run", "  File [" + (fileIdx + 1) + "/" + csvFiles.length + "]: " + fileName);
+
+                // Idempotency guard — skip already-processed files
+                if (fm.isAlreadyProcessed(csvFilePath, effectiveProcessedDir)) {
+                    pu.sop("run", "  SKIPPED (already processed): " + fileName);
+                    continue;
+                }
+
+                // ── Call ProcessData — all streaming + DB insert logic lives here ──
+                boolean success = pd.parseAndTransferDataFromCSV(
+                        pgURL,
+                        pgUser,
+                        pgPass,
+                        row.destinationTableName,
+                        params.sourceColumns,
+                        params.targetColumns,
+                        params.flagColumn,
+                        params.booleanColumn,
+                        csvFilePath
+                );
+
+                if (success) {
+                    pu.sop("run", "  ✓ SUCCESS: " + fileName);
+                    filesOkThisRow++;
+                    totalFilesOk++;
+
+                    // Move file to processed directory ONLY after confirmed success
+                    boolean moved = fm.moveToProcessed(csvFilePath, effectiveProcessedDir);
+                    if (!moved) {
+                        pu.sop("run", "  ⚠ WARNING: File processed OK but could not be moved. "
+                                + "Manual action required for: " + fileName);
+                    }
+
+                } else {
+                    pu.sop("run", "  ✗ FAILED: " + fileName + " — file stays in source directory.");
+                    filesFailedThisRow++;
+                    totalFilesFailed++;
+                }
+            }
+
+            pu.sop("run", "  Config row [" + (rowIdx + 1) + "] summary → "
+                    + "OK=" + filesOkThisRow + "  FAILED=" + filesFailedThisRow);
+
+            if (filesFailedThisRow > 0) {
+                rowsFailed++;
+            } else {
+                rowsSucceeded++;
+            }
+        }
+
+        // ── Pipeline summary ──────────────────────────────────────────────────
+        pu.sop("run", "PIPELINE COMPLETE");
+        pu.sop("run", "  Config rows processed : " + totalConfigRows);
+        pu.sop("run", "  Config rows OK        : " + rowsSucceeded);
+        pu.sop("run", "  Config rows w/ errors : " + rowsFailed);
+        pu.sop("run", "  Total files OK        : " + totalFilesOk);
+        pu.sop("run", "  Total files FAILED    : " + totalFilesFailed);
+    }
+
+    // =========================================================================
+    // Config loading
+    // =========================================================================
+
+    /**
+     * Query MySQL config table and return all active rows matching tm_id.
+     *
+     * Only rows where:
+     *   is_active = 1
+     *   tm_id     = ? (exact match, case-sensitive)
+     *
+     * Results are returned in database insertion order (no explicit ORDER BY —
+     * add one here if deterministic ordering across rows is required).
+     *
+     * @return List of ConfigRow objects, empty list if none, null on fatal DB error
+     */
+    private List<ConfigRow> loadConfigRows(String mysqlURL, String mysqlUser,
+                                           String mysqlPass, String configTable,
+                                           String tmId) {
+        Connection conn = null;
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        List<ConfigRow> rows = new ArrayList<>();
+
+        String sql = "SELECT source_path, destination_table_name, destination_path, parameters "
+                   + "FROM " + configTable + " "
+                   + "WHERE is_active = 1 AND tm_id = ?";
+
+        pu.sop("loadConfigRows", "Connecting to MySQL config DB...");
+        pu.sop("loadConfigRows", "SQL: " + sql);
+        pu.sop("loadConfigRows", "tm_id filter: " + tmId);
+
+        try {
+            Class.forName("com.mysql.cj.jdbc.Driver");
+            conn = DriverManager.getConnection(mysqlURL, mysqlUser, mysqlPass);
+            conn.setAutoCommit(true); // read-only config query; auto-commit is fine
+
+            ps = conn.prepareStatement(sql);
+            ps.setString(1, tmId);
+            rs = ps.executeQuery();
+
+            int rowCount = 0;
+            while (rs.next()) {
+                ConfigRow row = new ConfigRow();
+                row.sourcePath            = nullToEmpty(rs.getString("source_path"));
+                row.destinationTableName  = nullToEmpty(rs.getString("destination_table_name"));
+                row.destinationPath       = nullToEmpty(rs.getString("destination_path"));
+                row.parameters            = nullToEmpty(rs.getString("parameters"));
+                rows.add(row);
+                rowCount++;
+                pu.sop("loadConfigRows", "  Row [" + rowCount + "] loaded: source=" + row.sourcePath
+                        + ", table=" + row.destinationTableName);
+            }
+
+            pu.sop("loadConfigRows", "Config rows fetched: " + rowCount);
+            return rows;
+
+        } catch (ClassNotFoundException e) {
+            pu.sop("loadConfigRows", "FATAL: MySQL JDBC driver not found: " + e.getMessage());
+            e.printStackTrace();
+            return null;
+
+        } catch (Exception e) {
+            pu.sop("loadConfigRows", "FATAL: Failed to load config rows: " + e.getMessage());
+            e.printStackTrace();
+            return null;
+
+        } finally {
+            closeQuietly(rs, ps, conn);
+        }
+    }
+
+    // =========================================================================
+    // Parameter parsing
+    // =========================================================================
+
+    /**
+     * Parse the pipe-delimited parameters string from the config table.
+     *
+     * Expected format (4 segments separated by '|'):
+     *   "<sourceColumns> | <targetColumns> | <flagColumn> | <booleanColumn>"
+     *
+     * - sourceColumns  : comma-separated CSV header names
+     * - targetColumns  : comma-separated PG column names (1:1 with source)
+     * - flagColumn     : single CSV header name containing 'I'/'A' values
+     * - booleanColumn  : single PG target column name for the boolean result
+     *
+     * If the parameters string is blank or malformed, the globalFlagColumn
+     * argument is used as a safe fallback for flagColumn only.
+     *
+     * @param parameters     raw parameters column value from config table
+     * @param globalFlagCol  fallback flag column name (from args[8])
+     * @return ParsedParameters, or null if the string is fundamentally unparseable
+     */
+    private ParsedParameters parseParameters(String parameters, String globalFlagCol) {
+
+        if (parameters == null || parameters.trim().isEmpty()) {
+            pu.sop("parseParameters", "ERROR: Parameters string is null or empty.");
+            return null;
+        }
+
+        String[] segments = parameters.split("\\|", -1);
+
+        if (segments.length != PARAMETERS_SEGMENT_COUNT) {
+            pu.sop("parseParameters", "ERROR: Expected " + PARAMETERS_SEGMENT_COUNT
+                    + " pipe-separated segments, found " + segments.length
+                    + ". Raw: [" + parameters + "]");
+            return null;
+        }
+
+        String sourceColumns  = segments[0].trim();
+        String targetColumns  = segments[1].trim();
+        String flagColumn     = segments[2].trim();
+        String booleanColumn  = segments[3].trim();
+
+        // Validate non-empty segments
+        if (sourceColumns.isEmpty()) {
+            pu.sop("parseParameters", "ERROR: sourceColumns segment is empty.");
+            return null;
+        }
+        if (targetColumns.isEmpty()) {
+            pu.sop("parseParameters", "ERROR: targetColumns segment is empty.");
+            return null;
+        }
+        if (flagColumn.isEmpty()) {
+            pu.sop("parseParameters", "WARNING: flagColumn segment is empty. Using global fallback: " + globalFlagCol);
+            flagColumn = globalFlagCol;
+        }
+        if (booleanColumn.isEmpty()) {
+            pu.sop("parseParameters", "ERROR: booleanColumn segment is empty.");
+            return null;
+        }
+
+        // Validate column count parity (source vs target)
+        String[] srcCols = sourceColumns.split(",");
+        String[] tgtCols = targetColumns.split(",");
+
+        if (srcCols.length != tgtCols.length) {
+            pu.sop("parseParameters", "ERROR: sourceColumns count (" + srcCols.length
+                    + ") does not match targetColumns count (" + tgtCols.length + ").");
+            return null;
+        }
+
+        ParsedParameters pp = new ParsedParameters();
+        pp.sourceColumns  = sourceColumns;
+        pp.targetColumns  = targetColumns;
+        pp.flagColumn     = flagColumn;
+        pp.booleanColumn  = booleanColumn;
+        return pp;
+    }
+
+    // =========================================================================
+    // Directory scanning
+    // =========================================================================
+
+    /**
+     * Scan a directory for CSV files and return them sorted by file name (ascending).
+     *
+     * Sorting by name gives deterministic, reproducible processing order. If
+     * timestamp-based ordering is preferred, swap the comparator to
+     * Comparator.comparingLong(File::lastModified).
+     *
+     * @param directoryPath absolute path of the source directory
+     * @return sorted array of CSV File objects; empty array if none found;
+     *         null on error (directory not found, not readable, etc.)
+     */
+    private File[] scanCsvDirectory(String directoryPath) {
+
+        if (directoryPath == null || directoryPath.trim().isEmpty()) {
+            pu.sop("scanCsvDirectory", "ERROR: source_path is null or empty.");
+            return null;
+        }
+
+        File dir = new File(directoryPath.trim());
+
+        if (!dir.exists()) {
+            pu.sop("scanCsvDirectory", "ERROR: Directory does not exist: " + directoryPath);
+            return null;
+        }
+
+        if (!dir.isDirectory()) {
+            pu.sop("scanCsvDirectory", "ERROR: Path is not a directory: " + directoryPath);
+            return null;
+        }
+
+        if (!dir.canRead()) {
+            pu.sop("scanCsvDirectory", "ERROR: Directory is not readable: " + directoryPath);
+            return null;
+        }
+
+        // List only .csv files (case-insensitive extension check)
+        File[] csvFiles = dir.listFiles(
+                (d, name) -> name.toLowerCase().endsWith(".csv")
+        );
+
+        if (csvFiles == null) {
+            // listFiles() returns null for I/O errors
+            pu.sop("scanCsvDirectory", "ERROR: I/O error reading directory: " + directoryPath);
+            return null;
+        }
+
+        if (csvFiles.length == 0) {
+            pu.sop("scanCsvDirectory", "No CSV files found in: " + directoryPath);
+            return csvFiles; // Return empty array — caller decides how to handle
+        }
+
+        // Sort by file name ascending for deterministic ordering
+        Arrays.sort(csvFiles, Comparator.comparing(File::getName));
+
+        pu.sop("scanCsvDirectory", "CSV files found in [" + directoryPath + "]: " + csvFiles.length);
+        for (File f : csvFiles) {
+            pu.sop("scanCsvDirectory", "  " + f.getName() + "  (" + f.length() + " bytes)");
+        }
+
+        return csvFiles;
+    }
+
+    // =========================================================================
+    // Utility helpers
+    // =========================================================================
+
+    /** Null-safe string coercion. */
+    private static String nullToEmpty(String s) {
+        return s == null ? "" : s;
+    }
+
+    /** Silently close JDBC resources in reverse-open order. */
+    private static void closeQuietly(ResultSet rs, PreparedStatement ps, Connection conn) {
+        try { if (rs   != null) rs.close();   } catch (Exception ignored) {}
+        try { if (ps   != null) ps.close();   } catch (Exception ignored) {}
+        try { if (conn != null) conn.close(); } catch (Exception ignored) {}
+    }
+
+    /** Print CLI usage and expected arguments. */
+    private static void printUsage() {
+        System.out.println("");
+        System.out.println("Usage: java -jar tp3.jar <arg1> ... <arg10>");
+        System.out.println("");
+        System.out.println("  [1]  MySQL JDBC URL          e.g. jdbc:mysql://host:3306/configdb");
+        System.out.println("  [2]  MySQL Username");
+        System.out.println("  [3]  MySQL Password");
+        System.out.println("  [4]  Config Table Name       e.g. metadata_parser_config");
+        System.out.println("  [5]  PostgreSQL JDBC URL     e.g. jdbc:postgresql://host:5432/targetdb");
+        System.out.println("  [6]  PostgreSQL Username");
+        System.out.println("  [7]  PostgreSQL Password");
+        System.out.println("  [8]  TM_ID                  filter value for config table");
+        System.out.println("  [9]  Flag Column Name        (optional — pass \"\" to use default 'flag')");
+        System.out.println("  [10] Fallback Processed Dir  used when destination_path is empty in config");
+        System.out.println("");
+        System.out.println("Config table parameters column format:");
+        System.out.println("  \"<sourceColumns> | <targetColumns> | <flagColumn> | <booleanColumn>\"");
+        System.out.println("  Example: \"id,name,amount | id,name,amount | flag | is_active\"");
+        System.out.println("");
+    }
+
+    // =========================================================================
+    // Inner data-transfer types
+    // =========================================================================
+
+    /**
+     * Holds a single row from the MySQL config table.
+     * All fields are trimmed; null DB values become empty strings.
+     */
+    private static class ConfigRow {
+        String sourcePath;
+        String destinationTableName;
+        String destinationPath;
+        String parameters;
+    }
+
+    /**
+     * Result of parsing the pipe-delimited parameters column.
+     * All fields are guaranteed non-null and non-empty when returned from
+     * parseParameters() (null return indicates parse failure).
+     */
+    private static class ParsedParameters {
+        String sourceColumns;   // comma-separated CSV header names
+        String targetColumns;   // comma-separated PG column names
+        String flagColumn;      // single CSV flag header ('I'/'A')
+        String booleanColumn;   // single PG boolean target column
+    }
+}

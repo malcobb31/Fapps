@@ -1,0 +1,1387 @@
+package ntp12_process_v1;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.sql.BatchUpdateException;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Types;
+import java.text.SimpleDateFormat;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+public class ntp12_process_methods {
+
+	private static final String PROCESS_NAME = "NTP12";
+	private static final String PROCESS_VERSION = "2.0";
+	private static final int BATCH_SIZE = 500;
+	private static final int MAX_WARN_SAMPLES = 5;
+
+	private static final DateTimeFormatter LOG_FMT = DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss SSS");
+
+	enum SqlType {
+		BOOLEAN, DATE, TIMESTAMP, BIGINT, UUID, JSONB, VARCHAR, TEXT
+	}
+
+	static final class ColumnMeta {
+		final String name;
+		final SqlType sqlType;
+		final boolean nullable;
+		final String dbDefault;
+		final boolean primaryKey;
+		final boolean uniqueKey;
+		final int varcharLimit;
+
+		ColumnMeta(String name, SqlType sqlType, boolean nullable, String dbDefault, boolean pk, boolean uk,
+				int limit) {
+			this.name = name;
+			this.sqlType = sqlType;
+			this.nullable = nullable;
+			this.dbDefault = dbDefault;
+			this.primaryKey = pk;
+			this.uniqueKey = uk;
+			this.varcharLimit = limit;
+		}
+	}
+
+	static final List<String> INSERT_COLUMNS;
+	static final Map<String, ColumnMeta> COLUMN_REGISTRY;
+
+	static {
+		Map<String, ColumnMeta> r = new LinkedHashMap<>();
+		r.put("active", c("active", SqlType.BOOLEAN, true, null, false, false, -1));
+		r.put("dob", c("dob", SqlType.DATE, true, null, false, false, -1));
+		r.put("same_registration_correspondence_address",
+				c("same_registration_correspondence_address", SqlType.BOOLEAN, true, null, false, false, -1));
+		r.put("created_at", c("created_at", SqlType.TIMESTAMP, true, null, false, false, -1));
+		r.put("updated_at", c("updated_at", SqlType.TIMESTAMP, true, null, false, false, -1));
+		r.put("version", c("version", SqlType.BIGINT, true, null, false, false, -1));
+		r.put("country_code", c("country_code", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("gender", c("gender", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("title", c("title", SqlType.VARCHAR, true, null, false, false, 10));
+		r.put("dsc_id", c("dsc_id", SqlType.UUID, true, null, false, true, -1));
+		r.put("reporting_entity_id", c("reporting_entity_id", SqlType.UUID, true, null, false, false, -1));
+		r.put("landline_number", c("landline_number", SqlType.VARCHAR, true, null, false, false, 20));
+		// NEW: real column confirmed via \d re_mgmt.re_user — distinct from
+		// mobile_number/mobile1_number/mobile2_number
+		r.put("mobile", c("mobile", SqlType.VARCHAR, true, null, false, false, 20));
+		r.put("mobile_number", c("mobile_number", SqlType.VARCHAR, true, null, false, false, 20)); // CONFUSSION
+		r.put("user_type", c("user_type", SqlType.VARCHAR, true, null, false, false, 20));
+		r.put("citizenship", c("citizenship", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("ckyc_no", c("ckyc_no", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("created_by", c("created_by", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("designation", c("designation", SqlType.VARCHAR, true, null, false, false, 100));
+		r.put("employee_id", c("employee_id", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("proof_of_identity_number", c("proof_of_identity_number", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("updated_by", c("updated_by", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("email", c("email", SqlType.VARCHAR, true, null, false, false, 100));
+		r.put("first_name", c("first_name", SqlType.VARCHAR, true, null, false, false, 100));
+		r.put("last_name", c("last_name", SqlType.VARCHAR, true, null, false, false, 100));
+		r.put("middle_name", c("middle_name", SqlType.VARCHAR, true, null, false, false, 100));
+		r.put("key_cloak_user_id", c("key_cloak_user_id", SqlType.VARCHAR, true, null, false, false, 255));
+		r.put("user_id", c("user_id", SqlType.VARCHAR, true, null, false, true, 255));
+		r.put("ckyc_number", c("ckyc_number", SqlType.TEXT, true, null, false, false, -1));
+		r.put("employ_code", c("employ_code", SqlType.TEXT, true, null, false, false, -1));
+		r.put("register_city", c("register_city", SqlType.TEXT, true, null, false, false, -1));
+		r.put("office_address", c("office_address", SqlType.TEXT, true, null, false, false, -1));
+		r.put("register_state", c("register_state", SqlType.TEXT, true, null, false, false, -1));
+		r.put("register_country", c("register_country", SqlType.TEXT, true, null, false, false, -1));
+		r.put("board_resoluation_date", c("board_resoluation_date", SqlType.TEXT, true, null, false, false, -1));
+		r.put("authorization_letter", c("authorization_letter", SqlType.TEXT, true, null, false, false, -1));
+		r.put("date_of_authorization", c("date_of_authorization", SqlType.TEXT, true, null, false, false, -1));
+		r.put("operational_status", c("operational_status", SqlType.VARCHAR, true, null, false, false, 255));
+		r.put("status", c("status", SqlType.VARCHAR, true, null, false, false, 20));
+		r.put("workflow_status", c("workflow_status", SqlType.VARCHAR, true, null, false, false, 255));
+		r.put("register_pincode", c("register_pincode", SqlType.TEXT, true, null, false, false, -1));
+		r.put("register_district", c("register_district", SqlType.TEXT, true, null, false, false, -1));
+		r.put("register_pincode_other", c("register_pincode_other", SqlType.TEXT, true, null, false, false, -1));
+		r.put("city", c("city", SqlType.TEXT, true, null, false, false, -1));
+		r.put("state", c("state", SqlType.TEXT, true, null, false, false, -1));
+		r.put("country", c("country", SqlType.TEXT, true, null, false, false, -1));
+		r.put("pincode", c("pincode", SqlType.TEXT, true, null, false, false, -1));
+		r.put("district", c("district", SqlType.TEXT, true, null, false, false, -1));
+		r.put("digipin", c("digipin", SqlType.TEXT, true, null, false, false, -1));
+		r.put("pincode_other", c("pincode_other", SqlType.TEXT, true, null, false, false, -1));
+		r.put("address_line_one", c("address_line_one", SqlType.TEXT, true, null, false, false, -1));
+		r.put("address_line_two", c("address_line_two", SqlType.TEXT, true, null, false, false, -1));
+		r.put("address_line_one3", c("address_line_one3", SqlType.TEXT, true, null, false, false, -1));
+		r.put("address_line_two3", c("address_line_two3", SqlType.TEXT, true, null, false, false, -1));
+		r.put("operation", c("operation", SqlType.VARCHAR, true, null, false, false, -1));
+		r.put("requester_reason", c("requester_reason", SqlType.VARCHAR, true, null, false, false, 512));
+		r.put("approver_reason", c("approver_reason", SqlType.VARCHAR, true, null, false, false, 512));
+		r.put("address_line", c("address_line", SqlType.TEXT, true, null, false, false, -1));
+		r.put("date_of_authorizarion", c("date_of_authorizarion", SqlType.TIMESTAMP, true, null, false, false, -1));
+		r.put("phone_number", c("phone_number", SqlType.TEXT, true, null, false, false, -1));
+		r.put("pending_actions", c("pending_actions", SqlType.JSONB, true, "'{}'::jsonb", false, false, -1));
+		r.put("proof_of_identity", c("proof_of_identity", SqlType.VARCHAR, true, null, false, false, 50));
+		r.put("landline", c("landline", SqlType.TEXT, true, null, false, false, -1));
+		r.put("register_digipin", c("register_digipin", SqlType.TEXT, true, null, false, false, -1));
+		r.put("address_line1", c("address_line1", SqlType.VARCHAR, true, null, false, false, 255));
+		r.put("address_line2", c("address_line2", SqlType.VARCHAR, true, null, false, false, 255));
+		r.put("address_line3", c("address_line3", SqlType.VARCHAR, true, null, false, false, 255));
+		r.put("board_resolution_date", c("board_resolution_date", SqlType.TIMESTAMP, true, null, false, false, -1));
+		r.put("mobile1_number", c("mobile1_number", SqlType.TEXT, true, null, false, false, -1));
+		r.put("mobile2_number", c("mobile2_number", SqlType.TEXT, true, null, false, false, -1));
+		r.put("testbed_user_id", c("testbed_user_id", SqlType.VARCHAR, true, null, false, false, -1));
+		r.put("metadata", c("metadata", SqlType.JSONB, true, null, false, false, -1));
+		r.put("re_id", c("re_id", SqlType.VARCHAR, true, null, false, false, 50));
+		// NEW: confirmed real columns via \d re_mgmt.re_user
+		r.put("mobile_country_code", c("mobile_country_code", SqlType.VARCHAR, true, null, false, false, 20));
+		r.put("poi_type", c("poi_type", SqlType.VARCHAR, true, null, false, false, 255));
+		r.put("poi_no", c("poi_no", SqlType.VARCHAR, true, null, false, false, 255));
+
+		COLUMN_REGISTRY = Collections.unmodifiableMap(r);
+		INSERT_COLUMNS = Collections.unmodifiableList(new ArrayList<>(r.keySet()));
+	}
+
+	private static ColumnMeta c(String name, SqlType type, boolean nullable, String dbDefault, boolean pk, boolean uk,
+			int limit) {
+		return new ColumnMeta(name, type, nullable, dbDefault, pk, uk, limit);
+	}
+
+	static final class TypeBinder {
+
+		private static final String[] TS_PATTERNS = { "yyyy-MM-dd HH:mm:ss.SSS", "yyyy-MM-dd HH:mm:ss",
+				"yyyy/MM/dd HH:mm:ss", "dd-MM-yyyy HH:mm:ss", "yyyy-MM-dd" };
+
+		private static final String[] DATE_PATTERNS = { "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd", "dd-MM-yyyy",
+				"yyyy/MM/dd" };
+
+		static void bind(PreparedStatement ps, int idx, ColumnMeta meta, String resolvedValue,
+				DatatypeWarnAccumulator warns) throws SQLException {
+
+			if (isBlank(resolvedValue)) {
+				bindNull(ps, idx, meta.sqlType);
+				return;
+			}
+			String v = resolvedValue.trim();
+			switch (meta.sqlType) {
+			case BOOLEAN:
+				bindBoolean(ps, idx, meta, v, warns);
+				break;
+			case DATE:
+				bindDate(ps, idx, meta, v, warns);
+				break;
+			case TIMESTAMP:
+				bindTimestamp(ps, idx, meta, v, warns);
+				break;
+			case BIGINT:
+				bindBigint(ps, idx, meta, v, warns);
+				break;
+			case UUID:
+				bindUuid(ps, idx, meta, v, warns);
+				break;
+			case JSONB:
+				bindJsonb(ps, idx, v);
+				break;
+			case VARCHAR:
+			case TEXT:
+				bindString(ps, idx, meta, v, warns);
+				break;
+			default:
+				bindNull(ps, idx, meta.sqlType);
+			}
+		}
+
+		private static void bindBoolean(PreparedStatement ps, int idx, ColumnMeta meta, String v,
+				DatatypeWarnAccumulator warns) throws SQLException {
+			String lv = v.toLowerCase();
+			if ("true".equals(lv) || "1".equals(lv) || "y".equals(lv) || "yes".equals(lv) || "t".equals(lv)) {
+				ps.setBoolean(idx, true);
+			} else if ("false".equals(lv) || "0".equals(lv) || "n".equals(lv) || "no".equals(lv) || "f".equals(lv)) {
+				ps.setBoolean(idx, false);
+			} else {
+				warns.record(meta.name, v);
+				bindNull(ps, idx, SqlType.BOOLEAN);
+			}
+		}
+
+		private static void bindDate(PreparedStatement ps, int idx, ColumnMeta meta, String v,
+				DatatypeWarnAccumulator warns) throws SQLException {
+			String norm = v.replace('T', ' ');
+			for (String pattern : DATE_PATTERNS) {
+				try {
+					SimpleDateFormat sdf = new SimpleDateFormat(pattern);
+					sdf.setLenient(false);
+					java.util.Date d = sdf.parse(norm);
+					ps.setDate(idx, new java.sql.Date(d.getTime()));
+					return;
+				} catch (Exception ignored) {
+				}
+			}
+			warns.record(meta.name, v);
+			bindNull(ps, idx, SqlType.DATE);
+		}
+
+		private static void bindTimestamp(PreparedStatement ps, int idx, ColumnMeta meta, String v,
+				DatatypeWarnAccumulator warns) throws SQLException {
+			String norm = v.replace('T', ' ').replaceAll("\\s*[+\\-]\\d{2}:\\d{2}$", "").replaceAll("Z$", "").trim();
+			for (String pattern : TS_PATTERNS) {
+				try {
+					SimpleDateFormat sdf = new SimpleDateFormat(pattern);
+					sdf.setLenient(false);
+					java.util.Date d = sdf.parse(norm);
+					ps.setTimestamp(idx, new java.sql.Timestamp(d.getTime()));
+					return;
+				} catch (Exception ignored) {
+				}
+			}
+			warns.record(meta.name, v);
+			bindNull(ps, idx, SqlType.TIMESTAMP);
+		}
+
+		private static void bindBigint(PreparedStatement ps, int idx, ColumnMeta meta, String v,
+				DatatypeWarnAccumulator warns) throws SQLException {
+			try {
+				ps.setLong(idx, Long.parseLong(v));
+			} catch (NumberFormatException e) {
+				warns.record(meta.name, v);
+				bindNull(ps, idx, SqlType.BIGINT);
+			}
+		}
+
+		private static void bindUuid(PreparedStatement ps, int idx, ColumnMeta meta, String v,
+				DatatypeWarnAccumulator warns) throws SQLException {
+			try {
+				java.util.UUID.fromString(v);
+				ps.setString(idx, v);
+			} catch (IllegalArgumentException e) {
+				warns.record(meta.name, v);
+				ps.setNull(idx, Types.OTHER);
+			}
+		}
+
+		private static void bindJsonb(PreparedStatement ps, int idx, String v) throws SQLException {
+			String t = v.trim();
+			ps.setString(idx, (t.startsWith("{") || t.startsWith("[")) ? t : "{}");
+		}
+
+		private static void bindString(PreparedStatement ps, int idx, ColumnMeta meta, String v,
+				DatatypeWarnAccumulator warns) throws SQLException {
+			if (meta.varcharLimit > 0 && v.length() > meta.varcharLimit) {
+				warns.record(meta.name + "[TRUNCATED]", v.substring(0, Math.min(v.length(), 50)) + "...");
+				ps.setString(idx, v.substring(0, meta.varcharLimit));
+			} else {
+				ps.setString(idx, v);
+			}
+		}
+
+		static void bindNull(PreparedStatement ps, int idx, SqlType type) throws SQLException {
+			switch (type) {
+			case BOOLEAN:
+				ps.setNull(idx, Types.BOOLEAN);
+				break;
+			case DATE:
+				ps.setNull(idx, Types.DATE);
+				break;
+			case TIMESTAMP:
+				ps.setNull(idx, Types.TIMESTAMP);
+				break;
+			case BIGINT:
+				ps.setNull(idx, Types.BIGINT);
+				break;
+			case UUID:
+				ps.setNull(idx, Types.OTHER);
+				break;
+			case JSONB:
+				ps.setString(idx, "{}");
+				break;
+			case VARCHAR:
+			case TEXT:
+				ps.setNull(idx, Types.VARCHAR);
+				break;
+			default:
+				ps.setNull(idx, Types.NULL);
+			}
+		}
+
+		static boolean isBlank(String s) {
+			return s == null || s.trim().isEmpty();
+		}
+	}
+
+	static final class DatatypeWarnAccumulator {
+		private final Map<String, Integer> counts = new LinkedHashMap<>();
+		private final Map<String, List<String>> samples = new LinkedHashMap<>();
+
+		void record(String columnKey, String badValue) {
+			counts.merge(columnKey, 1, Integer::sum);
+			List<String> s = samples.computeIfAbsent(columnKey, k -> new ArrayList<>());
+			if (s.size() < MAX_WARN_SAMPLES) {
+				String safe = badValue == null ? "<null>"
+						: (badValue.length() > 50 ? badValue.substring(0, 50) + "" : badValue);
+				s.add(safe);
+			}
+		}
+
+		boolean isEmpty() {
+			return counts.isEmpty();
+		}
+
+		Map<String, Integer> counts() {
+			return counts;
+		}
+
+		Map<String, List<String>> samples() {
+			return samples;
+		}
+	}
+
+	static final class SkipAccumulator {
+		private final Map<String, Integer> counts = new LinkedHashMap<>();
+
+		void record(String reason) {
+			counts.merge(reason, 1, Integer::sum);
+		}
+
+		void record(String reason, int delta) {
+			counts.merge(reason, delta, Integer::sum);
+		}
+
+		int total() {
+			int t = 0;
+			for (int v : counts.values())
+				t += v;
+			return t;
+		}
+
+		Map<String, Integer> counts() {
+			return counts;
+		}
+	}
+
+	static final class EtlReport {
+		int totalRows;
+		int inserted;
+		int conflictSkipped;
+		int batchesExecuted;
+		int batchesFailed;
+		long startMs;
+		long endMs;
+
+		final SkipAccumulator skipAcc = new SkipAccumulator();
+		final DatatypeWarnAccumulator dtWarn = new DatatypeWarnAccumulator();
+
+		long elapsedSeconds() {
+			return (endMs - startMs) / 1000L;
+		}
+	}
+
+	static final class CsvTable {
+		final Path file;
+		final List<String> headers;
+		final List<Map<String, String>> rows;
+
+		CsvTable(Path file, List<String> headers, List<Map<String, String>> rows) {
+			this.file = file;
+			this.headers = headers;
+			this.rows = rows;
+		}
+
+		boolean hasHeader(String h) {
+			String needle = h.trim().toLowerCase();
+			for (String header : headers) {
+				if (needle.equals(header))
+					return true;
+			}
+			return false;
+		}
+	}
+
+	private static final Set<String> EXPECTED_SOURCE_COLS = Collections
+			.unmodifiableSet(new HashSet<>(Arrays.asList("user_id", "user_mode", "user_status", "bc_organisation",
+					"first_name", "last_name", "middle_name", "title", "gender", "date_of_birth", "user_created_date",
+					"last_updated_date", "user_created_by", "last_updated_by", "version_no", "pstn_phone_no",
+					"gsm_phone_no", "identification_type", "identification_number", "session_id", "user_pass_gen_by")));
+
+	private final String pgUrl;
+	private final String pgUser;
+	private final String pgPass;
+	private final Map<String, Integer> iaCounterByBcOrganisation = new HashMap<String, Integer>();
+
+	public ntp12_process_methods(String pgUrl, String pgUser, String pgPass) {
+		this.pgUrl = pgUrl;
+		this.pgUser = pgUser;
+		this.pgPass = pgPass;
+	}
+
+	public static void main(String[] args) {
+		if (args == null || args.length < 4) {
+			System.out.println("Usage: Ntp12Process <csvFolder> <pgUrl> <pgUser> <pgPass>");
+			return;
+		}
+		boolean ok = new ntp12_process_methods(args[1], args[2], args[3]).run(args[0]);
+		System.exit(ok ? 0 : 1);
+	}
+
+	public boolean run(String csvFolderPath) {
+		EtlReport report = new EtlReport();
+		report.startMs = System.currentTimeMillis();
+
+		log("INFO", "========================================", null, "APP_START");
+		log("INFO", "USER MIGRATION STARTING", null, "APP_START");
+		log("INFO", "Process=" + PROCESS_NAME + "  Version=" + PROCESS_VERSION, null, "APP_START");
+		log("INFO", "========================================", null, "APP_START");
+
+		try {
+			Path inputDir = Paths.get(csvFolderPath);
+			if (!Files.exists(inputDir) || !Files.isDirectory(inputDir)) {
+				log("ERROR", "CSV folder not found or not a directory: " + csvFolderPath, null, "CONFIG_LOAD");
+				return false;
+			}
+
+			List<Path> csvFiles = findCsvFiles(inputDir);
+			if (csvFiles.isEmpty()) {
+				log("WARN", "No CSV files found in: " + csvFolderPath, null, "CSV_LOAD");
+				return false;
+			}
+
+			List<CsvTable> masterTables = new ArrayList<CsvTable>();
+			Map<String, Map<String, String>> userAddressLookup = new HashMap<String, Map<String, String>>();
+			Map<String, Map<String, String>> userDetailsLookup = new HashMap<String, Map<String, String>>();
+
+			for (Path f : csvFiles) {
+				CsvTable t = loadCsv(f);
+				if (t == null || t.rows.isEmpty())
+					continue;
+
+				if (isUserMaster(t)) {
+					masterTables.add(t);
+					report.totalRows += t.rows.size();
+					continue;
+				}
+				if (isUserAddress(t)) {
+					mergeLookupByUserId(userAddressLookup, t);
+					continue;
+				}
+				if (isUserDetails(t)) {
+					mergeLookupByUserId(userDetailsLookup, t);
+				}
+			}
+
+			if (masterTables.isEmpty()) {
+				log("ERROR",
+						"No valid user_master CSV found. Required headers: "
+								+ "user_id, user_mode, user_status, bc_organisation, first_name, title",
+						null, "CSV_LOAD");
+				return false;
+			}
+
+			log("INFO", "Total source rows to process: " + report.totalRows, null, "CONFIG_LOAD");
+			log("INFO", "User address rows loaded: " + userAddressLookup.size(), null, "CONFIG_LOAD");
+			log("INFO", "User details rows loaded: " + userDetailsLookup.size(), null, "CONFIG_LOAD");
+
+			for (CsvTable t : masterTables)
+				validateSourceHeaders(t.headers);
+
+			Map<String, String> reLookup = loadReportingEntityLookup();
+			log("INFO", "Reporting-entity lookup loaded | Entries=" + reLookup.size(), null, "LOOKUP_LOAD");
+
+			String insertSql = buildInsertSql();
+
+			try (Connection conn = DriverManager.getConnection(pgUrl, pgUser, pgPass)) {
+				conn.setAutoCommit(false);
+
+				try (PreparedStatement ps = conn.prepareStatement(insertSql)) {
+
+					List<Map<String, String>> batch = new ArrayList<Map<String, String>>(BATCH_SIZE);
+					List<String> batchIds = new ArrayList<String>(BATCH_SIZE);
+
+					iaCounterByBcOrganisation.clear();
+
+					for (CsvTable masterTable : masterTables) {
+						for (Map<String, String> row : masterTable.rows) {
+
+							String userId = get(row, "user_id");
+							String userMode = get(row, "user_mode");
+
+							if (isBlank(userId)) {
+								report.skipAcc.record("BLANK_USER_ID");
+								continue;
+							}
+
+							if ("IBA".equalsIgnoreCase(userMode)) {
+								report.skipAcc.record("USER_MODE_IBA_NOT_IN_TARGET");
+								continue;
+							}
+
+							Map<String, String> resolved = resolveRow(row, reLookup, userAddressLookup,
+									userDetailsLookup, report.dtWarn);
+
+							bindResolvedRow(ps, resolved, report.dtWarn);
+							ps.addBatch();
+							batch.add(resolved);
+							batchIds.add(userId);
+
+							if (batch.size() >= BATCH_SIZE) {
+								flushBatch(conn, ps, batch, batchIds, report);
+								batch.clear();
+								batchIds.clear();
+							}
+						}
+					}
+
+					if (!batch.isEmpty())
+						flushBatch(conn, ps, batch, batchIds, report);
+				}
+			}
+
+			if (!report.dtWarn.isEmpty()) {
+				log("INFO", "-- Aggregated Datatype Warnings --", null, "DATATYPE_WARN");
+				for (Map.Entry<String, Integer> e : report.dtWarn.counts().entrySet()) {
+					log("WARN", "DATATYPE_WARN Column=" + e.getKey() + " Expected=" + typeForColumn(e.getKey())
+							+ " Failures=" + e.getValue() + " SampleValues=" + report.dtWarn.samples().get(e.getKey()),
+							null, "DATATYPE_WARN");
+				}
+			}
+
+			report.endMs = System.currentTimeMillis();
+			printEtlReport(report);
+			return true;
+
+		} catch (Exception e) {
+			log("ERROR", "Fatal ETL error: " + e.getMessage(), null, "ETL_ERROR");
+			return false;
+		}
+	}
+
+	private void flushBatch(Connection conn, PreparedStatement ps, List<Map<String, String>> batch,
+			List<String> batchIds, EtlReport report) throws SQLException {
+		report.batchesExecuted++;
+		try {
+			int[] results = ps.executeBatch();
+			conn.commit();
+			for (int r : results) {
+				if (r == 1 || r == java.sql.Statement.SUCCESS_NO_INFO) {
+					report.inserted++;
+				} else if (r == 0) {
+					report.conflictSkipped++;
+				}
+			}
+			log("INFO", "Batch committed | Size=" + batch.size() + " | RunningInserted=" + report.inserted, null,
+					"BATCH_SUCCESS");
+		} catch (BatchUpdateException bue) {
+			report.batchesFailed++;
+			conn.rollback();
+
+			StringBuilder rootCause = new StringBuilder();
+			SQLException next = bue.getNextException();
+			while (next != null) {
+				rootCause.append("[SQLState=").append(next.getSQLState()).append(" Msg=").append(next.getMessage())
+						.append("] ");
+				next = next.getNextException();
+			}
+			log("ERROR", "Batch failed | Size=" + batch.size() + " | RootCause=" + rootCause.toString().trim(), null,
+					"BATCH_ERROR");
+
+			ps.clearBatch();
+			retryIndividually(conn, ps, batch, batchIds, report);
+		}
+	}
+
+	private void retryIndividually(Connection conn, PreparedStatement ps, List<Map<String, String>> batch,
+			List<String> batchIds, EtlReport report) throws SQLException {
+		for (int i = 0; i < batch.size(); i++) {
+			String userId = batchIds.get(i);
+			try {
+				ps.clearParameters();
+				bindResolvedRow(ps, batch.get(i), report.dtWarn);
+				ps.execute();
+				conn.commit();
+				report.inserted++;
+			} catch (SQLException rowEx) {
+				try {
+					conn.rollback();
+				} catch (Exception ignored) {
+				}
+				String sqlState = rowEx.getSQLState() == null ? "UNKNOWN" : rowEx.getSQLState();
+				String reason;
+				if ("23505".equals(sqlState)) {
+					reason = "UNIQUE_CONSTRAINT_VIOLATION";
+					report.conflictSkipped++;
+				} else if ("23503".equals(sqlState)) {
+					reason = "FK_CONSTRAINT_VIOLATION";
+				} else if (sqlState.startsWith("23")) {
+					reason = "INTEGRITY_CONSTRAINT_" + sqlState;
+				} else {
+					reason = "ROW_ERROR_" + sqlState;
+				}
+				report.skipAcc.record(reason);
+				log("WARN", "Row skipped | user_id=" + userId + " | Reason=" + reason + " | SQLState=" + sqlState
+						+ " | Detail=" + rowEx.getMessage(), null, "CONSTRAINT_ERROR");
+			}
+		}
+	}
+
+	private Map<String, String> resolveRow(Map<String, String> row, Map<String, String> reLookup,
+			Map<String, Map<String, String>> userAddressLookup, Map<String, Map<String, String>> userDetailsLookup,
+			DatatypeWarnAccumulator warns) {
+		String userId = get(row, "user_id");
+		String bcOrg = get(row, "bc_organisation");
+		String userMode = get(row, "user_mode");
+		String rawStatus = get(row, "user_status");
+
+		Map<String, String> addressRow = lookupRowByUserId(userAddressLookup, userId);
+		Map<String, String> detailsRow = lookupRowByUserId(userDetailsLookup, userId);
+
+		String mappedType = mapUserType(userMode, bcOrg, rawStatus);
+		String opStatus = mapOperationalStatus(rawStatus);
+
+		// FIX: active = true iff user_master.user_status == "1" (which is also
+		// the
+		// only status that maps to operational_status "TESTBED"), else false.
+		// Previously this used a wrong 7-value whitelist and returned null on
+		// blank
+		// status instead of false. Confirmed against production data + explicit
+		// business rule: "if re_user.status is TESTBED or
+		// user_master.user_status = 1
+		// then true else false".
+		Boolean active = deriveActive(rawStatus);
+		String activeStr = active.toString();
+
+		String reUuid = resolveReportingEntityId(bcOrg, reLookup);
+		if (!isBlank(bcOrg) && isBlank(reUuid)) {
+			warns.record("reporting_entity_id[LOOKUP_MISS]", bcOrg);
+		}
+
+		String countryCode = firstNonBlank(get(row, "country_code"), "+91");
+		String gender = mapGender(get(row, "gender"));
+		String title = mapTitle(get(row, "title"));
+
+		String landlineNumber = firstNonBlank(get(addressRow, "phone2"), get(row, "pstn_phone_no"));
+		String mobileNo = firstNonBlank(get(addressRow, "phone3"), get(row, "gsm_phone_no"));
+		String email = firstNonBlank(get(addressRow, "email_id"), get(row, "email"));
+
+		String citizenship = normalizeCitizenship(
+				firstNonBlank(get(detailsRow, "citizenship"), get(row, "citizenship")));
+		String designation = firstNonBlank(get(detailsRow, "designation"), get(detailsRow, "user_certificate_name"),
+				get(row, "user_certificate_name"), get(row, "user_certificate"));
+
+		String createdBy = firstNonBlank(get(row, "user_created_by"), get(row, "created_by"), "SYSTEM");
+		String updatedBy = firstNonBlank(get(row, "last_updated_by"), get(row, "updated_by"), "SYSTEM");
+
+		// FIX: ckyc_no is intentionally left null per business instruction
+		// ("leave it") — value is confirmed/populated by a separate CERSAI
+		// process,
+		// not sourced from this ETL's input data.
+		String ckycNo = null;
+		String ckycNumber = firstNonBlank(get(row, "ckyc_number"), get(detailsRow, "ckyc_number"));
+
+		String proofOfIdentityNumber = null;
+		String proofOfIdentity = null;
+		String employeeId = null;
+		String keyCloakUserId = null;
+		String testbedUserId = null;
+
+		// FIX: office_address should reflect whether a registered address is
+		// actually available in source data, not be gated purely on user_type.
+		// "If available insert else null; use registered address if that's a
+		// thing
+		// in csv." We look for a registered-address source column
+		// (register_city /
+		// register_state / register_country / a dedicated registered-address
+		// field,
+		// whichever is present) and only set the default string when we
+		// actually
+		// have something to point at.
+		String registeredAddressSignal = firstNonBlank(get(row, "registered_address"), get(row, "register_address"),
+				get(detailsRow, "registered_address"), get(detailsRow, "register_address"));
+		String officeAddress = !isBlank(registeredAddressSignal) ? "Same as registered address" : null;
+
+		Boolean sameRegistrationCorrespondenceAddress = null;
+		if (!isBlank(mappedType) && mappedType.startsWith("IAU")) {
+			sameRegistrationCorrespondenceAddress = Boolean.TRUE;
+		}
+
+		String workflowStatus = "APPROVED";
+
+		Map<String, String> nameFields = resolveNameFields(row);
+
+		String metadataJson = buildMetadataJson(row, addressRow, detailsRow, mappedType, opStatus);
+
+		Map<String, String> r = new LinkedHashMap<String, String>();
+
+		r.put("active", activeStr);
+		r.put("dob", get(row, "date_of_birth"));
+		r.put("same_registration_correspondence_address", sameRegistrationCorrespondenceAddress == null ? null
+				: sameRegistrationCorrespondenceAddress.toString());
+		r.put("created_at", firstNonBlank(get(row, "user_created_date"), get(row, "created_at")));
+		r.put("updated_at",
+				firstNonBlank(get(row, "last_updated_date"), get(row, "updated_at"), get(row, "user_created_date")));
+		r.put("version", firstNonBlank(get(row, "version_no"), "0"));
+		r.put("country_code", countryCode);
+		r.put("gender", gender);
+		r.put("title", title);
+		r.put("dsc_id", null);
+		r.put("reporting_entity_id", reUuid);
+		r.put("landline_number", landlineNumber);
+		r.put("mobile", mobileNo);
+		r.put("mobile_number", mobileNo);
+		r.put("user_type", mappedType);
+		r.put("citizenship", citizenship);
+		r.put("ckyc_no", ckycNo);
+		r.put("created_by", createdBy);
+		r.put("designation", designation);
+		r.put("employee_id", employeeId);
+		r.put("proof_of_identity_number", proofOfIdentityNumber);
+		r.put("updated_by", updatedBy);
+		r.put("email", email);
+		r.put("first_name", nameFields.get("first_name"));
+		r.put("last_name", nameFields.get("last_name"));
+		r.put("middle_name", nameFields.get("middle_name"));
+		r.put("key_cloak_user_id", keyCloakUserId);
+		r.put("user_id", userId);
+		r.put("ckyc_number", ckycNumber);
+		r.put("employ_code", firstNonBlank(get(detailsRow, "employee_code"), get(detailsRow, "employ_code")));
+		r.put("register_city", null);
+		r.put("office_address", officeAddress);
+		r.put("register_state", null);
+		r.put("register_country", null);
+		r.put("board_resoluation_date", null);
+		r.put("authorization_letter", null);
+		r.put("date_of_authorization", null);
+		r.put("operational_status", opStatus);
+		r.put("status", opStatus);
+		r.put("workflow_status", workflowStatus);
+		r.put("register_pincode", null);
+		r.put("register_district", null);
+		r.put("register_pincode_other", null);
+		r.put("city", null);
+		r.put("state", null);
+		r.put("country", null);
+		r.put("pincode", null);
+		r.put("district", null);
+		r.put("digipin", null);
+		r.put("pincode_other", null);
+		r.put("address_line_one", null);
+		r.put("address_line_two", null);
+		r.put("address_line_one3", null);
+		r.put("address_line_two3", null);
+		r.put("operation", "INSERT");
+		r.put("requester_reason", null);
+		r.put("approver_reason", null);
+		r.put("address_line", null);
+		r.put("date_of_authorizarion", null);
+		r.put("phone_number", firstNonBlank(mobileNo, landlineNumber));
+		r.put("pending_actions", "{}");
+		r.put("proof_of_identity", proofOfIdentity);
+		r.put("landline", landlineNumber);
+		r.put("register_digipin", null);
+		r.put("address_line1", null);
+		r.put("address_line2", null);
+		r.put("address_line3", null);
+		r.put("board_resolution_date", null);
+		r.put("mobile1_number", mobileNo);
+		r.put("mobile2_number", landlineNumber);
+		r.put("testbed_user_id", testbedUserId);
+		r.put("metadata", metadataJson);
+		r.put("re_id", bcOrg);
+		r.put("mobile_country_code", countryCode);
+		r.put("poi_type", null);
+		r.put("poi_no", null);
+
+		return r;
+	}
+
+	private Map<String, String> resolveNameFields(Map<String, String> row) {
+
+		Map<String, String> nameMap = new HashMap<String, String>();
+
+		String firstName = get(row, "first_name");
+		String middleName = get(row, "middle_name");
+		String lastName = get(row, "last_name");
+
+		if (!isBlank(lastName) || !isBlank(middleName)) {
+			String cleanedFirst = firstName;
+			if (!isBlank(cleanedFirst)) {
+				if (!isBlank(lastName))
+					cleanedFirst = stripTrailingToken(cleanedFirst, lastName);
+				if (!isBlank(middleName))
+					cleanedFirst = stripTrailingToken(cleanedFirst, middleName);
+			}
+			nameMap.put("first_name", isBlank(cleanedFirst) ? firstName : cleanedFirst);
+			nameMap.put("middle_name", middleName);
+			nameMap.put("last_name", lastName);
+			return nameMap;
+		}
+
+		if (isBlank(firstName)) {
+			nameMap.put("first_name", null);
+			nameMap.put("middle_name", null);
+			nameMap.put("last_name", null);
+			return nameMap;
+		}
+
+		String[] parts = firstName.trim().split("\\s+");
+
+		if (parts.length == 1) {
+			nameMap.put("first_name", parts[0]);
+			nameMap.put("middle_name", null);
+			nameMap.put("last_name", null);
+		} else if (parts.length == 2) {
+			nameMap.put("first_name", parts[0]);
+			nameMap.put("middle_name", null);
+			nameMap.put("last_name", parts[1]);
+		} else {
+			StringBuilder middle = new StringBuilder();
+			for (int i = 1; i < parts.length - 1; i++) {
+				if (middle.length() > 0)
+					middle.append(" ");
+				middle.append(parts[i]);
+			}
+			nameMap.put("first_name", parts[0]);
+			nameMap.put("middle_name", middle.toString());
+			nameMap.put("last_name", parts[parts.length - 1]);
+		}
+
+		return nameMap;
+	}
+
+	private String stripTrailingToken(String source, String token) {
+		if (isBlank(source) || isBlank(token))
+			return source;
+		String trimmedSource = source.trim();
+		String trimmedToken = token.trim();
+		if (trimmedSource.length() < trimmedToken.length())
+			return source;
+
+		String tail = trimmedSource.substring(trimmedSource.length() - trimmedToken.length());
+		if (!tail.equalsIgnoreCase(trimmedToken))
+			return source;
+
+		int boundaryIdx = trimmedSource.length() - trimmedToken.length() - 1;
+		if (boundaryIdx >= 0 && trimmedSource.charAt(boundaryIdx) != ' ')
+			return source;
+
+		return trimmedSource.substring(0, trimmedSource.length() - trimmedToken.length()).trim();
+	}
+
+	private void bindResolvedRow(PreparedStatement ps, Map<String, String> resolved, DatatypeWarnAccumulator warns)
+			throws SQLException {
+		for (int i = 0; i < INSERT_COLUMNS.size(); i++) {
+			String col = INSERT_COLUMNS.get(i);
+			ColumnMeta meta = COLUMN_REGISTRY.get(col);
+			TypeBinder.bind(ps, i + 1, meta, resolved.get(col), warns);
+		}
+	}
+
+	private void validateSourceHeaders(List<String> headers) {
+		Set<String> headerSet = new HashSet<>(headers);
+		for (String expected : EXPECTED_SOURCE_COLS) {
+			if (!headerSet.contains(expected)) {
+				log("WARN", "MISSING_SOURCE_COLUMN=" + expected + " | Dependent target columns will receive NULL", null,
+						"MAPPING_WARN");
+			}
+		}
+	}
+
+	private String mapUserType(String userMode, String bcOrganisation, String rawStatus) {
+		if (isBlank(userMode))
+			return null;
+		String mode = userMode.trim().toUpperCase();
+
+		if ("IBA".equals(mode))
+			return "SKIP";
+
+		if (!"IA".equals(mode)) {
+			return mode;
+		}
+
+		if (!"1".equals(rawStatus == null ? "" : rawStatus.trim())) {
+			return "IA";
+		}
+
+		String key = normalizeKey(bcOrganisation);
+		Integer count = iaCounterByBcOrganisation.get(key);
+		if (count == null) {
+			count = Integer.valueOf(0);
+		}
+		count = Integer.valueOf(count.intValue() + 1);
+		iaCounterByBcOrganisation.put(key, count);
+
+		if (count.intValue() == 1) {
+			log("INFO", "IA occurrence 1 for bc_organisation " + bcOrganisation + " mapped to IAU_1", null,
+					"IA_MAPPING");
+			return "IAU_1";
+		}
+		if (count.intValue() == 2) {
+			log("INFO", "IA occurrence 2 for bc_organisation " + bcOrganisation + " mapped to IAU_2", null,
+					"IA_MAPPING");
+			return "IAU_2";
+		}
+
+		return "IAU";
+	}
+
+	private String mapOperationalStatus(String userStatus) {
+		if (isBlank(userStatus))
+			return null;
+		switch (userStatus.trim()) {
+		case "0":
+			return "IN_ACTIVE";
+		case "1":
+			return "TESTBED";
+		case "2":
+			return "NOT_LOGGED";
+		case "3":
+			return "DELETED";
+		case "4":
+			return "LOCKED";
+		case "6":
+			return "ALREADY_LOGGED";
+		case "7":
+			return "PENDING_AUTHORIZE";
+		case "8":
+			return "REJECTED";
+		case "12":
+			return "DIGITAL_CERTIFICATE_REGISTRATION";
+		case "13":
+			return "DELETION_PENDING";
+		case "14":
+			return "ACTIVATION_PENDING";
+		case "15":
+			return "ACTIVATION_REJECTED";
+		case "20":
+			return "TERMS_AND_CONDITIONS";
+		default:
+			return userStatus.trim();
+		}
+	}
+
+	private String mapTitle(String rawTitle) {
+		if (isBlank(rawTitle))
+			return null;
+		switch (rawTitle.trim()) {
+		case "01":
+			return "Mr.";
+		case "02":
+			return "Mrs.";
+		case "03":
+			return "Ms.";
+		case "04":
+			return "Ms.";
+		default:
+			return null;
+		}
+	}
+
+	private String mapGender(String rawGender) {
+		if (isBlank(rawGender))
+			return null;
+		switch (rawGender.trim().toUpperCase()) {
+		case "M":
+			return "Male";
+		case "F":
+			return "Female";
+		case "T":
+			return "Transgender";
+		default:
+			return rawGender.trim();
+		}
+	}
+
+	private String normalizeCitizenship(String rawCitizenship) {
+		if (isBlank(rawCitizenship))
+			return "Indian";
+		if (rawCitizenship.trim().toLowerCase().contains("india"))
+			return "Indian";
+		return rawCitizenship.trim();
+	}
+
+	/**
+	 * FIX: active = true iff user_master.user_status == "1" (the only status
+	 * that also maps to operational_status "TESTBED"), else false — never null.
+	 * Business rule: "if re_user.status is TESTBED or user_master.user_status =
+	 * 1 then set true else false."
+	 */
+	private Boolean deriveActive(String rawUserStatus) {
+		return Boolean.valueOf("1".equals(rawUserStatus == null ? "" : rawUserStatus.trim()));
+	}
+
+	private String buildMetadataJson(Map<String, String> row, Map<String, String> addressRow,
+			Map<String, String> detailsRow, String mappedType, String opStatus) {
+		Map<String, String> meta = new LinkedHashMap<String, String>();
+		addAllMetadata(meta, row);
+		addAllMetadata(meta, addressRow);
+		addAllMetadata(meta, detailsRow);
+		meta.put("mapped_user_type", mappedType == null ? "" : mappedType);
+		meta.put("mapped_operational_status", opStatus == null ? "" : opStatus);
+		return toJson(meta);
+	}
+
+	private void addAllMetadata(Map<String, String> target, Map<String, String> source) {
+		if (source == null)
+			return;
+		for (Map.Entry<String, String> e : source.entrySet()) {
+			String key = normalizeKey(e.getKey());
+			if (isBlank(key))
+				continue;
+			if (!target.containsKey(key))
+				target.put(key, cleanMetadataValue(e.getValue()));
+		}
+	}
+
+	private String cleanMetadataValue(String value) {
+		if (value == null)
+			return "";
+		String v = value.trim();
+		if (v.isEmpty() || "\\N".equals(v) || "NULL".equalsIgnoreCase(v) || "null".equalsIgnoreCase(v))
+			return "";
+		return v;
+	}
+
+	private String buildInsertSql() {
+		StringBuilder sb = new StringBuilder("INSERT INTO re_mgmt.re_user (");
+		for (int i = 0; i < INSERT_COLUMNS.size(); i++) {
+			if (i > 0)
+				sb.append(", ");
+			sb.append(INSERT_COLUMNS.get(i));
+		}
+		sb.append(") VALUES (");
+		for (int i = 0; i < INSERT_COLUMNS.size(); i++) {
+			if (i > 0)
+				sb.append(", ");
+			SqlType t = COLUMN_REGISTRY.get(INSERT_COLUMNS.get(i)).sqlType;
+			if (t == SqlType.UUID)
+				sb.append("CAST(? AS uuid)");
+			else if (t == SqlType.JSONB)
+				sb.append("CAST(? AS jsonb)");
+			else
+				sb.append("?");
+		}
+		sb.append(") ON CONFLICT (user_id) DO NOTHING");
+		return sb.toString();
+	}
+
+	private Map<String, String> loadReportingEntityLookup() {
+		Map<String, String> map = new HashMap<String, String>();
+		String sql = "SELECT fi_code, id FROM re_mgmt.reporting_entity";
+		Connection conn = null;
+		PreparedStatement ps = null;
+		ResultSet rs = null;
+
+		try {
+			conn = DriverManager.getConnection(pgUrl, pgUser, pgPass);
+			ps = conn.prepareStatement(sql);
+			rs = ps.executeQuery();
+
+			while (rs.next()) {
+				String fi = rs.getString("fi_code");
+				String id = rs.getString("id");
+				if (!isBlank(fi) && !isBlank(id)) {
+					try {
+						java.util.UUID.fromString(id.trim());
+						map.put(normalizeKey(fi), id.trim());
+					} catch (IllegalArgumentException ex) {
+						// Skip invalid UUID values from lookup table
+					}
+				}
+			}
+		} catch (Exception e) {
+			log("WARN", "Reporting-entity lookup failed: " + e.getMessage(), null, "LOOKUP_LOAD");
+		} finally {
+			closeQuietly(rs);
+			closeQuietly(ps);
+			closeQuietly(conn);
+		}
+
+		return map;
+	}
+
+	private void mergeLookupByUserId(Map<String, Map<String, String>> target, CsvTable table) {
+		if (target == null || table == null || table.rows == null)
+			return;
+		for (Map<String, String> row : table.rows) {
+			String userId = get(row, "user_id");
+			if (isBlank(userId))
+				continue;
+			target.put(normalizeKey(userId), row);
+		}
+	}
+
+	private Map<String, String> lookupRowByUserId(Map<String, Map<String, String>> lookup, String userId) {
+		if (lookup == null || isBlank(userId))
+			return null;
+		return lookup.get(normalizeKey(userId));
+	}
+
+	private boolean isUserAddress(CsvTable table) {
+		return table != null && table.hasHeader("user_id")
+				&& (table.hasHeader("email_id") || table.hasHeader("phone2") || table.hasHeader("phone3"));
+	}
+
+	private boolean isUserDetails(CsvTable table) {
+		return table != null && table.hasHeader("user_id")
+				&& (table.hasHeader("citizenship") || table.hasHeader("designation") || table.hasHeader("employee_code")
+						|| table.hasHeader("any_other_info") || table.hasHeader("department")
+						|| table.hasHeader("entered_place") || table.hasHeader("specialisation"));
+	}
+
+	private String resolveReportingEntityId(String bcOrg, Map<String, String> reLookup) {
+		if (isBlank(bcOrg) || reLookup == null || reLookup.isEmpty())
+			return null;
+
+		String key = normalizeKey(bcOrg);
+		String id = reLookup.get(key);
+		if (!isBlank(id))
+			return id;
+
+		for (Map.Entry<String, String> e : reLookup.entrySet()) {
+			if (e.getKey() != null && e.getKey().equalsIgnoreCase(key))
+				return e.getValue();
+		}
+
+		return null;
+	}
+
+	private CsvTable loadCsv(Path file) {
+		try (BufferedReader br = Files.newBufferedReader(file, StandardCharsets.ISO_8859_1)) {
+			String headerLine = br.readLine();
+			if (isBlank(headerLine))
+				return null;
+
+			List<String> rawHeaders = parseDelimitedLine(headerLine, '|');
+			if (rawHeaders.isEmpty())
+				return null;
+
+			List<String> headers = new ArrayList<>();
+			for (String h : rawHeaders)
+				headers.add(normalizeHeader(h));
+
+			List<Map<String, String>> rows = new ArrayList<>();
+			String line;
+			while ((line = br.readLine()) != null) {
+				if (isBlank(line))
+					continue;
+				List<String> vals = parseDelimitedLine(line, '|');
+				while (vals.size() < headers.size())
+					vals.add("");
+				Map<String, String> row = new LinkedHashMap<>();
+				for (int i = 0; i < headers.size(); i++)
+					row.put(headers.get(i), cleanValue(i < vals.size() ? vals.get(i) : null));
+				rows.add(row);
+			}
+			log("INFO", "Loaded: " + file.getFileName() + " | Rows=" + rows.size(), null, "CSV_LOAD");
+			return new CsvTable(file, headers, rows);
+		} catch (Exception e) {
+			log("ERROR", "CSV load error: " + file.getFileName() + " | " + e.getMessage(), null, "CSV_LOAD");
+			return null;
+		}
+	}
+
+	private boolean isUserMaster(CsvTable t) {
+		return t.hasHeader("user_id") && t.hasHeader("user_mode") && t.hasHeader("user_status")
+				&& t.hasHeader("bc_organisation") && t.hasHeader("first_name") && t.hasHeader("title");
+	}
+
+	private List<Path> findCsvFiles(Path dir) throws IOException {
+		List<Path> files = new ArrayList<>();
+		try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "*.csv")) {
+			for (Path p : stream)
+				if (Files.isRegularFile(p))
+					files.add(p);
+		}
+		files.sort(Comparator.comparing(p -> p.getFileName().toString().toLowerCase()));
+		return files;
+	}
+
+	private void printEtlReport(EtlReport r) {
+		int totalSkipped = r.skipAcc.total() + r.conflictSkipped;
+		log("INFO", "", null, "ETL_SUMMARY");
+		log("INFO", "ETL SUMMARY REPORT", null, "ETL_SUMMARY");
+		log("INFO", "", null, "ETL_SUMMARY");
+		log("INFO", String.format("Total Source Rows  : %d", r.totalRows), null, "ETL_SUMMARY");
+		log("INFO", String.format("Inserted           : %d", r.inserted), null, "ETL_SUMMARY");
+		log("INFO", String.format("Conflict Skipped   : %d (ON CONFLICT DO NOTHING)", r.conflictSkipped), null,
+				"ETL_SUMMARY");
+		log("INFO", String.format("Other Skipped      : %d", r.skipAcc.total()), null, "ETL_SUMMARY");
+		log("INFO", String.format("Total Skipped      : %d", totalSkipped), null, "ETL_SUMMARY");
+		log("INFO", String.format("Batches Executed   : %d", r.batchesExecuted), null, "ETL_SUMMARY");
+		log("INFO", String.format("Batches Failed     : %d", r.batchesFailed), null, "ETL_SUMMARY");
+		log("INFO", String.format("Execution Time     : %ds", r.elapsedSeconds()), null, "ETL_SUMMARY");
+		if (!r.skipAcc.counts().isEmpty()) {
+			log("INFO", " Skip Reasons ", null, "ETL_SUMMARY");
+			for (Map.Entry<String, Integer> e : r.skipAcc.counts().entrySet())
+				log("INFO", String.format("  %-45s = %d", e.getKey(), e.getValue()), null, "ETL_SUMMARY");
+		}
+		if (!r.dtWarn.isEmpty()) {
+			log("INFO", " Datatype Warnings ", null, "ETL_SUMMARY");
+			for (Map.Entry<String, Integer> e : r.dtWarn.counts().entrySet())
+				log("WARN", String.format("  Column=%-40s Failures=%-8d Samples=%s", e.getKey(), e.getValue(),
+						r.dtWarn.samples().get(e.getKey())), null, "ETL_SUMMARY");
+		}
+		log("INFO", "", null, "ETL_SUMMARY");
+		log("INFO", "USER MIGRATION COMPLETED", null, "APP_END");
+		log("INFO", "", null, "APP_END");
+	}
+
+	private String get(Map<String, String> row, String col) {
+		if (row == null || col == null)
+			return "";
+		return cleanValue(row.get(col.trim().toLowerCase()));
+	}
+
+	private String cleanValue(String v) {
+		if (v == null)
+			return "";
+		v = v.trim();
+		if (v.isEmpty() || "\\N".equals(v) || "\"\"".equals(v) || "NULL".equalsIgnoreCase(v))
+			return "";
+		return v;
+	}
+
+	private String firstNonBlank(String... values) {
+		if (values == null)
+			return null;
+		for (String v : values)
+			if (!isBlank(v))
+				return v.trim();
+		return null;
+	}
+
+	private boolean isBlank(String s) {
+		return s == null || s.trim().isEmpty();
+	}
+
+	private String toJson(Map<String, String> map) {
+		StringBuilder json = new StringBuilder("{");
+		int i = 0;
+		for (Map.Entry<String, String> e : map.entrySet()) {
+			if (i++ > 0)
+				json.append(",");
+			json.append("\"").append(escapeJson(e.getKey())).append("\":");
+			if (e.getValue() == null)
+				json.append("null");
+			else
+				json.append("\"").append(escapeJson(e.getValue())).append("\"");
+		}
+		json.append("}");
+		return json.toString();
+	}
+
+	private String escapeJson(String v) {
+		if (v == null)
+			return "";
+		return v.replace("\\", "\\\\").replace("\"", "\\\"").replace("\r", "\\r").replace("\n", "\\n");
+	}
+
+	private String normalizeHeader(String h) {
+		if (h == null)
+			return "";
+		h = h.trim();
+		if (h.startsWith("\"") && h.endsWith("\"") && h.length() >= 2)
+			h = h.substring(1, h.length() - 1).trim();
+		return h.toLowerCase();
+	}
+
+	private String normalizeKey(String key) {
+		if (key == null)
+			return "";
+		return key.trim().toLowerCase();
+	}
+
+	private void closeQuietly(java.io.Closeable c) {
+		if (c != null) {
+			try {
+				c.close();
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private void closeQuietly(ResultSet rs) {
+		if (rs != null) {
+			try {
+				rs.close();
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private void closeQuietly(PreparedStatement ps) {
+		if (ps != null) {
+			try {
+				ps.close();
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private void closeQuietly(Connection conn) {
+		if (conn != null) {
+			try {
+				conn.close();
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private List<String> parseDelimitedLine(String line, char delimiter) {
+		List<String> out = new ArrayList<>();
+		if (line == null)
+			return out;
+		StringBuilder cur = new StringBuilder();
+		boolean inQ = false;
+		for (int i = 0; i < line.length(); i++) {
+			char ch = line.charAt(i);
+			if (ch == '"') {
+				if (inQ && i + 1 < line.length() && line.charAt(i + 1) == '"') {
+					cur.append('"');
+					i++;
+				} else {
+					inQ = !inQ;
+				}
+			} else if (ch == delimiter && !inQ) {
+				out.add(cur.toString());
+				cur.setLength(0);
+			} else {
+				cur.append(ch);
+			}
+		}
+		out.add(cur.toString());
+		return out;
+	}
+
+	private String typeForColumn(String colKey) {
+		String base = colKey.contains("[") ? colKey.substring(0, colKey.indexOf('[')) : colKey;
+		ColumnMeta meta = COLUMN_REGISTRY.get(base);
+		return meta == null ? "UNKNOWN" : meta.sqlType.name();
+	}
+
+	private void log(String level, String message, String serverIp, String evtType) {
+		String ts = LocalDateTime.now().format(LOG_FMT);
+		StringBuilder sb = new StringBuilder(512);
+		sb.append("Time:").append(ts).append(" [").append(capitalize(level)).append("] ").append("Process_Name: ")
+				.append(PROCESS_NAME).append(" ");
+		if (!isBlank(serverIp))
+			sb.append("Server_IP: ").append(serverIp).append(" ");
+		sb.append("Process_Version: ").append(PROCESS_VERSION).append(" Log_Level: EVT_LOG").append("  EVT_Type: ")
+				.append(evtType != null ? evtType : "NA").append(" Description: ")
+				.append(message != null ? message : "");
+		System.out.println(sb.toString().trim());
+	}
+
+	private String capitalize(String s) {
+		if (s == null || s.isEmpty())
+			return s;
+		return s.substring(0, 1).toUpperCase() + s.substring(1).toLowerCase();
+	}
+}

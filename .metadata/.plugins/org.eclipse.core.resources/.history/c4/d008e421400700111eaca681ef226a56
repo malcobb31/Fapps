@@ -1,0 +1,242 @@
+package dell_scality;
+
+import java.io.InputStream;
+import java.security.DigestInputStream;
+import java.security.MessageDigest;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.*;
+
+import com.amazonaws.ClientConfiguration;
+import com.amazonaws.auth.*;
+import com.amazonaws.client.builder.AwsClientBuilder;
+import com.amazonaws.services.s3.*;
+import com.amazonaws.services.s3.model.*;
+import com.amazonaws.services.s3.transfer.*;
+
+public class migrationV1 {
+
+    private static final Logger logger = Logger.getLogger(migrationV1.class.getName());
+
+    static {
+        ConsoleHandler handler = new ConsoleHandler();
+        handler.setFormatter(new SimpleFormatter());
+        logger.addHandler(handler);
+        logger.setUseParentHandlers(false);
+    }
+
+    //  Create S3 Client
+    public static AmazonS3 createClient(String accessKey, String secretKey, String endpoint) {
+
+        BasicAWSCredentials creds = new BasicAWSCredentials(accessKey, secretKey);
+
+        ClientConfiguration config = new ClientConfiguration();
+        config.setMaxConnections(300);
+        config.setConnectionTimeout(60_000);
+        config.setSocketTimeout(60_000);
+        config.setSignerOverride("S3SignerType");
+
+        return AmazonS3ClientBuilder.standard()
+                .withEndpointConfiguration(
+                        new AwsClientBuilder.EndpointConfiguration(endpoint, "us-east-1"))
+                .withPathStyleAccessEnabled(true)
+                .withClientConfiguration(config)
+                .withCredentials(new AWSStaticCredentialsProvider(creds))
+                .build();
+    }
+
+    //  Byte  Hex (Java 8 safe)
+    private static String bytesToHex(byte[] bytes) {
+
+        StringBuilder hex = new StringBuilder(bytes.length * 2);
+
+        for (byte b : bytes) {
+            String s = Integer.toHexString(0xff & b);
+            if (s.length() == 1) {
+                hex.append('0');
+            }
+            hex.append(s);
+        }
+
+        return hex.toString();
+    }
+
+    public static void main(String[] args) throws Exception {
+
+    	 AmazonS3 source = createClient(
+                 "AKIA5071D3A94B4DABD6",
+                 "7w/OjXG1UEsikGbSeFTFQu01z7WkygPQqfjdrPpq",
+                 "http://192.168.90.163"
+         );
+
+         AmazonS3 destination = createClient(
+                 "HPZBCYK10H24VCNRKKM7",
+                 "hNz4QcK6TWQUmCuqfUSr+DBHXC2kHo93Fhq5xqLm",
+                 "http://172.20.161.11"
+         );
+
+        String sourceBucket = "uat_testbed_bucket_02";
+        String destBucket = "test";
+
+        ExecutorService executor = Executors.newFixedThreadPool(20);
+
+        TransferManager transferManager =
+                TransferManagerBuilder.standard()
+                        .withS3Client(destination)
+                        .withMultipartUploadThreshold(64L * 1024 * 1024)
+                        .withMinimumUploadPartSize(32L * 1024 * 1024)
+                        .build();
+
+        AtomicInteger processed = new AtomicInteger();
+        AtomicInteger success = new AtomicInteger();
+        AtomicInteger failed = new AtomicInteger();
+        AtomicInteger skipped = new AtomicInteger();
+
+        long startTime = System.currentTimeMillis();
+
+        logger.info("=========== MIGRATION STARTED ===========");
+
+        ObjectListing listing = source.listObjects(sourceBucket);
+
+        do {
+
+            for (S3ObjectSummary obj : listing.getObjectSummaries()) {
+
+                executor.submit(() -> {
+
+                    String key = obj.getKey();
+                    processed.incrementAndGet();
+
+                    try {
+
+                        if (destination.doesObjectExist(destBucket, key)) {
+                            logger.info("SKIPPED (already exists): " + key);
+                            skipped.incrementAndGet();
+                            return;
+                        }
+
+                        int attempt = 0;
+
+                        while (attempt < 3) {
+
+                            try {
+
+                                logger.info("Transferring -> " + key);
+
+                                //  OPEN SOURCE OBJECT
+                                S3Object sourceObject = source.getObject(sourceBucket, key);
+
+                                //  Create SHA while reading (single pass)
+                                MessageDigest digest = MessageDigest.getInstance("SHA-256");
+
+                                DigestInputStream digestStream =
+                                        new DigestInputStream(
+                                                sourceObject.getObjectContent(),
+                                                digest);
+
+                                ObjectMetadata metadata = sourceObject.getObjectMetadata();
+
+                                PutObjectRequest request =
+                                        new PutObjectRequest(
+                                                destBucket,
+                                                key,
+                                                digestStream,
+                                                metadata);
+
+                                Upload upload = transferManager.upload(request);
+
+                                upload.waitForCompletion();
+
+                                digestStream.close();
+                                sourceObject.close();
+
+                                String sourceSha = bytesToHex(digest.digest());
+
+                                //  VERIFY DESTINATION SHA
+                                S3Object destObject = destination.getObject(destBucket, key);
+
+                                MessageDigest destDigest = MessageDigest.getInstance("SHA-256");
+
+                                InputStream destStream =
+                                        new DigestInputStream(
+                                                destObject.getObjectContent(),
+                                                destDigest);
+
+                                byte[] buffer = new byte[16 * 1024];
+                                while (destStream.read(buffer) != -1) {}
+
+                                destStream.close();
+                                destObject.close();
+
+                                String destSha = bytesToHex(destDigest.digest());
+
+                                if (!sourceSha.equals(destSha)) {
+                                    throw new RuntimeException("SHA mismatch!");
+                                }
+
+                                logger.info("SUCCESS -> " + key +
+                                        " | SHA256=" + sourceSha);
+
+                                success.incrementAndGet();
+                                break;
+
+                            } catch (Exception e) {
+
+                                attempt++;
+
+                                logger.warning("Retry " + attempt + " -> " + key);
+
+                                if (attempt == 3) {
+                                    logger.severe("FAILED -> " + key +
+                                            " | Reason: " + e.getMessage());
+                                    failed.incrementAndGet();
+                                }
+                            }
+                        }
+
+                    } catch (Exception ex) {
+
+                        logger.severe("ERROR -> " + key +
+                                " | " + ex.getMessage());
+
+                        failed.incrementAndGet();
+                    }
+
+                });
+            }
+
+            listing = source.listNextBatchOfObjects(listing);
+
+        } while (listing.isTruncated());
+
+        executor.shutdown();
+        executor.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
+
+        transferManager.shutdownNow(false);
+
+        long endTime = System.currentTimeMillis();
+
+        logger.info("\n=========== MIGRATION SUMMARY ===========");
+        logger.info("Processed  : " + processed.get());
+        logger.info("Successful : " + success.get());
+        logger.info("Skipped    : " + skipped.get());
+        logger.info("Failed     : " + failed.get());
+        logger.info("Time Taken : " + ((endTime - startTime) / 1000) + " sec");
+        logger.info("========================================");
+    }
+}
+
+
+
+
+// AmazonS3 source = createClient(
+//                "AKIA5071D3A94B4DABD6",
+//                "7w/OjXG1UEsikGbSeFTFQu01z7WkygPQqfjdrPpq",
+//                "http://192.168.90.163"
+//        );
+//
+//        AmazonS3 destination = createClient(
+//                "HPZBCYK10H24VCNRKKM7",
+//                "hNz4QcK6TWQUmCuqfUSr+DBHXC2kHo93Fhq5xqLm",
+//                "http://172.20.161.11"
+//        );

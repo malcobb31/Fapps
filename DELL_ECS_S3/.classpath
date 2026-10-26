@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<classpath>
+	<classpathentry kind="src" path="src"/>
+	<classpathentry kind="con" path="org.eclipse.jdt.launching.JRE_CONTAINER/org.eclipse.jdt.internal.debug.ui.launcher.StandardVMType/JavaSE-1.8"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/aws-java-sdk-core-1.12.797.jar"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/aws-java-sdk-s3-1.12.797.jar"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/aws-java-sdk-verifiedpermissions-1.12.680.jar"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/commons-codec-1.15.jar"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/commons-collections4-4.4.jar"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/commons-compress-1.25.0.jar"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/commons-io-2.15.0.jar"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/commons-logging-1.2.jar"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/httpclient-4.5.4.jar"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/poi-5.2.5.jar"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/poi-ooxml-5.2.5.jar"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/poi-ooxml-lite-5.2.5.jar"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/xmlbeans-5.2.0.jar"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/jackson-databind-2.15.2.jar"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/jackson-annotations-2.15.2.jar"/>
+	<classpathentry kind="lib" path="C:/Users/User/Documents/EyeQ_Migration_Updation/req_jar/jackson-core-2.15.2.jar"/>
+	<classpathentry kind="output" path="bin"/>
+</classpath>

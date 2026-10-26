@@ -1,0 +1,146 @@
+package ftp_postgre;
+
+import java.io.IOException;
+import java.nio.file.*;
+import java.sql.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.logging.*;
+
+public class ProcessData {
+
+    private static final Logger logger = Logger.getLogger(ProcessData.class.getName());
+
+    // Fixed metadata
+    private static final String PROCESS_NAME = "Ftp_Postgre";
+    private static final String PROCESS_VERSION = "1.1.0";
+
+    private static String serverIp;
+
+    private static void setupLogger() {
+        logger.setUseParentHandlers(false);
+        ConsoleHandler handler = new ConsoleHandler();
+        handler.setFormatter(new CustomLogFormatter(serverIp));
+        logger.addHandler(handler);
+    }
+
+    public static void  process(String path,
+                        String dbUrl,
+                        String dbUser,
+                        String dbPass,
+                        String destinDir,
+                        String scheduleTable,
+                        String serverIp) {
+
+        
+        setupLogger();
+
+        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass)) {
+
+            Path folder = Paths.get(path);
+            if (!Files.exists(folder)) {
+                logEvent(Level.SEVERE, "EVT_Log", "INVALID_PATH", "Folder not found: " + path);
+                return;
+            }
+
+            DirectoryStream<Path> stream = Files.newDirectoryStream(folder, "*.csv");
+            int count = 0;
+
+            for (Path file : stream) {
+                count++;
+                String fileName = file.getFileName().toString();
+                logEvent(Level.INFO, "EVT_Log", "FILE_SCAN", "Found file: " + fileName);
+
+                if (!isValidFileName(fileName)) {
+                    logEvent(Level.WARNING, "EVT_Log", "INVALID_FILE", "Invalid file name format: " + fileName);
+                    continue;
+                }
+
+                String[] parts = fileName.split("_");
+                String serialNo = parts[4]; // 4th parameter
+
+                String query = "SELECT table_name, sync_status FROM " + scheduleTable + " WHERE sno = ?";
+                try (PreparedStatement ps = conn.prepareStatement(query)) {
+                    ps.setInt(1, Integer.parseInt(serialNo));
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            String tableName = rs.getString("table_name");
+                            String syncStatus = rs.getString("sync_status");
+
+                            if ("init".equalsIgnoreCase(syncStatus)) {
+                                // Move file
+                                Path dest = Paths.get(destinDir, fileName);
+                                Files.move(file, dest, StandardCopyOption.REPLACE_EXISTING);
+                                logEvent(Level.INFO, "EVT_Log", "FILE_MOVE",
+                                        "File " + fileName + " moved to " + dest);
+
+                                // Update status
+                                String update = "UPDATE " + scheduleTable + " SET sync_status = 'ready_to_import' WHERE sno = ?";
+                                try (PreparedStatement ups = conn.prepareStatement(update)) {
+                                    ups.setInt(1, Integer.parseInt(serialNo));
+                                    ups.executeUpdate();
+                                    logEvent(Level.INFO, "EVT_Log", "STATUS_UPDATE",
+                                            "Updated sync_status to ready_to_import for SNO=" + serialNo);
+                                }
+                            } else {
+                                logEvent(Level.WARNING, "EVT_Log", "SKIPPED_FILE",
+                                        "File " + fileName + " skipped. Current sync_status: " + syncStatus);
+                            }
+
+                        } else {
+                            logEvent(Level.WARNING, "EVT_Log", "MISSING_ENTRY",
+                                    "No schedule entry found for SNO=" + serialNo + " (file " + fileName + ")");
+                        }
+                    }
+                }
+            }
+
+            logEvent(Level.INFO, "EVT_Log", "SUMMARY", "Total files processed in folder: " + count);
+
+        } catch (SQLException | IOException e) {
+            logEvent(Level.SEVERE, "EVT_Log", "ERROR", "Error processing files: " + e.getMessage());
+        }
+    }
+
+    private static boolean isValidFileName(String fileName) {
+        // Expected format: raw_NA_NA_NA_3_2025_07_18_13_24_57.csv
+        String regex = "^raw_[^_]+_[^_]+_[^_]+_\\d{1,}_\\d{4}_\\d{2}_\\d{2}_\\d{2}_\\d{2}_\\d{2}\\.csv$";
+        return fileName.matches(regex);
+    }
+
+    private static void logEvent(Level level, String evtLog, String evtType, String description) {
+        LogRecord record = new LogRecord(level, description);
+        record.setParameters(new String[]{evtLog, evtType, description});
+        logger.log(record);
+    }
+
+    // Custom Formatter for logs
+    static class CustomLogFormatter extends Formatter {
+        private final DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+        private final String serverIp;
+
+        public CustomLogFormatter(String serverIp) {
+            this.serverIp = serverIp;
+        }
+
+        @Override
+        public String format(LogRecord record) {
+            String time = LocalDateTime.now().format(dtf);
+            String evtLog = (String) record.getParameters()[0];
+            String evtType = (String) record.getParameters()[1];
+            String description = (String) record.getParameters()[2];
+
+            return String.format(
+                "Time:%s [Debug] Process_Name:%s Server_IP:%s Process_Version:%s Log_Level:%s %s EVT_Type:%s Description: %s%n",
+                time,
+                PROCESS_NAME,
+                serverIp,
+                PROCESS_VERSION,
+                record.getLevel().getName(),
+                evtLog,
+                evtType,
+                description
+            );
+        }
+    }
+}

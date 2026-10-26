@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<launchConfiguration type="org.eclipse.jdt.launching.localJavaApplication">
+<listAttribute key="org.eclipse.debug.core.MAPPED_RESOURCE_PATHS">
+<listEntry value="/ERROR_PARSER_TEMP/src/error_parser/error_parser_main.java"/>
+</listAttribute>
+<listAttribute key="org.eclipse.debug.core.MAPPED_RESOURCE_TYPES">
+<listEntry value="1"/>
+</listAttribute>
+<stringAttribute key="org.eclipse.jdt.launching.MAIN_TYPE" value="error_parser.error_parser_main"/>
+<stringAttribute key="org.eclipse.jdt.launching.PROGRAM_ARGUMENTS" value="C:\Users\User\Documents\Jars\post_ip_Final_Load_2026-02-25.txt C:\Users\User\Documents\Jars\error_file.csv"/>
+<stringAttribute key="org.eclipse.jdt.launching.PROJECT_ATTR" value="ERROR_PARSER_TEMP"/>
+</launchConfiguration>
